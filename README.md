@@ -132,7 +132,7 @@ When defining operations, you can use several types of values:
 
 ```python
 df = pl.DataFrame({
-    "order_id": [1, 2, 3],
+    "order_id": [1, 2],
     "items": [
         [{"product": "Apple", "quantity": 5, "price": 1.0}],
         [{"product": "Banana", "quantity": 10, "price": 0.5}],
