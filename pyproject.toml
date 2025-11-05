@@ -1,0 +1,67 @@
+[project]
+name = "polars-nexpresso"
+version = "0.1.0"
+description = "A utility library for generating Polars expressions to work with nested data structures"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+keywords = ["polars", "nested", "struct", "dataframe", "expression", "data-processing", "nexpresso"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "polars>=1.20.0",
+]
+
+
+[project.urls]
+Homepage = "https://github.com/yourusername/polars-nexpresso"
+Documentation = "https://github.com/yourusername/polars-nexpresso#readme"
+Repository = "https://github.com/yourusername/polars-nexpresso"
+Issues = "https://github.com/yourusername/polars-nexpresso/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nexpresso"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312", "py313"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "pytest-cov>=4.1.0",
+    "black>=24.1.0",
+    "ruff>=0.10.0",
+    "mypy>=1.15.0",
+]
