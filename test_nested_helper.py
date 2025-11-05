@@ -14,12 +14,9 @@ Tests cover:
 
 import polars as pl
 import pytest
+from packaging import version
 
-from nexpresso import (
-    NestedExpressionBuilder,
-    apply_nested_operations,
-    generate_nested_exprs,
-)
+from nexpresso import NestedExpressionBuilder, apply_nested_operations, generate_nested_exprs
 
 
 def test_create_new_top_level_column():
@@ -186,8 +183,7 @@ def test_nested_list_of_structs():
             "count": None,  # Keep count as-is
             # pl.field("value") references the ORIGINAL value (1), not transformed (2)
             # So total = original_value (1) * count (2) = 2
-            "total": pl.field("value")
-            * pl.field("count"),  # New field based on original values
+            "total": pl.field("value") * pl.field("count"),  # New field based on original values
         }
     }
 
@@ -221,8 +217,7 @@ def test_deeply_nested_structure():
                 "sum": pl.field("x") + pl.field("y"),  # New field in inner
             },
             "z": None,  # Keep outer.z
-            "product": pl.field("inner").struct.field("x")
-            * pl.field("z"),  # New field in outer
+            "product": pl.field("inner").struct.field("x") * pl.field("z"),  # New field in outer
         }
     }
 
@@ -294,8 +289,7 @@ def test_complex_real_world_example():
             "item": None,  # Keep item name
             "price": None,  # Keep price
             "quantity": None,  # Keep quantity
-            "subtotal": pl.field("price")
-            * pl.field("quantity"),  # New: calculate subtotal
+            "subtotal": pl.field("price") * pl.field("quantity"),  # New: calculate subtotal
             "discounted_price": pl.field("price") * 0.9,  # New: apply 10% discount
         },
         "profile": {
@@ -359,9 +353,7 @@ def test_apply_function_to_nonexistent_field():
         }
     )
 
-    with pytest.raises(
-        ValueError, match="Cannot apply function to non-existent field 'z'"
-    ):
+    with pytest.raises(ValueError, match="Cannot apply function to non-existent field 'z'"):
         generate_nested_exprs(
             {"struct_col": {"z": lambda x: x * 2}}, df.schema, struct_mode="with_fields"
         )
@@ -378,9 +370,7 @@ def test_recurse_into_nonexistent_struct_field():
         }
     )
 
-    with pytest.raises(
-        ValueError, match="Cannot recurse into non-existent struct field 'z'"
-    ):
+    with pytest.raises(ValueError, match="Cannot recurse into non-existent struct field 'z'"):
         generate_nested_exprs(
             {"struct_col": {"z": {"inner": None}}}, df.schema, struct_mode="with_fields"
         )
@@ -462,9 +452,7 @@ def test_nested_lists():
     )
 
     # Transform inner list elements
-    fields = {
-        "nested_lists": lambda x: x.list.eval(pl.element().list.eval(pl.element() * 2))
-    }
+    fields = {"nested_lists": lambda x: x.list.eval(pl.element().list.eval(pl.element() * 2))}
     exprs = generate_nested_exprs(fields, df.schema)
     result = df.select(exprs)
 
@@ -502,12 +490,18 @@ def test_list_of_lists_of_structs():
     assert result["nested_items"][0][1][0]["value"] == 6
 
 
+@pytest.mark.skipif(
+    version.parse(pl.__version__) < version.parse("1.35.1"),
+    reason="Older Polars versions raise SchemaError instead of InvalidOperationError",
+)
 def test_array_type():
     """Test that Array types raise an error (Arrays don't support list.eval in Polars).
 
     Note: Arrays in Polars are fixed-size and don't support list.eval() operations.
     This test documents this limitation. Arrays should be converted to Lists first
     if nested operations are needed.
+
+    Skipped on Polars versions < 1.35.1 due to different error behavior.
     """
     df = pl.DataFrame(
         {
@@ -516,9 +510,7 @@ def test_array_type():
                 [{"value": 5, "count": 6}, {"value": 7, "count": 8}],
             ]
         },
-        schema={
-            "items": pl.Array(pl.Struct({"value": pl.Int64, "count": pl.Int64}), 2)
-        },
+        schema={"items": pl.Array(pl.Struct({"value": pl.Int64, "count": pl.Int64}), 2)},
     )
 
     fields = {
@@ -541,9 +533,7 @@ def test_array_type():
     df_list = df.with_columns(
         pl.col("items").cast(pl.List(pl.Struct({"value": pl.Int64, "count": pl.Int64})))
     )
-    exprs_list = generate_nested_exprs(
-        fields, df_list.schema, struct_mode="with_fields"
-    )
+    exprs_list = generate_nested_exprs(fields, df_list.schema, struct_mode="with_fields")
     result = df_list.select(exprs_list)
 
     assert result["items"][0][0]["value"] == 2
@@ -757,9 +747,7 @@ def test_struct_with_pl_expr_field():
             "x": None,
             "y": None,
             "sum": pl.field("x") + pl.field("y"),  # Direct pl.Expr
-            "multiplied": (pl.field("x") * pl.field("y")).alias(
-                "product"
-            ),  # With alias
+            "multiplied": (pl.field("x") * pl.field("y")).alias("product"),  # With alias
         }
     }
 
