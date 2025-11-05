@@ -60,6 +60,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Create virtual environment
+        run: uv venv
+
       - name: Install build dependencies
         run: uv pip install build twine
 
@@ -67,7 +70,7 @@ jobs:
         run: uv build
 
       - name: Check package
-        run: twine check dist/*
+        run: uv run twine check dist/*
 
       - name: Publish to TestPyPI
         if: inputs.test_pypi == true
@@ -75,6 +78,7 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
           packages-dir: dist/
+          # Note: TestPyPI may not support trusted publishing yet, so API token is required
           password: ${{ secrets.TEST_PYPI_API_TOKEN }}
 
       - name: Publish to PyPI
@@ -82,5 +86,5 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          # Trusted publishing via OIDC - no password needed
 
