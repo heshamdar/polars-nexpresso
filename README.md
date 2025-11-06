@@ -61,7 +61,7 @@ nexpresso_expr = {
         }
     }
 }
-exprs = generate_nested_exprs(fields, df.schema, struct_mode='with_fields')
+exprs = generate_nested_exprs(nexpresso_expr, df.schema, struct_mode='with_fields')
 print(df.select(exprs))
 ```
 
