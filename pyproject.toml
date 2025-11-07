@@ -1,12 +1,12 @@
 [project]
 name = "polars-nexpresso"
-version = "0.1.0"
+version = "0.1.2"
 description = "A utility library for generating Polars expressions to work with nested data structures"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Your Name", email = "your.email@example.com"},
+    {name = "Hesham Dar", email = "heshamdar@gmail.com"},
 ]
 keywords = ["polars", "nested", "struct", "dataframe", "expression", "data-processing", "nexpresso"]
 classifiers = [
@@ -27,10 +27,10 @@ dependencies = [
 
 
 [project.urls]
-Homepage = "https://github.com/yourusername/polars-nexpresso"
-Documentation = "https://github.com/yourusername/polars-nexpresso#readme"
-Repository = "https://github.com/yourusername/polars-nexpresso"
-Issues = "https://github.com/yourusername/polars-nexpresso/issues"
+Homepage = "https://github.com/heshamdar/polars-nexpresso"
+Documentation = "https://github.com/heshamdar/polars-nexpresso#readme"
+Repository = "https://github.com/heshamdar/polars-nexpresso"
+Issues = "https://github.com/heshamdar/polars-nexpresso/issues"
 
 [build-system]
 requires = ["hatchling"]
