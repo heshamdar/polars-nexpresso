@@ -43,8 +43,7 @@ class NestedExpressionBuilder:
         """
         if struct_mode not in ("select", "with_fields"):
             raise ValueError(
-                f"Invalid struct_mode: {struct_mode}. "
-                "Must be 'select' or 'with_fields'."
+                f"Invalid struct_mode: {struct_mode}. " "Must be 'select' or 'with_fields'."
             )
         self._schema = schema
         self._struct_mode = struct_mode
@@ -103,9 +102,7 @@ class NestedExpressionBuilder:
             return field_spec(base_expr).alias(col_name)
         elif isinstance(field_spec, dict):
             col_type: PolarsDataType = self._schema[col_name]
-            return self._process_nested_field(col_type, field_spec, base_expr).alias(
-                col_name
-            )
+            return self._process_nested_field(col_type, field_spec, base_expr).alias(col_name)
         else:
             raise TypeError(
                 f"Invalid field specification type for '{col_name}': "
@@ -130,9 +127,7 @@ class NestedExpressionBuilder:
         # Handle Array types (fixed-size arrays)
         # Arrays can be treated similarly to lists for nested operations
         if isinstance(dtype, pl.Array):
-            inner_expr = self._process_nested_field(
-                dtype.inner, field_spec, pl.element()
-            )
+            inner_expr = self._process_nested_field(dtype.inner, field_spec, pl.element())
             # Use list.eval for arrays (they can be treated as lists)
             return base_expr.list.eval(inner_expr)
 
@@ -214,16 +209,11 @@ class NestedExpressionBuilder:
             if final_exprs:
                 struct_with_transforms: Expr = base_expr.struct.with_fields(final_exprs)
                 selected_fields.extend(
-                    [
-                        struct_with_transforms.struct.field(name)
-                        for name in field_spec.keys()
-                    ]
+                    [struct_with_transforms.struct.field(name) for name in field_spec.keys()]
                 )
             else:
                 # No transformations, just select
-                selected_fields.extend(
-                    [base_expr.struct.field(name) for name in field_spec.keys()]
-                )
+                selected_fields.extend([base_expr.struct.field(name) for name in field_spec.keys()])
             return pl.struct(selected_fields)
         else:
             # In with_fields mode, use with_fields() which preserves original field references
@@ -268,21 +258,15 @@ class NestedExpressionBuilder:
             return field_spec(field_base_expr)
         elif isinstance(field_spec, dict):
             if field_name not in schema_map:
-                raise ValueError(
-                    f"Cannot recurse into non-existent struct field '{field_name}'."
-                )
-            return self._process_nested_field(
-                schema_map[field_name], field_spec, field_base_expr
-            )
+                raise ValueError(f"Cannot recurse into non-existent struct field '{field_name}'.")
+            return self._process_nested_field(schema_map[field_name], field_spec, field_base_expr)
         else:
-            raise TypeError(
-                f"Invalid field specification for '{field_name}': {type(field_spec)}"
-            )
+            raise TypeError(f"Invalid field specification for '{field_name}': {type(field_spec)}")
 
 
 def generate_nested_exprs(
     fields: dict[str, FieldValue],
-    schema: pl.Schema,
+    schema: pl.Schema | pl.DataFrame | pl.LazyFrame,
     struct_mode: StructMode = "select",
 ) -> list[pl.Expr]:
     """
@@ -299,7 +283,8 @@ def generate_nested_exprs(
             - `Callable`: Apply function to field (e.g., `lambda x: x + 1`)
             - `pl.Expr`: Full expression to create/modify field
 
-        schema: The schema of the DataFrame to work with.
+        schema: The schema of the DataFrame to work with. Can be a Schema, DataFrame, or LazyFrame.
+        If a DataFrame or LazyFrame is provided, the schema will be collected automatically.
 
         struct_mode: How to handle struct fields:
             - `'select'`: Only keep specified fields (default)
@@ -338,6 +323,10 @@ def generate_nested_exprs(
         ... }, df2.schema)
         >>> df2.select(exprs)
     """
+
+    if isinstance(schema, pl.DataFrame | pl.LazyFrame):
+        schema = schema.collect_schema()
+
     builder = NestedExpressionBuilder(schema, struct_mode)
     return builder.build(fields)
 
