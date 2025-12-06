@@ -7,7 +7,7 @@ structs and deeply nested hierarchies.
 """
 
 from collections.abc import Callable
-from typing import Any, Literal
+from typing import Literal
 
 import polars as pl
 from polars._typing import PolarsDataType
