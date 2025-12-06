@@ -1,9 +1,26 @@
+"""Tests for the hierarchical_packer module."""
+
+from __future__ import annotations
+
 import json
+from typing import TYPE_CHECKING
 
 import polars as pl
 import pytest
 
-from nexpresso.hierarchical_packer import HierarchicalPacker, HierarchySpec, LevelSpec
+from nexpresso.hierarchical_packer import (
+    HierarchicalPacker,
+    HierarchySpec,
+    HierarchyValidationError,
+    LevelSpec,
+)
+
+if TYPE_CHECKING:
+    from _pytest.capture import CaptureFixture
+    from _pytest.fixtures import FixtureRequest
+    from _pytest.logging import LogCaptureFixture
+    from _pytest.monkeypatch import MonkeyPatch
+    from pytest_mock.plugin import MockerFixture
 
 TEST_HIERARCHY = HierarchySpec(
     levels=[
@@ -127,7 +144,8 @@ def test_denormalize_reconstructs_nested(packer, apartment_level_df):
     _assert_same_rows(rebuilt, expected)
 
 
-def test_pack_without_preserve_order(apartment_level_df):
+def test_pack_without_preserve_order(apartment_level_df: pl.DataFrame) -> None:
+    """Test that packing without order preservation works correctly."""
     relaxed_packer = HierarchicalPacker(TEST_HIERARCHY, preserve_child_order=False)
 
     street_level = relaxed_packer.pack(apartment_level_df, "street")
@@ -135,3 +153,555 @@ def test_pack_without_preserve_order(apartment_level_df):
 
     unpacked = relaxed_packer.unpack(street_level, "apartment")
     _assert_same_rows(unpacked, apartment_level_df)
+
+
+# =============================================================================
+# New Tests: Separator Escaping
+# =============================================================================
+
+
+class TestSeparatorEscaping:
+    """Tests for separator escaping functionality."""
+
+    def test_escape_unescape_roundtrip(self) -> None:
+        """Test that escaping and unescaping a field name is reversible."""
+        packer = HierarchicalPacker(
+            HierarchySpec(levels=[LevelSpec(name="level", id_fields=["id"])]),
+            granularity_separator=".",
+            escape_char="\\",
+        )
+
+        # Field with separator
+        original = "field.with.dots"
+        escaped = packer._escape_field(original)
+        unescaped = packer._unescape_field(escaped)
+
+        assert escaped == "field\\.with\\.dots"
+        assert unescaped == original
+
+    def test_escape_char_in_field_name(self) -> None:
+        """Test escaping when field name contains escape char."""
+        packer = HierarchicalPacker(
+            HierarchySpec(levels=[LevelSpec(name="level", id_fields=["id"])]),
+            granularity_separator=".",
+            escape_char="\\",
+        )
+
+        original = "field\\name"
+        escaped = packer._escape_field(original)
+        unescaped = packer._unescape_field(escaped)
+
+        assert escaped == "field\\\\name"
+        assert unescaped == original
+
+    def test_split_path_with_escapes(self) -> None:
+        """Test splitting a path that contains escaped separators."""
+        packer = HierarchicalPacker(
+            HierarchySpec(levels=[LevelSpec(name="level", id_fields=["id"])]),
+            granularity_separator=".",
+            escape_char="\\",
+        )
+
+        # Path with escaped dot
+        path = "level\\.one.level\\.two"
+        parts = packer._split_path(path)
+
+        assert parts == ["level.one", "level.two"]
+
+    def test_join_path_escapes_components(self) -> None:
+        """Test that join_path properly escapes components."""
+        packer = HierarchicalPacker(
+            HierarchySpec(levels=[LevelSpec(name="level", id_fields=["id"])]),
+            granularity_separator=".",
+            escape_char="\\",
+        )
+
+        components = ["level.one", "level.two"]
+        joined = packer._join_path(components)
+
+        assert joined == "level\\.one.level\\.two"
+
+    def test_custom_separator(self) -> None:
+        """Test using a custom separator."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"]),
+                LevelSpec(name="child", id_fields=["id"]),
+            ]
+        )
+        packer = HierarchicalPacker(spec, granularity_separator="/")
+
+        df = pl.DataFrame(
+            {
+                "parent/id": ["p1", "p1"],
+                "parent/child/id": ["c1", "c2"],
+                "parent/child/value": [10, 20],
+            }
+        )
+
+        packed = packer.pack(df, "parent")
+        assert "parent" in packed.columns
+
+        unpacked = packer.unpack(packed, "child")
+        _assert_same_rows(unpacked, df)
+
+    def test_escape_char_same_as_separator_raises(self) -> None:
+        """Test that using same char for escape and separator raises error."""
+        with pytest.raises(ValueError, match="cannot be the same"):
+            HierarchicalPacker(
+                HierarchySpec(levels=[LevelSpec(name="level", id_fields=["id"])]),
+                granularity_separator=".",
+                escape_char=".",
+            )
+
+
+# =============================================================================
+# New Tests: Validation
+# =============================================================================
+
+
+class TestValidation:
+    """Tests for validation functionality."""
+
+    def test_validate_detects_null_keys(self) -> None:
+        """Test that validate() detects null values in key columns."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"]),
+                LevelSpec(name="child", id_fields=["id"]),
+            ]
+        )
+        packer = HierarchicalPacker(spec)
+
+        df = pl.DataFrame(
+            {
+                "parent.id": ["p1", None, "p3"],  # Null in key column
+                "parent.child.id": ["c1", "c2", "c3"],
+                "parent.child.value": [10, 20, 30],
+            }
+        )
+
+        with pytest.raises(HierarchyValidationError, match="null values"):
+            packer.validate(df)
+
+    def test_validate_returns_errors_when_not_raising(self) -> None:
+        """Test that validate() returns errors without raising when configured."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"]),
+            ]
+        )
+        packer = HierarchicalPacker(spec)
+
+        df = pl.DataFrame({"parent.id": ["p1", None, "p3"]})
+
+        errors = packer.validate(df, raise_on_error=False)
+
+        assert len(errors) == 1
+        assert errors[0].level == "parent"
+        assert "null values" in str(errors[0])
+
+    def test_validate_passes_for_valid_data(self) -> None:
+        """Test that validate() passes for valid data."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"]),
+            ]
+        )
+        packer = HierarchicalPacker(spec)
+
+        df = pl.DataFrame({"parent.id": ["p1", "p2", "p3"]})
+
+        errors = packer.validate(df, raise_on_error=False)
+        assert len(errors) == 0
+
+    def test_aggregation_validation_detects_non_uniform_values(self) -> None:
+        """Test that aggregation validation detects non-uniform values."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"]),
+                LevelSpec(name="child", id_fields=["id"]),
+            ]
+        )
+        packer = HierarchicalPacker(spec, validate_on_pack=True)
+
+        # Same parent.id but different parent.name values
+        df = pl.DataFrame(
+            {
+                "parent.id": ["p1", "p1"],
+                "parent.name": ["Name1", "Name2"],  # Non-uniform!
+                "parent.child.id": ["c1", "c2"],
+                "parent.child.value": [10, 20],
+            }
+        )
+
+        with pytest.raises(HierarchyValidationError, match="non-uniform values"):
+            packer.pack(df, "parent")
+
+    def test_aggregation_validation_can_be_disabled(self) -> None:
+        """Test that aggregation validation can be disabled."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"]),
+                LevelSpec(name="child", id_fields=["id"]),
+            ]
+        )
+        packer = HierarchicalPacker(spec, validate_on_pack=False)
+
+        # Same parent.id but different parent.name values
+        df = pl.DataFrame(
+            {
+                "parent.id": ["p1", "p1"],
+                "parent.name": ["Name1", "Name2"],  # Non-uniform!
+                "parent.child.id": ["c1", "c2"],
+                "parent.child.value": [10, 20],
+            }
+        )
+
+        # Should not raise - just picks first value
+        packed = packer.pack(df, "parent")
+        assert packed.height == 1
+
+
+# =============================================================================
+# New Tests: Frame Type Preservation
+# =============================================================================
+
+
+class TestFrameTypePreservation:
+    """Tests for preserving DataFrame/LazyFrame types."""
+
+    def test_pack_preserves_dataframe_type(
+        self, packer: HierarchicalPacker, apartment_level_df: pl.DataFrame
+    ) -> None:
+        """Test that pack() returns DataFrame when given DataFrame."""
+        result = packer.pack(apartment_level_df, "street")
+        assert isinstance(result, pl.DataFrame)
+
+    def test_pack_preserves_lazyframe_type(
+        self, packer: HierarchicalPacker, apartment_level_df: pl.DataFrame
+    ) -> None:
+        """Test that pack() returns LazyFrame when given LazyFrame."""
+        lf = apartment_level_df.lazy()
+        result = packer.pack(lf, "street")
+        assert isinstance(result, pl.LazyFrame)
+
+    def test_unpack_preserves_dataframe_type(
+        self, packer: HierarchicalPacker, apartment_level_df: pl.DataFrame
+    ) -> None:
+        """Test that unpack() returns DataFrame when given DataFrame."""
+        packed = packer.pack(apartment_level_df, "street")
+        result = packer.unpack(packed, "apartment")
+        assert isinstance(result, pl.DataFrame)
+
+    def test_unpack_preserves_lazyframe_type(
+        self, packer: HierarchicalPacker, apartment_level_df: pl.DataFrame
+    ) -> None:
+        """Test that unpack() returns LazyFrame when given LazyFrame."""
+        packed = packer.pack(apartment_level_df.lazy(), "street")
+        result = packer.unpack(packed, "apartment")
+        assert isinstance(result, pl.LazyFrame)
+
+
+# =============================================================================
+# New Tests: Empty DataFrames
+# =============================================================================
+
+
+class TestEmptyDataFrames:
+    """Tests for handling empty DataFrames."""
+
+    def test_pack_empty_dataframe(self) -> None:
+        """Test that packing an empty DataFrame works correctly."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"]),
+                LevelSpec(name="child", id_fields=["id"]),
+            ]
+        )
+        packer = HierarchicalPacker(spec)
+
+        df = pl.DataFrame(
+            {
+                "parent.id": pl.Series([], dtype=pl.Utf8),
+                "parent.child.id": pl.Series([], dtype=pl.Utf8),
+                "parent.child.value": pl.Series([], dtype=pl.Int64),
+            }
+        )
+
+        packed = packer.pack(df, "parent")
+        assert packed.height == 0
+        assert "parent" in packed.columns
+
+    def test_unpack_empty_dataframe(self) -> None:
+        """Test that unpacking an empty packed DataFrame works correctly."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"]),
+                LevelSpec(name="child", id_fields=["id"]),
+            ]
+        )
+        packer = HierarchicalPacker(spec)
+
+        df = pl.DataFrame(
+            {
+                "parent.id": pl.Series([], dtype=pl.Utf8),
+                "parent.child.id": pl.Series([], dtype=pl.Utf8),
+                "parent.child.value": pl.Series([], dtype=pl.Int64),
+            }
+        )
+
+        packed = packer.pack(df, "parent")
+        unpacked = packer.unpack(packed, "child")
+
+        assert unpacked.height == 0
+
+
+# =============================================================================
+# New Tests: Build from Tables
+# =============================================================================
+
+
+class TestBuildFromTables:
+    """Tests for building hierarchies from normalized tables."""
+
+    def test_build_from_tables_simple(self) -> None:
+        """Test building a simple hierarchy from normalized tables."""
+        spec = HierarchySpec.from_levels(
+            LevelSpec(name="city", id_fields=["id"]),
+            LevelSpec(name="street", id_fields=["id"], parent_keys=["city_id"]),
+        )
+        packer = HierarchicalPacker(spec)
+
+        city_df = pl.DataFrame({"id": ["NYC", "LA"], "name": ["New York", "Los Angeles"]})
+
+        street_df = pl.DataFrame(
+            {
+                "id": ["st1", "st2", "st3"],
+                "name": ["Broadway", "Main St", "Sunset Blvd"],
+                "city_id": ["NYC", "NYC", "LA"],
+            }
+        )
+
+        result = packer.build_from_tables({"city": city_df, "street": street_df})
+
+        assert isinstance(result, pl.DataFrame)
+        assert "city" in result.columns
+        assert result.height == 2  # Two cities
+
+        # Unpack and verify
+        unpacked = packer.unpack(result, "street")
+        assert unpacked.height == 3  # Three streets
+
+    def test_build_from_tables_with_lazyframes(self) -> None:
+        """Test that build_from_tables preserves LazyFrame type."""
+        spec = HierarchySpec.from_levels(
+            LevelSpec(name="parent", id_fields=["id"]),
+            LevelSpec(name="child", id_fields=["id"], parent_keys=["parent_id"]),
+        )
+        packer = HierarchicalPacker(spec)
+
+        parent_lf = pl.DataFrame({"id": ["p1"], "name": ["Parent 1"]}).lazy()
+        child_lf = pl.DataFrame({"id": ["c1"], "name": ["Child 1"], "parent_id": ["p1"]}).lazy()
+
+        result = packer.build_from_tables({"parent": parent_lf, "child": child_lf})
+
+        assert isinstance(result, pl.LazyFrame)
+
+    def test_build_from_tables_missing_table_raises(self) -> None:
+        """Test that missing tables raise an appropriate error."""
+        spec = HierarchySpec.from_levels(
+            LevelSpec(name="parent", id_fields=["id"]),
+            LevelSpec(name="child", id_fields=["id"], parent_keys=["parent_id"]),
+        )
+        packer = HierarchicalPacker(spec)
+
+        parent_df = pl.DataFrame({"id": ["p1"], "name": ["Parent 1"]})
+
+        # When target_level is child, we need the child table
+        with pytest.raises(HierarchyValidationError, match="Missing table"):
+            packer.build_from_tables({"parent": parent_df}, target_level="child")
+
+    def test_build_from_tables_missing_parent_keys_raises(self) -> None:
+        """Test that missing parent_keys on child level raises an error."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"]),
+                LevelSpec(name="child", id_fields=["id"]),  # No parent_keys!
+            ]
+        )
+        packer = HierarchicalPacker(spec)
+
+        parent_df = pl.DataFrame({"id": ["p1"], "name": ["Parent 1"]})
+        child_df = pl.DataFrame({"id": ["c1"], "name": ["Child 1"], "parent_id": ["p1"]})
+
+        with pytest.raises(HierarchyValidationError, match="parent_keys"):
+            packer.build_from_tables({"parent": parent_df, "child": child_df})
+
+
+# =============================================================================
+# New Tests: Composable Levels
+# =============================================================================
+
+
+class TestComposableLevels:
+    """Tests for composable level definitions."""
+
+    def test_from_levels_creates_hierarchy(self) -> None:
+        """Test that from_levels creates a valid HierarchySpec."""
+        spec = HierarchySpec.from_levels(
+            LevelSpec(name="country", id_fields=["code"]),
+            LevelSpec(name="city", id_fields=["id"], parent_keys=["country_code"]),
+            LevelSpec(name="street", id_fields=["name"], parent_keys=["city_id"]),
+        )
+
+        assert len(spec.levels) == 3
+        assert spec.levels[0].name == "country"
+        assert spec.levels[1].name == "city"
+        assert spec.levels[2].name == "street"
+
+    def test_from_levels_validates_parent_keys_count(self) -> None:
+        """Test that from_levels validates parent_keys count matches parent id_fields."""
+        with pytest.raises(ValueError, match="parent_keys"):
+            HierarchySpec.from_levels(
+                LevelSpec(name="parent", id_fields=["id1", "id2"]),  # Two id fields
+                LevelSpec(
+                    name="child", id_fields=["id"], parent_keys=["parent_id"]
+                ),  # Only one parent_key!
+            )
+
+    def test_from_levels_rejects_parent_keys_on_root(self) -> None:
+        """Test that from_levels rejects parent_keys on root level."""
+        with pytest.raises(ValueError, match="Root level"):
+            HierarchySpec.from_levels(
+                LevelSpec(name="root", id_fields=["id"], parent_keys=["invalid"]),
+            )
+
+    def test_from_levels_with_key_aliases(self) -> None:
+        """Test that from_levels accepts key_aliases."""
+        spec = HierarchySpec.from_levels(
+            LevelSpec(name="parent", id_fields=["id"]),
+            key_aliases={"parent.id": "parent.child.parent_id"},
+        )
+
+        assert spec.key_aliases == {"parent.id": "parent.child.parent_id"}
+
+
+# =============================================================================
+# New Tests: Error Messages
+# =============================================================================
+
+
+class TestErrorMessages:
+    """Tests for error message quality."""
+
+    def test_validation_error_includes_level(self) -> None:
+        """Test that HierarchyValidationError includes level context."""
+        error = HierarchyValidationError(
+            "Test error message",
+            level="test_level",
+            details={"key": "value"},
+        )
+
+        assert "[Level: test_level]" in str(error)
+        assert error.level == "test_level"
+        assert error.details == {"key": "value"}
+
+    def test_missing_level_error_is_descriptive(self) -> None:
+        """Test that missing level errors are descriptive."""
+        spec = HierarchySpec(levels=[LevelSpec(name="known", id_fields=["id"])])
+
+        with pytest.raises(KeyError, match="not found"):
+            spec.index_of("unknown")
+
+
+# =============================================================================
+# New Tests: Prepare Level Table
+# =============================================================================
+
+
+class TestPrepareLevelTable:
+    """Tests for prepare_level_table functionality."""
+
+    def test_prepare_level_table_adds_prefix(self) -> None:
+        """Test that prepare_level_table adds the correct prefix to columns."""
+        spec = HierarchySpec.from_levels(
+            LevelSpec(name="parent", id_fields=["id"]),
+            LevelSpec(name="child", id_fields=["id"], parent_keys=["parent_id"]),
+        )
+        packer = HierarchicalPacker(spec)
+
+        raw_df = pl.DataFrame(
+            {"id": ["c1", "c2"], "name": ["Child 1", "Child 2"], "parent_id": ["p1", "p1"]}
+        )
+
+        prepared = packer.prepare_level_table("child", raw_df)
+
+        assert "parent.child.id" in prepared.columns
+        assert "parent.child.name" in prepared.columns
+        assert "parent.child.parent_id" in prepared.columns
+
+    def test_prepare_level_table_with_column_mapping(self) -> None:
+        """Test that prepare_level_table respects column mapping."""
+        spec = HierarchySpec.from_levels(
+            LevelSpec(name="item", id_fields=["id"]),
+        )
+        packer = HierarchicalPacker(spec)
+
+        raw_df = pl.DataFrame({"item_id": [1, 2], "item_name": ["A", "B"]})
+
+        prepared = packer.prepare_level_table(
+            "item",
+            raw_df,
+            column_mapping={"item_id": "id", "item_name": "name"},
+        )
+
+        assert "item.id" in prepared.columns
+        assert "item.name" in prepared.columns
+
+    def test_prepare_level_table_preserves_dataframe_type(self) -> None:
+        """Test that prepare_level_table preserves DataFrame type."""
+        spec = HierarchySpec(levels=[LevelSpec(name="level", id_fields=["id"])])
+        packer = HierarchicalPacker(spec)
+
+        raw_df = pl.DataFrame({"id": [1, 2]})
+        result = packer.prepare_level_table("level", raw_df)
+
+        assert isinstance(result, pl.DataFrame)
+
+    def test_prepare_level_table_preserves_lazyframe_type(self) -> None:
+        """Test that prepare_level_table preserves LazyFrame type."""
+        spec = HierarchySpec(levels=[LevelSpec(name="level", id_fields=["id"])])
+        packer = HierarchicalPacker(spec)
+
+        raw_lf = pl.DataFrame({"id": [1, 2]}).lazy()
+        result = packer.prepare_level_table("level", raw_lf)
+
+        assert isinstance(result, pl.LazyFrame)
+
+
+# =============================================================================
+# New Tests: Get Level Columns
+# =============================================================================
+
+
+class TestGetLevelColumns:
+    """Tests for get_level_columns functionality."""
+
+    def test_get_level_columns_returns_expected(self) -> None:
+        """Test that get_level_columns returns the expected columns."""
+        spec = HierarchySpec(
+            levels=[
+                LevelSpec(name="parent", id_fields=["id"], required_fields=["name"]),
+                LevelSpec(name="child", id_fields=["id", "code"]),
+            ]
+        )
+        packer = HierarchicalPacker(spec)
+
+        parent_cols = packer.get_level_columns("parent")
+        assert "parent.id" in parent_cols
+        assert "parent.name" in parent_cols
+
+        child_cols = packer.get_level_columns("child")
+        assert "parent.child.id" in child_cols
+        assert "parent.child.code" in child_cols
