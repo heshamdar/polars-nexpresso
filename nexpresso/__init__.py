@@ -18,7 +18,7 @@ from nexpresso.nexpresso import (
 )
 from nexpresso.structuring_utils import convert_polars_schema, unnest_all, unnest_rename
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 __all__ = [
     "__version__",

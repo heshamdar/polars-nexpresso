@@ -4,68 +4,12 @@
 [![Polars](https://img.shields.io/badge/polars-%3E%3D1.20.0-blue)](https://www.pola.rs/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Polars Nexpresso** - A utility library for generating Polars expressions to work with nested data structures. Easily select, modify, and create columns and nested fields in Polars DataFrames, particularly for complex nested structures like lists of structs and deeply nested hierarchies.
+**Polars Nexpresso** is a utility library for working with nested and hierarchical data in Polars. It provides two main capabilities:
 
-*Nexpresso* = **N**ested **Express**ion + ☕ (espresso) - because why not?
+1. **Nested Expression Builder** - Clean, intuitive syntax for transforming deeply nested structs and lists
+2. **Hierarchical Packer** - Pack/unpack operations for hierarchical data, similar to pandas MultiIndex but using Polars' native nested types
 
-## Motivation
-
-Working with deeply nested columns in Polars can quickly become verbose and hard to read. Consider modifying a field nested within a list of structs that contains another list of structs:
-
-**Without Nexpresso:**
-```python
-import polars as pl
-
-df = pl.DataFrame(
-    {
-        "orders": [
-            [
-                {"items": [{"quantity": 1, "price": 10}, {"quantity": 2, "price": 20}]},
-                {"items": [{"quantity": 3, "price": 30}, {"quantity": 4, "price": 40}]},
-            ],
-            [
-                {"items": [{"quantity": 5, "price": 50}, {"quantity": 6, "price": 60}]},
-                {"items": [{"quantity": 7, "price": 70}, {"quantity": 8, "price": 80}]},
-            ],
-        ]
-    }
-)
-
-
-verbose_expr = (
-    pl.col("orders")
-    .list.eval(
-        pl.element().struct.with_fields(
-            pl.element()
-            .struct.field("items")
-            .list.eval(
-                pl.element().struct.with_fields(
-                    (pl.element().struct.field("quantity") * 2)
-                )
-            )
-        )
-    )
-)
-
-print(df.select(verbose_expr))
-```
-
-**With Nexpresso:**
-```python
-from nexpresso import generate_nested_exprs
-
-nexpresso_expr = {
-    'orders': {
-        'items': {
-            'quantity': lambda x: x * 2
-        }
-    }
-}
-exprs = generate_nested_exprs(nexpresso_expr, df.schema, struct_mode='with_fields')
-print(df.select(exprs))
-```
-
-Much cleaner and easier to read! 🎉
+*Nexpresso* = **N**ested **Express**ion + ☕ (espresso)
 
 ## Installation
 
@@ -81,50 +25,113 @@ uv add polars-nexpresso
 
 ## Quick Start
 
+### Nested Expression Builder
+
+Transform deeply nested data with intuitive dictionary syntax:
+
 ```python
 import polars as pl
 from nexpresso import generate_nested_exprs
 
-# Create a DataFrame with nested structures
 df = pl.DataFrame({
-    "customer": [
-        {"name": "Alice", "address": {"city": "NYC", "zip": "10001"}},
-        {"name": "Bob", "address": {"city": "LA", "zip": "90001"}},
+    "order": [
+        {"customer": "Alice", "items": [{"name": "Laptop", "price": 999}, {"name": "Mouse", "price": 25}]},
+        {"customer": "Bob", "items": [{"name": "Keyboard", "price": 75}]},
     ]
 })
 
-# Define operations on nested fields
+# Define transformations declaratively
 fields = {
-    "customer": {
-        "name": None,  # Keep as-is 
-        "address": {
-            "city": None,  # Keep city
-            "zip": lambda x: x.cast(pl.Int64),  # Transform zip to integer
-            "state": pl.lit("Unknown"),  # Add new field
-        },
+    "order": {
+        "customer": None,  # Keep as-is
+        "items": {
+            "name": None,
+            "price": lambda x: x * 1.1,  # 10% price increase
+            "discounted": pl.field("price") * 0.9,  # New field
+        }
     }
 }
 
-# Generate expressions and apply them
 exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
 result = df.select(exprs)
 ```
+
+### Hierarchical Packer
+
+Build and navigate hierarchical data from normalized tables:
+
+```python
+from nexpresso import HierarchicalPacker, HierarchySpec, LevelSpec
+
+# Define hierarchy
+spec = HierarchySpec.from_levels(
+    LevelSpec(name="region", id_fields=["id"]),
+    LevelSpec(name="store", id_fields=["id"], parent_keys=["region_id"]),
+)
+
+packer = HierarchicalPacker(spec)
+
+# Build from separate tables (like database tables)
+nested = packer.build_from_tables({
+    "region": regions_df,
+    "store": stores_df,
+})
+
+# Navigate between granularities
+flat = packer.unpack(nested, "store")      # Explode to store level
+packed = packer.pack(flat, "region")        # Aggregate back to region level
+```
+
+## Features
+
+### Nested Expression Builder
+
+| Feature | Description |
+|---------|-------------|
+| **Field Selection** | Keep fields as-is with `None` |
+| **Transformations** | Apply lambdas: `lambda x: x * 2` |
+| **New Fields** | Create with `pl.Expr`: `pl.field("a") + pl.field("b")` |
+| **Deep Nesting** | Works with any depth of structs/lists |
+| **Two Modes** | `select` (keep specified) or `with_fields` (keep all) |
+
+### Hierarchical Packer
+
+| Feature | Description |
+|---------|-------------|
+| **Build from Tables** | Join normalized tables into nested hierarchy |
+| **Pack/Unpack** | Navigate between granularity levels |
+| **Normalize/Denormalize** | Split into per-level tables and reconstruct |
+| **Validation** | Check for null keys and data integrity |
+| **Custom Separators** | Use any separator (default: `.`) |
+| **Type Preservation** | DataFrame in = DataFrame out |
 
 ## Core Concepts
 
 ### Field Value Types
 
-When defining operations, you can use several types of values:
+When defining transformations:
 
-- **`None`**: Keep the field as-is (select it without modification)
+- **`None`**: Keep the field unchanged
 - **`dict`**: Recursively process nested structures
-- **`Callable`**: Apply a function to the field (e.g., `lambda x: x * 2`)
-- **`pl.Expr`**: Use a full Polars expression to create/modify the field
+- **`Callable`**: Apply function to field (e.g., `lambda x: x * 2`)
+- **`pl.Expr`**: Create/modify field with full expression
 
 ### Struct Modes
 
-- **`"select"`** (default): Only keep the fields specified in the dictionary
-- **`"with_fields"`**: Keep all existing fields and add/modify only the specified ones. If this is used, the fields that are not specified will be kept as-is.
+- **`"select"`**: Only keep fields specified in the dictionary
+- **`"with_fields"`**: Keep all fields, add/modify specified ones
+
+### Hierarchy Levels
+
+Define your data hierarchy with `LevelSpec`:
+
+```python
+LevelSpec(
+    name="store",           # Level identifier
+    id_fields=["id"],       # Unique key columns
+    parent_keys=["region_id"],  # Foreign key to parent (for build_from_tables)
+)
+```
 
 ## Examples
 
@@ -132,119 +139,127 @@ When defining operations, you can use several types of values:
 
 ```python
 df = pl.DataFrame({
-    "order_id": [1, 2],
-    "items": [
-        [{"product": "Apple", "quantity": 5, "price": 1.0}],
-        [{"product": "Banana", "quantity": 10, "price": 0.5}],
-    ],
+    "items": [[{"name": "A", "qty": 5}, {"name": "B", "qty": 3}]]
 })
 
 fields = {
-    "order_id": None,
     "items": {
-        "product": None,
-        "quantity": lambda x: x * 2,  # Double quantity
-        "price": None,
-        "subtotal": pl.field("quantity") * pl.field("price"),  # Original qty * price
-    },
+        "name": None,
+        "qty": lambda x: x * 2,
+        "total": pl.field("qty") * 10,
+    }
 }
 
-exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
-result = df.select(exprs)
+result = apply_nested_operations(df, fields, struct_mode="with_fields")
 ```
 
-### Select Mode vs With Fields Mode
+### Conditional Logic
 
 ```python
-df = pl.DataFrame({
-    "product": [
-        {"name": "Widget", "price": 10.0, "cost": 5.0, "stock": 100},
-    ]
+fields = {
+    "customer": {
+        "name": None,
+        "tier": None,
+        "discount": pl.when(pl.field("tier") == "Gold")
+            .then(0.15)
+            .when(pl.field("tier") == "Silver")
+            .then(0.10)
+            .otherwise(0.05),
+    }
+}
+```
+
+### Building Hierarchies from Database Tables
+
+```python
+# Tables with foreign key relationships
+regions = pl.DataFrame({"id": ["west", "east"], "name": ["West", "East"]})
+stores = pl.DataFrame({
+    "id": ["s1", "s2"], 
+    "name": ["Store 1", "Store 2"],
+    "region_id": ["west", "east"]
 })
 
-# Select mode: only keep specified fields
-fields_select = {
-    "product": {
-        "name": None,
-        "price": lambda x: x * 1.2,  # cost and stock are excluded
-    }
-}
+spec = HierarchySpec.from_levels(
+    LevelSpec(name="region", id_fields=["id"]),
+    LevelSpec(name="store", id_fields=["id"], parent_keys=["region_id"]),
+)
 
-# With fields mode: keep all fields, add/modify some
-fields_with = {
-    "product": {
-        "price": lambda x: x * 1.2,  # Modify price
-        "profit": pl.field("price") * 1.2 - pl.field("cost"),  # New field
-        # name, cost, stock are kept as-is
-    }
-}
-
-exprs_select = generate_nested_exprs(fields_select, df.schema, struct_mode="select")
-exprs_with = generate_nested_exprs(fields_with, df.schema, struct_mode="with_fields")
+packer = HierarchicalPacker(spec)
+nested = packer.build_from_tables({"region": regions, "store": stores})
+# Result: Stores nested within their regions
 ```
 
-### Convenience Function
+### Normalize and Denormalize
 
 ```python
-from nexpresso import apply_nested_operations
+# Split nested data into separate tables
+tables = packer.normalize(nested_df)
+# {"region": region_df, "store": store_df, ...}
 
-result = apply_nested_operations(
-    df,
-    {"data": {"value": lambda x: x * 2, "result": pl.field("value") * pl.field("multiplier")}},
-    struct_mode="with_fields",
-    use_with_columns=True,  # Use with_columns instead of select
-)
+# Reconstruct from separate tables
+rebuilt = packer.denormalize(tables)
 ```
 
 ## API Reference
 
-### `generate_nested_exprs(fields, schema, struct_mode="select")`
+### Nested Expressions
+
+#### `generate_nested_exprs(fields, schema, struct_mode="select")`
 
 Generate Polars expressions for nested data operations.
 
 **Parameters:**
+- `fields`: Dictionary defining operations on columns/fields
+- `schema`: DataFrame schema (or DataFrame/LazyFrame to extract schema)
+- `struct_mode`: `"select"` or `"with_fields"`
 
-- **`fields`** (`dict[str, FieldValue]`): Dictionary defining operations on columns/fields
-  - Keys are column/field names
-  - Values specify the operation:
-    - `None`: Select field as-is
-    - `dict`: Recursively process nested structure
-    - `Callable`: Apply function to field (e.g., `lambda x: x + 1`)
-    - `pl.Expr`: Full expression to create/modify field
+**Returns:** `list[pl.Expr]`
 
-- **`schema`** (`pl.Schema`): The schema of the DataFrame to work with
+#### `apply_nested_operations(df, fields, struct_mode="select", use_with_columns=False)`
 
-- **`struct_mode`** (`Literal["select", "with_fields"]`): How to handle struct fields
-  - `"select"`: Only keep specified fields (default)
-  - `"with_fields"`: Keep all existing fields and add/modify specified ones
+Apply nested operations directly to a DataFrame.
 
-**Returns:**
+### Hierarchical Packer
 
-- `list[pl.Expr]`: List of Polars expressions ready for use in `.select()` or `.with_columns()`
+#### `HierarchicalPacker(spec, *, granularity_separator=".", escape_char="\\", preserve_child_order=True, validate_on_pack=True)`
 
-### `apply_nested_operations(df, fields, struct_mode="select", use_with_columns=False)`
+Main class for hierarchical operations.
 
-Apply nested operations directly to a DataFrame or LazyFrame.
+**Key Methods:**
+- `pack(frame, to_level)` - Pack to coarser granularity
+- `unpack(frame, to_level)` - Unpack to finer granularity
+- `normalize(frame)` - Split into per-level tables
+- `denormalize(tables)` - Reconstruct from per-level tables
+- `build_from_tables(tables)` - Build hierarchy from normalized tables
+- `validate(frame)` - Check data integrity
 
-**Parameters:**
+#### `HierarchySpec.from_levels(*levels, key_aliases=None)`
 
-- **`df`** (`pl.DataFrame | pl.LazyFrame`): The DataFrame or LazyFrame to operate on
-- **`fields`** (`dict[str, FieldValue]`): Dictionary defining operations (same as `generate_nested_exprs`)
-- **`struct_mode`** (`Literal["select", "with_fields"]`): How to handle struct fields
-- **`use_with_columns`** (`bool`): If `True`, use `.with_columns()` instead of `.select()`
+Create a hierarchy specification from level definitions.
 
-**Returns:**
+#### `LevelSpec(name, id_fields, required_fields=None, order_by=None, parent_keys=None)`
 
-- `pl.DataFrame | pl.LazyFrame`: DataFrame or LazyFrame with operations applied
+Define a single level in the hierarchy.
+
+## Running Examples
+
+```bash
+# Run comprehensive examples
+python examples.py
+
+# Or run specific module examples
+python -m nexpresso.hierarchical_packer
+```
 
 ## Performance
 
-The library generates native Polars expressions, so performance is equivalent to writing expressions manually. All operations are lazy and benefit from Polars' query optimization.
+Both components generate native Polars expressions, so performance is equivalent to hand-written code. All operations are lazy-compatible and benefit from Polars' query optimization.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT License - see LICENSE file for details.
 
-## Acknowledgments
+## Contributing
 
-Built for the [Polars](https://www.pola.rs/) data processing library. Special thanks to the Polars team for creating such an excellent tool.
+Contributions welcome! Please feel free to submit issues and pull requests.

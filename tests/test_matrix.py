@@ -6,9 +6,9 @@ Tests the library against multiple Polars versions using uv to manage
 different environments dynamically.
 
 Usage:
-    python test_matrix.py                    # Test all versions
-    python test_matrix.py --versions 1.0.0 1.15.0  # Test specific versions
-    python test_matrix.py --min-version 1.10.0     # Test from minimum version
+    python tests/test_matrix.py                    # Test all versions
+    python tests/test_matrix.py --versions 1.20.0 1.30.0  # Test specific versions
+    python tests/test_matrix.py --min-version 1.20.0      # Test from minimum version
 """
 
 import argparse
@@ -16,20 +16,26 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import List
 
 import pytest
 
 # Polars versions to test against
 DEFAULT_VERSIONS = [
-    "1.20.0",  # More recent version
-    "1.30.0",  # Pre-current minimum
+    "1.20.0",  # Minimum supported version
+    "1.30.0",  # Intermediate version
     "1.35.1",  # Current minimum in pyproject.toml
     "latest",  # Latest available version
 ]
 
+# Test files to run
+TEST_FILES = [
+    "test_nested_helper.py",
+    "test_hierarchical_packer.py",
+    "test_structuring_utils.py",
+]
 
-def run_command(cmd: List[str], cwd: Path = None) -> tuple[int, str, str]:
+
+def run_command(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
     """Run a command and return exit code, stdout, and stderr."""
     try:
         result = subprocess.run(
@@ -45,17 +51,17 @@ def run_command(cmd: List[str], cwd: Path = None) -> tuple[int, str, str]:
 
 
 @pytest.mark.skip(
-    reason="Run via 'python test_matrix.py' script or parametrize with versions"
+    reason="Run via 'python tests/test_matrix.py' script or parametrize with versions"
 )
-def test_polars_version(version: str, project_root: Path) -> tuple[bool, str]:
+def test_polars_version(version: str, project_root: Path) -> tuple[bool, str, str]:
     """
     Test the library against a specific Polars version.
 
     This test is skipped by default when run via pytest.
-    To run version matrix tests, use: python test_matrix.py
+    To run version matrix tests, use: python tests/test_matrix.py
 
     Returns:
-        (success: bool, output: str)
+        (success: bool, output: str, actual_version: str)
     """
     print(f"\n{'='*80}")
     print(f"Testing with Polars {version}")
@@ -97,11 +103,13 @@ packages = ["nexpresso"]
             dirs_exist_ok=True,
         )
 
-        # Copy test file
-        shutil.copy(
-            project_root / "test_nested_helper.py",
-            env_dir / "test_nested_helper.py",
-        )
+        # Copy all test files
+        tests_dir = env_dir / "tests"
+        tests_dir.mkdir(exist_ok=True)
+        for test_file in TEST_FILES:
+            src = project_root / "tests" / test_file
+            if src.exists():
+                shutil.copy(src, tests_dir / test_file)
 
         # Create a uv environment with the specific Polars version
         print(f"Setting up environment for Polars {version}...")
@@ -118,17 +126,37 @@ packages = ["nexpresso"]
         if exit_code != 0:
             error_msg = f"Failed to setup environment for Polars {version}:\n{stderr}"
             print(f"❌ {error_msg}")
-            return False, error_msg
+            return False, error_msg, version
 
-        # Run pytest
-        print(f"Running tests with Polars {version}...")
+        # Get the actual installed Polars version
+        version_cmd = [
+            "uv",
+            "run",
+            "--project",
+            str(env_dir),
+            "python",
+            "-c",
+            "import polars; print(polars.__version__)",
+        ]
+        exit_code, version_stdout, version_stderr = run_command(version_cmd)
+        if exit_code == 0:
+            actual_version = version_stdout.strip()
+            if version == "latest":
+                print(f"Installed Polars version: {actual_version}")
+        else:
+            # Fallback to requested version if we can't determine actual version
+            actual_version = version
+            print(f"Warning: Could not determine installed Polars version, using {version}")
+
+        # Run pytest on all test files
+        print(f"Running tests with Polars {actual_version}...")
         test_cmd = [
             "uv",
             "run",
             "--project",
             str(env_dir),
             "pytest",
-            "test_nested_helper.py",
+            "tests/",
             "-v",
             "--tb=short",
         ]
@@ -136,12 +164,12 @@ packages = ["nexpresso"]
         exit_code, stdout, stderr = run_command(test_cmd)
 
         if exit_code == 0:
-            print(f"✅ Polars {version}: All tests passed!")
-            return True, stdout
+            print(f"✅ Polars {actual_version}: All tests passed!")
+            return True, stdout, actual_version
         else:
-            error_msg = f"Tests failed for Polars {version}:\n{stderr}\n{stdout}"
+            error_msg = f"Tests failed for Polars {actual_version}:\n{stderr}\n{stdout}"
             print(f"❌ {error_msg}")
-            return False, error_msg
+            return False, error_msg, actual_version
 
 
 def main():
@@ -178,9 +206,7 @@ def main():
     elif args.min_version:
         # Find versions >= min_version
         min_ver = args.min_version
-        versions_to_test = [
-            v for v in DEFAULT_VERSIONS if v == "latest" or v >= min_ver
-        ]
+        versions_to_test = [v for v in DEFAULT_VERSIONS if v == "latest" or v >= min_ver]
     else:
         versions_to_test = DEFAULT_VERSIONS
 
@@ -191,17 +217,17 @@ def main():
         print("No versions to test!")
         return 1
 
-    project_root = Path(__file__).parent
+    project_root = Path(__file__).parent.parent
     print(f"Testing polars-nexpresso against {len(versions_to_test)} Polars version(s)")
     print(f"Versions: {', '.join(versions_to_test)}")
 
     results = {}
     for version in versions_to_test:
-        success, output = test_polars_version(version, project_root)
-        results[version] = (success, output)
+        success, output, actual_version = test_polars_version(version, project_root)
+        results[version] = (success, output, actual_version)
 
         if not success and args.stop_on_failure:
-            print(f"\n❌ Stopping on first failure (Polars {version})")
+            print(f"\n❌ Stopping on first failure (Polars {actual_version})")
             break
 
     # Print summary
@@ -209,20 +235,20 @@ def main():
     print("TEST SUMMARY")
     print(f"{'='*80}")
 
-    passed = sum(1 for success, _ in results.values() if success)
+    passed = sum(1 for success, _, _ in results.values() if success)
     failed = len(results) - passed
 
-    for version, (success, _) in results.items():
+    for version, (success, _, actual_version) in results.items():
         status = "✅ PASSED" if success else "❌ FAILED"
-        print(f"Polars {version:10s}: {status}")
+        print(f"Polars {actual_version:10s}: {status}")
 
     print(f"\nTotal: {len(results)} | Passed: {passed} | Failed: {failed}")
 
     if failed > 0:
         print("\nFailed versions:")
-        for version, (success, output) in results.items():
+        for version, (success, output, actual_version) in results.items():
             if not success:
-                print(f"\n  Polars {version}:")
+                print(f"\n  Polars {actual_version}:")
                 print(f"  {output[:200]}...")  # Show first 200 chars
 
     return 0 if failed == 0 else 1
