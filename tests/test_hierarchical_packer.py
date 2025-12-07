@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from nexpresso.hierarchical_packer import (
     HierarchicalPacker,
@@ -80,7 +81,7 @@ def _canonical_rows(df: FrameLike) -> list[str]:
 
 
 def _assert_same_rows(left: FrameLike, right: FrameLike):
-    assert _canonical_rows(left) == _canonical_rows(right)
+    assert_frame_equal(left, right)
 
 
 def test_pack_unpack_roundtrip(packer, apartment_level_df):
