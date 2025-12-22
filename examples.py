@@ -26,13 +26,8 @@ To run: python examples.py
 
 import polars as pl
 
-from nexpresso import (
-    HierarchicalPacker,
-    HierarchySpec,
-    LevelSpec,
-    apply_nested_operations,
-    generate_nested_exprs,
-)
+from nexpresso import HierarchicalPacker, HierarchySpec, LevelSpec, apply_nested_operations
+from nexpresso.hierarchical_packer import FrameT
 
 # Configure Polars display for better output
 pl.Config.set_tbl_rows(100)
