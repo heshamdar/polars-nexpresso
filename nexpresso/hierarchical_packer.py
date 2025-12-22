@@ -25,6 +25,8 @@ from polars.expr.expr import Expr
 FrameT = TypeVar("FrameT", pl.LazyFrame, pl.DataFrame)
 
 ColumnSelector = str | pl.Expr
+ExtraColumnsMode = Literal["preserve", "drop", "error"]
+
 ROW_ID_COLUMN = "__hier_row_id"
 DEFAULT_SEPARATOR = "."
 DEFAULT_ESCAPE_CHAR = "\\"
@@ -275,7 +277,13 @@ class HierarchicalPacker:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def pack(self, frame: FrameT, to_level: str) -> FrameT:
+    def pack(
+        self,
+        frame: FrameT,
+        to_level: str,
+        *,
+        extra_columns: ExtraColumnsMode = "preserve",
+    ) -> FrameT:
         """
         Pack flattened columns down to ``to_level`` so that rows represent the
         requested granularity.
@@ -283,6 +291,11 @@ class HierarchicalPacker:
         Args:
             frame: The DataFrame or LazyFrame to pack.
             to_level: The target level name to pack down to.
+            extra_columns: How to handle columns that don't belong to the hierarchy:
+                - ``"preserve"``: Keep extra columns if they have uniform values
+                  within each group (default). Raises error if values differ.
+                - ``"drop"``: Silently drop extra columns.
+                - ``"error"``: Raise an error if any extra columns are present.
 
         Returns:
             Packed frame with nested structures, same type as input.
@@ -290,9 +303,24 @@ class HierarchicalPacker:
         Raises:
             KeyError: If the level is not found in the hierarchy.
             HierarchyValidationError: If validation is enabled and data integrity
-                issues are detected.
+                issues are detected, or if extra_columns="error" and extra columns
+                are present.
         """
         lf, added_cols, schema = self._prepare_frame(frame)
+
+        # Identify and handle extra columns
+        extra_cols = self._identify_extra_columns(schema)
+        if extra_cols:
+            if extra_columns == "error":
+                raise HierarchyValidationError(
+                    f"Found {len(extra_cols)} column(s) not part of the hierarchy: "
+                    f"{extra_cols[:5]}{'...' if len(extra_cols) > 5 else ''}. "
+                    "Use extra_columns='preserve' to keep them or 'drop' to remove them.",
+                    details={"extra_columns": extra_cols},
+                )
+            elif extra_columns == "drop":
+                lf = lf.drop(*extra_cols)
+                schema = lf.collect_schema()
 
         target_idx = self.spec.index_of(to_level)
         for level_idx in reversed(range(target_idx, len(self._levels_meta))):
@@ -1031,6 +1059,55 @@ class HierarchicalPacker:
         if self.preserve_child_order:
             lf = lf.drop(ROW_ID_COLUMN, strict=False)
         return lf
+
+    def _identify_extra_columns(self, schema: pl.Schema) -> list[str]:
+        """
+        Identify columns that don't belong to any level in the hierarchy.
+
+        A column belongs to the hierarchy if:
+        - It starts with the root level name followed by the separator (e.g., "country.")
+        - OR it's an internal column (like __hier_row_id)
+        - OR it's a key alias column
+
+        Args:
+            schema: The current schema.
+
+        Returns:
+            List of column names that are not part of the hierarchy.
+        """
+        extra_cols: list[str] = []
+        root_prefix = f"{self._levels_meta[0].name}{self.separator}"
+
+        # Get all known hierarchy prefixes
+        hierarchy_prefixes = [meta.prefix for meta in self._levels_meta if meta.prefix]
+
+        # Also consider the root level path itself (for packed data)
+        hierarchy_paths = {meta.path for meta in self._levels_meta}
+
+        # Key alias targets are also valid
+        key_alias_targets = set(self.spec.key_aliases.keys())
+
+        for col in schema.keys():
+            # Skip internal columns
+            if col == ROW_ID_COLUMN:
+                continue
+
+            # Check if column is a known hierarchy path (for packed data)
+            if col in hierarchy_paths:
+                continue
+
+            # Check if column is a key alias target
+            if col in key_alias_targets:
+                continue
+
+            # Check if column starts with any hierarchy prefix
+            is_hierarchy_col = any(col.startswith(prefix) for prefix in hierarchy_prefixes)
+            if not is_hierarchy_col:
+                # Also check if it's the root level itself (without children)
+                if not col.startswith(root_prefix) and col != self._levels_meta[0].name:
+                    extra_cols.append(col)
+
+        return extra_cols
 
     def _qualify_field(self, level_idx: int, field: str) -> str:
         """

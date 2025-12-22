@@ -32,6 +32,8 @@ TEST_FILES = [
     "test_nested_helper.py",
     "test_hierarchical_packer.py",
     "test_structuring_utils.py",
+    "test_complex_hierarchies.py",
+    "test_integration.py",
 ]
 
 
@@ -80,6 +82,7 @@ requires-python = ">=3.10"
 dependencies = [
     "{polars_version_spec}",
     "pytest>=8.4.2",
+    "packaging>=21.0",
 ]
 
 [build-system]
@@ -106,6 +109,13 @@ packages = ["nexpresso"]
         # Copy all test files
         tests_dir = env_dir / "tests"
         tests_dir.mkdir(exist_ok=True)
+
+        # Copy conftest.py and __init__.py first (if they exist)
+        for special_file in ["conftest.py", "__init__.py"]:
+            src = project_root / "tests" / special_file
+            if src.exists():
+                shutil.copy(src, tests_dir / special_file)
+
         for test_file in TEST_FILES:
             src = project_root / "tests" / test_file
             if src.exists():
