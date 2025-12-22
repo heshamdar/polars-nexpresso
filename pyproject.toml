@@ -23,12 +23,13 @@ classifiers = [
 ]
 dependencies = [
     "polars>=1.20.0",
+    "packaging>=21.0",
 ]
 
 
 [project.urls]
 Homepage = "https://github.com/heshamdar/polars-nexpresso"
-Documentation = "https://github.com/heshamdar/polars-nexpresso#readme"
+Documentation = "https://heshamdar.github.io/polars-nexpresso"
 Repository = "https://github.com/heshamdar/polars-nexpresso"
 Issues = "https://github.com/heshamdar/polars-nexpresso/issues"
 
@@ -64,4 +65,10 @@ dev = [
     "black>=24.1.0",
     "ruff>=0.10.0",
     "mypy>=1.15.0",
+]
+docs = [
+    "mkdocs>=1.6.0",
+    "mkdocs-material>=9.5.0",
+    "mkdocstrings[python]>=0.26.0",
+    "pymdown-extensions>=10.0.0",
 ]

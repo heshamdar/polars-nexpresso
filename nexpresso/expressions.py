@@ -7,13 +7,27 @@ structs and deeply nested hierarchies.
 """
 
 from collections.abc import Callable
+from functools import lru_cache
 from typing import Literal
 
 import polars as pl
+from packaging import version
 from polars._typing import PolarsDataType
 from polars.expr.expr import Expr
 
 from nexpresso.hierarchical_packer import FrameT
+
+
+@lru_cache(maxsize=1)
+def _polars_version() -> version.Version:
+    """Get the current Polars version as a parsed Version object."""
+    return version.parse(pl.__version__)
+
+
+def _supports_arr_eval() -> bool:
+    """Check if the current Polars version supports arr.eval()."""
+    return _polars_version() >= version.parse("1.35.1")
+
 
 # Type aliases for better readability
 FieldValue = None | dict[str, "FieldValue"] | Callable[[pl.Expr], pl.Expr] | pl.Expr
@@ -129,6 +143,13 @@ class NestedExpressionBuilder:
         # Handle Array types (fixed-size arrays)
         # As of Polars 1.0+, Arrays support arr.eval() for element-wise operations
         if isinstance(dtype, pl.Array):
+            if not _supports_arr_eval():
+                raise ValueError(
+                    f"Array types require Polars >= 1.0.0 for arr.eval() support. "
+                    f"Current version: {pl.__version__}. "
+                    "Workaround: Convert the Array to a List first using "
+                    ".cast(pl.List(inner_type))."
+                )
             inner_expr = self._process_nested_field(dtype.inner, field_spec, pl.element())
             # Use arr.eval for arrays (available in Polars 1.0+)
             return base_expr.arr.eval(inner_expr)

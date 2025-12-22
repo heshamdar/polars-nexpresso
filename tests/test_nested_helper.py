@@ -14,9 +14,9 @@ Tests cover:
 
 import polars as pl
 import pytest
-from packaging import version
 
 from nexpresso import NestedExpressionBuilder, apply_nested_operations, generate_nested_exprs
+from tests.conftest import requires_arr_eval
 
 
 def test_create_new_top_level_column():
@@ -490,18 +490,12 @@ def test_list_of_lists_of_structs():
     assert result["nested_items"][0][1][0]["value"] == 6
 
 
-@pytest.mark.skipif(
-    version.parse(pl.__version__) < version.parse("1.35.1"),
-    reason="Older Polars versions raise SchemaError instead of InvalidOperationError",
-)
+@requires_arr_eval
 def test_array_type():
-    """Test that Array types raise an error (Arrays don't support list.eval in Polars).
+    """Test that Array types work with arr.eval() in Polars.
 
-    Note: Arrays in Polars are fixed-size and don't support list.eval() operations.
-    This test documents this limitation. Arrays should be converted to Lists first
-    if nested operations are needed.
-
-    Skipped on Polars versions < 1.35.1 due to different error behavior.
+    As of Polars 1.0+, Arrays support arr.eval() for element-wise operations.
+    This test verifies that nested operations work correctly on Array types.
     """
     df = pl.DataFrame(
         {
@@ -520,25 +514,17 @@ def test_array_type():
         }
     }
 
-    # Arrays don't support list.eval() in Polars, so this should raise an error
-    # The implementation has a limitation here - Arrays need to be converted to Lists first
+    # Arrays now support arr.eval() in Polars 1.0+
     exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
+    result = df.select(exprs)
 
-    with pytest.raises(
-        pl.exceptions.InvalidOperationError, match="list.eval operation not supported"
-    ):
-        df.select(exprs)
-
-    # Workaround: Convert Array to List first
-    df_list = df.with_columns(
-        pl.col("items").cast(pl.List(pl.Struct({"value": pl.Int64, "count": pl.Int64})))
-    )
-    exprs_list = generate_nested_exprs(fields, df_list.schema, struct_mode="with_fields")
-    result = df_list.select(exprs_list)
-
-    assert result["items"][0][0]["value"] == 2
-    assert result["items"][0][0]["count"] == 2
-    assert result["items"][0][1]["value"] == 6
+    # Verify the transformations worked
+    assert result["items"][0][0]["value"] == 2  # 1 * 2
+    assert result["items"][0][0]["count"] == 2  # unchanged
+    assert result["items"][0][1]["value"] == 6  # 3 * 2
+    assert result["items"][0][1]["count"] == 4  # unchanged
+    assert result["items"][1][0]["value"] == 10  # 5 * 2
+    assert result["items"][1][1]["value"] == 14  # 7 * 2
 
 
 def test_empty_field_spec_select_mode():

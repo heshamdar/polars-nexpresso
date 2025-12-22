@@ -26,7 +26,13 @@ To run: python examples.py
 
 import polars as pl
 
-from nexpresso import HierarchicalPacker, HierarchySpec, LevelSpec, apply_nested_operations
+from nexpresso import (
+    HierarchicalPacker,
+    HierarchySpec,
+    LevelSpec,
+    apply_nested_operations,
+    generate_nested_exprs,
+)
 from nexpresso.hierarchical_packer import FrameT
 
 # Configure Polars display for better output
@@ -643,6 +649,12 @@ def main():
     demonstrate_complete_workflow()
 
     print("\n" + "=" * 80)
+    print("  ALL EXAMPLES COMPLETED SUCCESSFULLY!")
+    print("=" * 80 + "\n")
+
+
+if __name__ == "__main__":
+    main()
     print("  ALL EXAMPLES COMPLETED SUCCESSFULLY!")
     print("=" * 80 + "\n")
 
