@@ -13,6 +13,8 @@ import polars as pl
 from polars._typing import PolarsDataType
 from polars.expr.expr import Expr
 
+from nexpresso.hierarchical_packer import FrameT
+
 # Type aliases for better readability
 FieldValue = None | dict[str, "FieldValue"] | Callable[[pl.Expr], pl.Expr] | pl.Expr
 
@@ -266,7 +268,7 @@ class NestedExpressionBuilder:
 
 def generate_nested_exprs(
     fields: dict[str, FieldValue],
-    schema: pl.Schema | pl.DataFrame | pl.LazyFrame,
+    schema: pl.Schema | FrameT,
     struct_mode: StructMode = "select",
 ) -> list[pl.Expr]:
     """
@@ -333,11 +335,11 @@ def generate_nested_exprs(
 
 # Convenience class method for direct DataFrame usage
 def apply_nested_operations(
-    df: pl.DataFrame | pl.LazyFrame,
+    df: FrameT,
     fields: dict[str, FieldValue],
     struct_mode: StructMode = "select",
     use_with_columns: bool = False,
-) -> pl.DataFrame | pl.LazyFrame:
+) -> FrameT:
     """
     Apply nested operations directly to a DataFrame or LazyFrame.
 
