@@ -130,20 +130,12 @@ print(flat)
 from nexpresso import apply_nested_operations
 
 # Add profit calculation to each product
+# With struct_mode="with_fields", all existing fields are preserved automatically
+# We only specify the new fields we want to add
 result = apply_nested_operations(nested, {
     "region": {
-        "id": None,
-        "name": None,
-        "manager": None,
         "store": {
-            "id": None,
-            "name": None,
-            "square_feet": None,
             "product": {
-                "id": None,
-                "name": None,
-                "price": None,
-                "cost": None,
                 "profit": pl.field("price") - pl.field("cost"),
                 "margin_pct": (
                     (pl.field("price") - pl.field("cost")) / 
@@ -239,19 +231,11 @@ nested = packer.build_from_tables({
     "product": products,
 })
 
-# 4. Add calculations
+# 4. Add calculations - with_fields preserves all existing fields
 result = apply_nested_operations(nested, {
     "region": {
-        "id": None,
-        "name": None,
         "store": {
-            "id": None,
-            "name": None,
             "product": {
-                "id": None,
-                "name": None,
-                "price": None,
-                "units_sold": None,
                 "revenue": pl.field("price") * pl.field("units_sold"),
             }
         }

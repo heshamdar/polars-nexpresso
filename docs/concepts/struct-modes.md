@@ -2,11 +2,18 @@
 
 When transforming struct fields, Nexpresso provides two modes that control how unspecified fields are handled.
 
+!!! tip "Key Difference"
+    - **`select`**: You must use `field: None` to keep fields you don't want to modify
+    - **`with_fields`**: Fields **inside structs** are preserved automatically - only specify fields you want to add or modify
+
+!!! warning "Top-level columns"
+    The `struct_mode` only affects fields **inside struct columns**. Top-level DataFrame columns must always be included in the dictionary (use `column: None` to keep unchanged).
+
 ## The Two Modes
 
 ### `select` Mode (Default)
 
-Only keeps fields that are explicitly specified in the dictionary.
+Only keeps fields that are explicitly specified in the dictionary. **You must use `field: None` to keep any field you want to preserve.**
 
 ```python
 df = pl.DataFrame({
@@ -15,23 +22,25 @@ df = pl.DataFrame({
 
 result = apply_nested_operations(df, {
     "data": {
-        "a": None,
-        "b": lambda x: x * 2,
+        "a": None,       # Keep "a" unchanged
+        "b": lambda x: x * 2,  # Modify "b"
+        # "c" is NOT specified, so it will be DROPPED!
     }
 }, struct_mode="select")
 
 # Result: {"a": 1, "b": 4}
-# Field "c" is dropped!
+# Field "c" is dropped because it wasn't specified!
 ```
 
 ### `with_fields` Mode
 
-Keeps all existing fields, adds or modifies only those specified.
+Keeps all existing fields automatically. **No need to specify `field: None`** - only specify fields you want to add or modify.
 
 ```python
 result = apply_nested_operations(df, {
     "data": {
-        "a": lambda x: x * 10,
+        "a": lambda x: x * 10,  # Modify "a"
+        # "b" and "c" are preserved automatically - no need to list them!
     }
 }, struct_mode="with_fields")
 

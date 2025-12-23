@@ -61,3 +61,5 @@ dmypy.json
 
 # ruff
 .ruff_cache/
+
+site/

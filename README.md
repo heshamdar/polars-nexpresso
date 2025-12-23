@@ -43,9 +43,7 @@ df = pl.DataFrame({
 # Define transformations declaratively
 fields = {
     "order": {
-        "customer": None,  # Keep as-is
         "items": {
-            "name": None,
             "price": lambda x: x * 1.1,  # 10% price increase
             "discounted": pl.field("price") * 0.9,  # New field
         }
@@ -144,7 +142,6 @@ df = pl.DataFrame({
 
 fields = {
     "items": {
-        "name": None,
         "qty": lambda x: x * 2,
         "total": pl.field("qty") * 10,
     }
@@ -158,8 +155,6 @@ result = apply_nested_operations(df, fields, struct_mode="with_fields")
 ```python
 fields = {
     "customer": {
-        "name": None,
-        "tier": None,
         "discount": pl.when(pl.field("tier") == "Gold")
             .then(0.15)
             .when(pl.field("tier") == "Silver")

@@ -67,10 +67,7 @@ Use a dictionary to specify what to do with each field:
 
 ```python
 fields = {
-    "order_id": None,  # Keep as-is
     "customer": {
-        "name": None,  # Keep as-is
-        "tier": None,  # Keep as-is
         # Add new field based on tier
         "discount": pl.when(pl.field("tier") == "Gold")
             .then(0.15)
@@ -79,9 +76,6 @@ fields = {
             .otherwise(0.05),
     },
     "items": {
-        "product": None,
-        "price": None,
-        "qty": None,
         # Calculate line total
         "total": pl.field("price") * pl.field("qty"),
     },

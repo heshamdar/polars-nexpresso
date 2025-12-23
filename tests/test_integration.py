@@ -81,21 +81,11 @@ class TestEndToEndWorkflows:
         assert "region" in nested.columns
 
         # Step 3: Transform nested data with calculations
+        # with_fields mode: only specify fields to add/modify - existing fields preserved
         fields = {
             "region": {
-                "id": None,
-                "name": None,
-                "manager": None,
                 "store": {
-                    "id": None,
-                    "name": None,
-                    "square_feet": None,
                     "product": {
-                        "id": None,
-                        "name": None,
-                        "price": None,
-                        "cost": None,
-                        "units_sold": None,
                         "revenue": pl.field("price") * pl.field("units_sold"),
                         "profit": (pl.field("price") - pl.field("cost")) * pl.field("units_sold"),
                         "margin_pct": (
@@ -167,12 +157,12 @@ class TestEndToEndWorkflows:
         )
 
         # Apply tiered discounts and loyalty bonuses
+        # Note: Top-level columns must be included (order_id), but nested struct fields
+        # are automatically preserved by with_fields mode
         fields = {
-            "order_id": None,
+            "order_id": None,  # Top-level column must be kept explicitly
             "customer": {
-                "name": None,
-                "tier": None,
-                "years_member": None,
+                # Fields inside struct (name, tier, years_member) preserved by with_fields
                 "discount_pct": pl.when(pl.field("tier") == "Gold")
                 .then(15)
                 .when(pl.field("tier") == "Silver")
@@ -185,10 +175,9 @@ class TestEndToEndWorkflows:
                 .otherwise(pl.lit("Standard")),
             },
             "items": {
-                "product": None,
-                "price": None,
-                "qty": None,
-                "subtotal": pl.field("price") * pl.field("qty"),
+                # Fields inside struct (product, price, qty) preserved by with_fields
+                "subtotal": pl.field("price")
+                * pl.field("qty"),
             },
         }
 
@@ -376,14 +365,11 @@ class TestExpressionBuilderIntegration:
             }
         )
 
-        # First transformation: calculate rates
+        # First transformation: calculate rates (with_fields preserves existing)
         rates = apply_nested_operations(
             df,
             {
                 "metrics": {
-                    "views": None,
-                    "clicks": None,
-                    "conversions": None,
                     "click_rate": pl.field("clicks") / pl.field("views") * 100,
                     "conv_rate": pl.field("conversions") / pl.field("clicks") * 100,
                 }
@@ -395,16 +381,11 @@ class TestExpressionBuilderIntegration:
         assert rates["metrics"][0]["click_rate"] == 5.0  # 50/1000 * 100
         assert rates["metrics"][0]["conv_rate"] == 20.0  # 10/50 * 100
 
-        # Second transformation: normalize values
+        # Second transformation: add more fields (existing preserved automatically)
         normalized = apply_nested_operations(
             rates,
             {
                 "metrics": {
-                    "views": None,
-                    "clicks": None,
-                    "conversions": None,
-                    "click_rate": None,
-                    "conv_rate": None,
                     "views_normalized": pl.field("views") / 1000,
                     "performance_score": (pl.field("click_rate") + pl.field("conv_rate")) / 2,
                 }
@@ -453,22 +434,14 @@ class TestRealWorldScenarios:
             }
         )
 
-        # Calculate order totals
+        # Calculate order totals (with_fields preserves existing fields)
         result = apply_nested_operations(
             orders,
             {
                 "order": {
-                    "id": None,
-                    "customer_id": None,
-                    "status": None,
                     "items": {
-                        "sku": None,
-                        "name": None,
-                        "qty": None,
-                        "unit_price": None,
                         "line_total": pl.field("qty") * pl.field("unit_price"),
                     },
-                    "shipping": None,
                 }
             },
             struct_mode="with_fields",
