@@ -7,7 +7,7 @@ When transforming struct fields, Nexpresso provides two modes that control how u
     - **`with_fields`**: Fields **inside structs** are preserved automatically - only specify fields you want to add or modify
 
 !!! warning "Top-level columns"
-    The `struct_mode` only affects fields **inside struct columns**. Top-level DataFrame columns must always be included in the dictionary (use `column: None` to keep unchanged).
+    The `struct_mode` only affects fields **inside struct columns**. To keep top level columns, use the standard `.with_columns()` context.
 
 ## The Two Modes
 

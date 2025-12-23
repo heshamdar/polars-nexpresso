@@ -44,7 +44,7 @@ Each key in the fields dictionary is a column or field name. The value specifies
     - **`struct_mode="select"`**: Use `field: None` for every field you want to keep
     - **`struct_mode="with_fields"`**: `None` is **not needed inside structs** - all struct fields are preserved automatically. Only specify fields you want to add or modify.
     
-    **Important:** Top-level DataFrame columns must always be included in the dictionary regardless of mode. Use `column: None` to keep a top-level column unchanged.
+    **Important:** To keep top level columns, use the standard `.with_columns()` context.
 
 ### `Callable` - Transform
 
