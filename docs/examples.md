@@ -37,9 +37,6 @@ df = pl.DataFrame({
 # Add calculated field
 result = apply_nested_operations(df, {
     "product": {
-        "name": None,
-        "price": None,
-        "qty": None,
         "total": pl.field("price") * pl.field("qty"),
     }
 }, struct_mode="with_fields")
@@ -65,9 +62,6 @@ df = pl.DataFrame({
 # Transform each item in the list
 result = apply_nested_operations(df, {
     "orders": {
-        "item": None,
-        "price": None,
-        "qty": None,
         "subtotal": pl.field("price") * pl.field("qty"),
     }
 }, struct_mode="with_fields")
@@ -89,9 +83,6 @@ df = pl.DataFrame({
 
 result = apply_nested_operations(df, {
     "customer": {
-        "name": None,
-        "tier": None,
-        "years": None,
         "discount": pl.when(pl.field("tier") == "Gold")
             .then(0.15)
             .when(pl.field("tier") == "Silver")
@@ -126,12 +117,8 @@ df = pl.DataFrame({
 
 result = apply_nested_operations(df, {
     "company": {
-        "name": None,
         "departments": {
-            "name": None,
             "employees": {
-                "name": None,
-                "salary": None,
                 "annual_bonus": pl.field("salary") * 0.1,
             }
         }
@@ -323,17 +310,8 @@ nested = packer.build_from_tables({
 # 3. Add calculations
 enriched = apply_nested_operations(nested, {
     "region": {
-        "id": None,
-        "name": None,
         "store": {
-            "id": None,
-            "name": None,
             "product": {
-                "id": None,
-                "name": None,
-                "price": None,
-                "cost": None,
-                "units": None,
                 "revenue": pl.field("price") * pl.field("units"),
                 "profit": (pl.field("price") - pl.field("cost")) * pl.field("units"),
             }

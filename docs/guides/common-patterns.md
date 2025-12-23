@@ -8,11 +8,9 @@ This guide shows recipes for common tasks with Nexpresso.
 
 ```python
 # Add profit and margin to products
+# With with_fields mode, existing fields (name, price, cost) are kept automatically
 result = apply_nested_operations(df, {
     "products": {
-        "name": None,
-        "price": None,
-        "cost": None,
         "profit": pl.field("price") - pl.field("cost"),
         "margin": (pl.field("price") - pl.field("cost")) / pl.field("price"),
     }
@@ -22,10 +20,9 @@ result = apply_nested_operations(df, {
 ### Conditional Logic
 
 ```python
-# Apply tiered discounts
+# Apply tiered discounts - existing fields preserved automatically
 result = apply_nested_operations(df, {
     "customer": {
-        "tier": None,
         "discount": pl.when(pl.field("tier") == "Gold")
             .then(0.15)
             .when(pl.field("tier") == "Silver")
@@ -38,12 +35,12 @@ result = apply_nested_operations(df, {
 ### String Transformations
 
 ```python
-# Normalize text fields
+# Normalize text fields - modify existing and add new
 result = apply_nested_operations(df, {
     "user": {
-        "email": lambda x: x.str.to_lowercase(),
-        "name": lambda x: x.str.strip_chars(),
-        "name_upper": pl.field("name").str.to_uppercase(),
+        "email": lambda x: x.str.to_lowercase(),  # Modify existing
+        "name": lambda x: x.str.strip_chars(),     # Modify existing
+        "name_upper": pl.field("name").str.to_uppercase(),  # Add new
     }
 }, struct_mode="with_fields")
 ```
@@ -51,10 +48,9 @@ result = apply_nested_operations(df, {
 ### Working with Dates
 
 ```python
-# Extract date components
+# Extract date components from timestamp - add new fields
 result = apply_nested_operations(df, {
     "event": {
-        "timestamp": None,
         "year": pl.field("timestamp").dt.year(),
         "month": pl.field("timestamp").dt.month(),
         "day_of_week": pl.field("timestamp").dt.weekday(),

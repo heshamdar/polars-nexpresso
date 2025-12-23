@@ -77,24 +77,13 @@ Use nested expressions to add calculations without unpacking:
 
 ```python
 # Define product-level calculations
+# With struct_mode="with_fields", we only need to specify the fields we're adding/modifying
+# All existing fields are automatically preserved
 fields = {
     "region": {
-        "id": None,
-        "name": None,
-        "manager": None,
         "store": {
-            "id": None,
-            "name": None,
-            "square_feet": None,
-            "opened_year": None,
             "product": {
-                "id": None,
-                "name": None,
-                "category": None,
-                "price": None,
-                "cost": None,
-                "units_sold": None,
-                # Add calculated fields
+                # Add calculated fields - existing fields (id, name, price, etc.) are kept automatically
                 "revenue": pl.field("price") * pl.field("units_sold"),
                 "total_cost": pl.field("cost") * pl.field("units_sold"),
                 "profit": (pl.field("price") - pl.field("cost")) * pl.field("units_sold"),
@@ -260,20 +249,11 @@ def main():
         "product": products,
     })
     
-    # Add metrics
+    # Add metrics - with_fields mode preserves all existing fields automatically
     enriched = apply_nested_operations(nested, {
         "region": {
-            "id": None,
-            "name": None,
             "store": {
-                "id": None,
-                "name": None,
                 "product": {
-                    "id": None,
-                    "name": None,
-                    "price": None,
-                    "cost": None,
-                    "units_sold": None,
                     "revenue": pl.field("price") * pl.field("units_sold"),
                     "profit": (pl.field("price") - pl.field("cost")) * pl.field("units_sold"),
                 }

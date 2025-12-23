@@ -30,11 +30,10 @@ Working with nested data in Polars is powerful but can be verbose. Nexpresso red
 === "With Nexpresso"
 
     ```python
+    # with_fields mode preserves existing fields automatically
     apply_nested_operations(df, {
         "orders": {
-            "item": None,
-            "price": None,
-            "total": pl.field("price") * pl.field("qty")
+            "total": pl.field("price") * pl.field("qty")  # Just add the new field
         }
     }, struct_mode="with_fields")
     ```
@@ -68,16 +67,15 @@ df = pl.DataFrame({
 })
 
 # Transform with nested expressions
+# with_fields mode: just specify what you want to add/modify
 result = apply_nested_operations(df, {
     "order": {
-        "customer": None,  # Keep as-is
         "items": {
-            "name": None,
-            "price": None,
             "discounted": pl.field("price") * 0.9,  # Add new field
         }
     }
 }, struct_mode="with_fields")
+# All existing fields (customer, name, price) are preserved automatically!
 ```
 
 ## Features

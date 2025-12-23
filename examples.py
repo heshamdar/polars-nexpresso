@@ -256,12 +256,6 @@ def demonstrate_nested_expressions(flat: pl.DataFrame):
         "region": {
             "store": {
                 "product": {
-                    # Keep existing fields
-                    "name": None,
-                    "category": None,
-                    "price": None,
-                    "cost": None,
-                    "units_sold": None,
                     # Calculate new metrics
                     "revenue": pl.field("price") * pl.field("units_sold"),
                     "total_cost": pl.field("cost") * pl.field("units_sold"),
@@ -334,11 +328,7 @@ def demonstrate_conditional_transformations():
 
     # Apply tiered discounts
     fields = {
-        "order_id": None,
         "customer": {
-            "name": None,
-            "tier": None,
-            "years_member": None,
             # Calculate discount based on tier
             "discount_pct": pl.when(pl.field("tier") == "Gold")
             .then(15)
@@ -353,9 +343,6 @@ def demonstrate_conditional_transformations():
             .otherwise(pl.lit("Standard")),
         },
         "items": {
-            "product": None,
-            "price": None,
-            "qty": None,
             "line_total": pl.field("price") * pl.field("qty"),
             # Flag high-value items
             "is_high_value": pl.field("price") > 100,
@@ -649,12 +636,6 @@ def main():
     demonstrate_complete_workflow()
 
     print("\n" + "=" * 80)
-    print("  ALL EXAMPLES COMPLETED SUCCESSFULLY!")
-    print("=" * 80 + "\n")
-
-
-if __name__ == "__main__":
-    main()
     print("  ALL EXAMPLES COMPLETED SUCCESSFULLY!")
     print("=" * 80 + "\n")
 
