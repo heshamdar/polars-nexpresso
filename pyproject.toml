@@ -1,6 +1,6 @@
 [project]
 name = "polars-nexpresso"
-version = "0.1.2"
+version = "0.2.0"
 description = "A utility library for generating Polars expressions to work with nested data structures"
 readme = "README.md"
 requires-python = ">=3.10"
