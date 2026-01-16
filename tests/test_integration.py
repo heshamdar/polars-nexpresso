@@ -10,7 +10,6 @@ These tests verify end-to-end workflows that combine:
 from __future__ import annotations
 
 import polars as pl
-import pytest
 
 from nexpresso import (
     HierarchicalPacker,

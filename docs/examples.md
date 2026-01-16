@@ -143,26 +143,49 @@ spec = HierarchySpec(
 )
 packer = HierarchicalPacker(spec)
 
-# Flat data
+# Example: Population measures at multiple granularities
+
 flat = pl.DataFrame({
     "country.code": ["US", "US", "CA"],
     "country.name": ["United States", "United States", "Canada"],
+    "country.population": [330_000_000, 330_000_000, 38_000_000],
     "country.city.id": ["NYC", "LA", "TOR"],
     "country.city.name": ["New York", "Los Angeles", "Toronto"],
+    "country.city.population": [8_800_000, 4_000_000, 2_900_000],
 })
 
-# Pack to country level
+# Pack to the country level (nesting the cities inside each country)
 packed = packer.pack(flat, "country")
-print("Packed:")
+print("Packed (nested country/city with populations):")
 print(packed)
 
-# Unpack back
-unpacked = packer.unpack(packed, "city")
-print("Unpacked:")
-print(unpacked)
+# Want to compute city population normalized by country population (city pop / country pop)
+# First, unpack to the city level so that each row is a city, but country-level columns are accessible
+
+city_level = packer.unpack(packed, "city")
+print("Unpacked to city level:")
+print(city_level)
+
+# Calculate normalized population and assign new column 'country.city.population_norm'
+city_level = city_level.with_columns(
+    (pl.col("country.city.population") / pl.col("country.population")).alias("country.city.population_norm")
+)
+print("City level with normalized population:")
+print(city_level)
+
+# Now, pack back to the country level so that the computed normalized value is nested within each city
+repacked = packer.pack(city_level, "country")
+print("Packed back to country level with normalized population:")
+print(repacked)
+
+# Note:
+# In Polars, with a deeply nested structure, you cannot easily do:
+#   pl.col("city").list.eval(pl.element().struct.with_fields(pl.field("population")/pl.col("population"))) 
+# because those fields live at different levels (inside lists/structs).
+# The unpack/pack pattern makes such cross-level calculations tractable.
 ```
 
-### Building from Database Tables
+### Building from Database (normalized) Tables
 
 ```python
 spec = HierarchySpec.from_levels(

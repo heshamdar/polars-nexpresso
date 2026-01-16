@@ -31,9 +31,7 @@ from nexpresso import (
     HierarchySpec,
     LevelSpec,
     apply_nested_operations,
-    generate_nested_exprs,
 )
-from nexpresso.hierarchical_packer import FrameT
 
 # Configure Polars display for better output
 pl.Config.set_tbl_rows(100)

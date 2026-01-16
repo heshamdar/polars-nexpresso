@@ -14,25 +14,45 @@ Country
 
 In a flat representation, this might look like:
 
-| country.code | country.city.id | country.city.street.name |
-|--------------|-----------------|--------------------------|
-| US           | NYC             | Broadway                 |
-| US           | NYC             | 5th Ave                  |
-| US           | LA              | Sunset Blvd              |
+**Flat Table Representation**
 
-In a nested representation (packed to country level):
+| country.code | country.city.id | country.city.street.name | country.population | country.city.population | country.city.street.population |
+|--------------|----------------|-------------------------|--------------------|------------------------|-------------------------------|
+| US           | NYC            | Broadway                | 10000000           | 8000000                | 21.0                          |
+| US           | NYC            | 5th Ave                 | 10000000           | 8000000                | 10.0                          |
+| US           | LA             | Sunset Blvd             | 10000000           | 4000000                | 35.0                          |
+| US           | LA             | Sunset Blvd             | 10000000           | 4000000                | 35.0                          |
 
-```
+**Nested Representation (packed at country level):**
+
+```json
 {
   "country": {
     "code": "US",
+    "population": 10000000,
     "city": [
-      {"id": "NYC", "street": [{"name": "Broadway"}, {"name": "5th Ave"}]},
-      {"id": "LA", "street": [{"name": "Sunset Blvd"}]}
+      {
+        "id": "NYC",
+        "population": 8000000,
+        "street": [
+          {"name": "Broadway", "population": 21.0},
+          {"name": "5th Ave", "population": 10.0}
+        ]
+      },
+      {
+        "id": "LA",
+        "population": 4000000,
+        "street": [
+          {"name": "Sunset Blvd", "population": 35.0}
+        ]
+      }
     ]
   }
 }
 ```
+
+
+The benefit of a nested structure is that multiple granularities can be represented in a single table, unlike standard flat/denormalized data. One current limitation with polars is that operations cannot easily be carried out between different granularities, but using Nexpresso, you can perform operations between different granularities by simply unpacking to your required level, performing your operations, and then packing back.
 
 ## Key Operations
 
