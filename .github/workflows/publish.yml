@@ -37,7 +37,7 @@ jobs:
 
       - name: Run tests with Polars ${{ matrix.polars-version }}
         run: |
-          uv run python test_matrix.py --versions ${{ matrix.polars-version }} --stop-on-failure
+          uv run python tests/test_matrix.py --versions ${{ matrix.polars-version }} --stop-on-failure
 
   publish:
     needs: test
