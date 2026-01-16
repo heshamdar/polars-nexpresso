@@ -1,557 +1,641 @@
+#!/usr/bin/env python3
 """
-Comprehensive examples showcasing polars-nexpresso functionality.
+Polars Nexpresso - Comprehensive Examples
+==========================================
 
-This file demonstrates various use cases and features of the helper, including:
-- Creating new columns and fields
-- Working with nested structs and lists
-- Selecting vs modifying fields (select vs with_fields modes)
-- Transforming nested data structures
-- Conditional transformations
-- Real-world scenarios
+This file demonstrates the complete workflow of polars-nexpresso, showing how to:
 
-Key Concepts:
-- pl.field() references ORIGINAL struct fields, not transformed ones
-- Transformations apply to the field itself (e.g., lambda x: x * 2)
-- Operations don't accumulate - multiple references get the same original value
-- Use struct_mode="select" to keep only specified fields
-- Use struct_mode="with_fields" to keep all fields and add/modify some
+1. Build hierarchical data from normalized database tables
+2. Pack/unpack data at different granularities
+3. Transform nested fields using intuitive expressions
+4. Split and normalize hierarchical data
+
+The Scenario: E-Commerce Analytics
+----------------------------------
+We'll model an e-commerce system with the following hierarchy:
+
+    Region → Store → Product (with sales data)
+
+Starting from separate "database tables", we'll:
+- Join them into a nested hierarchy
+- Analyze and transform the data at various levels
+- Use nested expressions for complex calculations
 
 To run: python examples.py
 """
 
 import polars as pl
 
-from nexpresso import apply_nested_operations, generate_nested_exprs
+from nexpresso import (
+    HierarchicalPacker,
+    HierarchySpec,
+    LevelSpec,
+    apply_nested_operations,
+)
 
+# Configure Polars display for better output
 pl.Config.set_tbl_rows(100)
-pl.Config.set_tbl_cols(100)
-pl.Config.set_tbl_width_chars(100)
+pl.Config.set_tbl_cols(20)
+pl.Config.set_tbl_width_chars(200)
 pl.Config.set_fmt_str_lengths(100)
 
 
-def example_1_basic_column_operations():
-    """Example 1: Basic column operations at the top level."""
+def print_section(title: str, description: str = "") -> None:
+    """Print a section header."""
+    print("\n" + "=" * 80)
+    print(f"  {title}")
     print("=" * 80)
-    print("Example 1: Basic Column Operations")
-    print("=" * 80)
+    if description:
+        print(f"\n{description}\n")
 
-    df = pl.DataFrame(
+
+def print_subsection(title: str) -> None:
+    """Print a subsection header."""
+    print(f"\n--- {title} ---\n")
+
+
+# =============================================================================
+# PART 1: THE DATA - Simulating Database Tables
+# =============================================================================
+
+
+def create_database_tables() -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """
+    Create sample data representing normalized database tables.
+
+    In a real scenario, these might come from:
+    - PostgreSQL/MySQL queries
+    - CSV files
+    - API responses
+    - Data warehouse exports
+    """
+    # Regions table (parent level)
+    regions = pl.DataFrame(
         {
-            "name": ["Alice", "Bob", "Charlie"],
-            "age": [25, 30, 35],
-            "salary": [50000, 60000, 70000],
+            "id": ["west", "east", "central"],
+            "name": ["West Coast", "East Coast", "Central"],
+            "timezone": ["PST", "EST", "CST"],
+            "manager": ["Alice", "Bob", "Charlie"],
         }
     )
 
-    print("Original DataFrame:")
-    print(df)
-    print()
-
-    # Keep existing columns, create new ones
-    fields = {
-        "name": None,  # Keep as-is
-        "age": None,  # Keep as-is
-        "salary": lambda x: x * 1.1,  # Apply 10% raise
-        "bonus": pl.col("salary") * 0.1,  # Calculate bonus based on original salary
-        "total_comp": pl.col("salary") * 1.1
-        + pl.col("salary") * 0.1,  # Total compensation
-    }
-
-    exprs = generate_nested_exprs(fields, df.schema)
-    result = df.select(exprs)
-
-    print("After transformations:")
-    print(result)
-    print()
-
-
-def example_2_nested_struct_operations():
-    """Example 2: Working with nested structs - creating and modifying fields."""
-    print("=" * 80)
-    print("Example 2: Nested Struct Operations")
-    print("=" * 80)
-
-    df = pl.DataFrame(
+    # Stores table (child of region)
+    stores = pl.DataFrame(
         {
-            "employee": [
-                {"name": "Alice", "address": {"city": "NYC", "zip": "10001"}},
-                {"name": "Bob", "address": {"city": "LA", "zip": "90001"}},
-                {"name": "Charlie", "address": {"city": "Chicago", "zip": "60601"}},
-            ]
+            "id": ["s1", "s2", "s3", "s4", "s5"],
+            "name": ["SF Downtown", "LA Beach", "NYC Times Sq", "Chicago Loop", "Denver Mall"],
+            "square_feet": [5000, 3500, 8000, 4500, 3000],
+            "opened_year": [2015, 2018, 2010, 2019, 2020],
+            "region_id": ["west", "west", "east", "central", "central"],  # Foreign key
         }
     )
 
-    print("Original DataFrame:")
-    print(df)
-    print()
-
-    # Modify nested fields and create new ones
-    fields = {
-        "employee": {
-            "name": None,  # Keep name
-            "address": {
-                "city": None,  # Keep city
-                "zip": None,  # Keep zip
-                "state": pl.lit("Unknown"),  # Add new field
-            },
-            "full_address": pl.field("address").struct.field("city")
-            + pl.lit(", ")
-            + pl.field("address").struct.field("zip"),  # Create computed field
-        }
-    }
-
-    exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
-    result = df.select(exprs)
-
-    print("After adding nested fields:")
-    print(result)
-    print()
-
-
-def example_3_select_mode():
-    """Example 3: Using select mode to keep only specified fields."""
-    print("=" * 80)
-    print("Example 3: Select Mode - Keeping Only Specified Fields")
-    print("=" * 80)
-
-    df = pl.DataFrame(
+    # Products table (child of store) - with sales data
+    products = pl.DataFrame(
         {
-            "product": [
-                {"name": "Widget", "price": 10.0, "cost": 5.0, "stock": 100},
-                {"name": "Gadget", "price": 20.0, "cost": 8.0, "stock": 50},
-                {"name": "Thing", "price": 15.0, "cost": 7.0, "stock": 200},
-            ]
-        }
-    )
-
-    print("Original DataFrame:")
-    print(df)
-    print()
-
-    # Select mode: only keep specified fields
-    fields = {
-        "product": {
-            "name": None,  # Keep name
-            "price": lambda x: x * 1.2,  # Increase price by 20%
-            # cost and stock are excluded - they won't appear in result
-        }
-    }
-
-    exprs = generate_nested_exprs(fields, df.schema, struct_mode="select")
-    result = df.select(exprs)
-
-    print("After select (only name and modified price):")
-    print(result)
-    print()
-
-
-def example_4_with_fields_mode():
-    """Example 4: Using with_fields mode to add/modify while keeping all fields."""
-    print("=" * 80)
-    print("Example 4: With Fields Mode - Modifying While Keeping All Fields")
-    print("=" * 80)
-
-    df = pl.DataFrame(
-        {
-            "product": [
-                {"name": "Widget", "price": 10.0, "cost": 5.0, "stock": 100},
-                {"name": "Gadget", "price": 20.0, "cost": 8.0, "stock": 50},
-                {"name": "Thing", "price": 15.0, "cost": 7.0, "stock": 200},
-            ]
-        }
-    )
-
-    print("Original DataFrame:")
-    print(df)
-    print()
-
-    # With fields mode: keep all fields, add/modify some
-    fields = {
-        "product": {
-            "price": lambda x: x * 1.2,  # Modify price
-            "profit": pl.field("price") * 1.2
-            - pl.field("cost"),  # New field using original values
-            "margin": (pl.field("price") * 1.2 - pl.field("cost"))
-            / (pl.field("price") * 1.2),  # New field
-            # name, cost, stock are kept as-is
-        }
-    }
-
-    exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
-    result = df.select(exprs)
-
-    print("After with_fields (all fields kept, new ones added):")
-    print(result)
-    print()
-
-
-def example_5_lists_of_structs():
-    """Example 5: Working with lists of structs."""
-    print("=" * 80)
-    print("Example 5: Lists of Structs")
-    print("=" * 80)
-
-    df = pl.DataFrame(
-        {
-            "order_id": [1, 2, 3],
-            "items": [
-                [
-                    {"product": "Apple", "quantity": 5, "price": 1.0},
-                    {"product": "Banana", "quantity": 10, "price": 0.5},
-                ],
-                [
-                    {"product": "Orange", "quantity": 3, "price": 1.5},
-                ],
-                [
-                    {"product": "Grape", "quantity": 2, "price": 2.0},
-                    {"product": "Apple", "quantity": 4, "price": 1.0},
-                ],
+            "id": ["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10"],
+            "name": [
+                "Laptop",
+                "Phone",
+                "Tablet",
+                "Laptop",
+                "Phone",
+                "Laptop",
+                "Monitor",
+                "Keyboard",
+                "Mouse",
+                "Headphones",
             ],
+            "category": [
+                "Electronics",
+                "Electronics",
+                "Electronics",
+                "Electronics",
+                "Electronics",
+                "Electronics",
+                "Electronics",
+                "Accessories",
+                "Accessories",
+                "Accessories",
+            ],
+            "price": [
+                999.99,
+                699.99,
+                449.99,
+                1099.99,
+                799.99,
+                899.99,
+                349.99,
+                129.99,
+                49.99,
+                199.99,
+            ],
+            "cost": [700.00, 450.00, 300.00, 750.00, 500.00, 600.00, 200.00, 70.00, 25.00, 100.00],
+            "units_sold": [150, 300, 200, 120, 250, 180, 90, 400, 600, 150],
+            "store_id": ["s1", "s1", "s1", "s2", "s2", "s3", "s3", "s4", "s4", "s5"],  # Foreign key
         }
     )
 
-    print("Original DataFrame:")
-    print(df)
-    print()
-
-    # Transform items in the list
-    fields = {
-        "order_id": None,  # Keep order_id
-        "items": {
-            "product": None,  # Keep product name
-            "quantity": lambda x: x * 2,  # Double quantity
-            "price": None,  # Keep price
-            # Note: pl.field() references original values, not transformed
-            "subtotal": pl.field("quantity")
-            * pl.field("price"),  # Original qty * price
-            "discounted_price": pl.field("price") * 0.9,  # 10% discount
-        },
-    }
-
-    exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
-    result = df.select(exprs)
-
-    print("After transforming list items:")
-    print(result)
-    print()
+    return regions, stores, products
 
 
-def example_6_deeply_nested():
-    """Example 6: Deeply nested structures."""
-    print("=" * 80)
-    print("Example 6: Deeply Nested Structures")
-    print("=" * 80)
+# =============================================================================
+# PART 2: BUILDING THE HIERARCHY
+# =============================================================================
 
-    df = pl.DataFrame(
+
+def demonstrate_hierarchy_building():
+    """Demonstrate building a nested hierarchy from flat tables."""
+    print_section(
+        "PART 1: Building a Hierarchy from Database Tables",
+        "We start with three separate tables (like in a relational database)\n"
+        "and combine them into a nested hierarchical structure.",
+    )
+
+    regions, stores, products = create_database_tables()
+
+    print_subsection("Input Tables (Normalized Data)")
+    print("REGIONS table:")
+    print(regions)
+    print("\nSTORES table:")
+    print(stores)
+    print("\nPRODUCTS table:")
+    print(products)
+
+    # Define the hierarchy with explicit parent-child relationships
+    spec = HierarchySpec.from_levels(
+        LevelSpec(name="region", id_fields=["id"]),
+        LevelSpec(name="store", id_fields=["id"], parent_keys=["region_id"]),
+        LevelSpec(name="product", id_fields=["id"], parent_keys=["store_id"]),
+    )
+
+    packer = HierarchicalPacker(spec)
+
+    # Build the nested structure
+    nested = packer.build_from_tables(
         {
-            "company": [
-                {
-                    "name": "TechCorp",
-                    "departments": [
-                        {
-                            "name": "Engineering",
-                            "employees": [
-                                {"name": "Alice", "salary": 100000},
-                                {"name": "Bob", "salary": 120000},
-                            ],
-                        },
-                        {
-                            "name": "Sales",
-                            "employees": [
-                                {"name": "Charlie", "salary": 80000},
-                            ],
-                        },
-                    ],
+            "region": regions,
+            "store": stores,
+            "product": products,
+        }
+    )
+
+    print_subsection("Result: Nested Hierarchy")
+    print("Data is now nested: Region → Store → Product")
+    print(nested)
+
+    return nested, packer
+
+
+# =============================================================================
+# PART 3: WORKING WITH HIERARCHICAL DATA
+# =============================================================================
+
+
+def demonstrate_pack_unpack(nested: pl.DataFrame, packer: HierarchicalPacker):
+    """Demonstrate packing and unpacking operations."""
+    print_section(
+        "PART 2: Packing and Unpacking",
+        "Navigate between different levels of granularity.\n"
+        "Packing aggregates child rows into nested structures.\n"
+        "Unpacking explodes nested structures into flat rows.",
+    )
+
+    print_subsection("Unpack to Product Level (Finest Granularity)")
+    print("Each row represents one product with all parent data included:")
+    flat = packer.unpack(nested, "product")
+    print(flat)
+
+    print_subsection("Pack to Store Level")
+    print("Products are nested within each store:")
+    store_level = packer.pack(flat, "store")
+    print(store_level)
+
+    print_subsection("Pack to Region Level (Coarsest Granularity)")
+    print("Stores (with their products) are nested within each region:")
+    region_level = packer.pack(flat, "region")
+    print(region_level)
+
+    return flat
+
+
+# =============================================================================
+# PART 4: NESTED EXPRESSIONS - THE POWER OF NEXPRESSO
+# =============================================================================
+
+
+def demonstrate_nested_expressions(flat: pl.DataFrame):
+    """Demonstrate nested expression capabilities."""
+    print_section(
+        "PART 3: Transforming Nested Data with Nexpresso",
+        "Use intuitive dictionary syntax to define transformations\n"
+        "on deeply nested fields. Much cleaner than raw Polars expressions!",
+    )
+
+    # First, let's create a nicely nested structure to work with
+    spec = HierarchySpec(
+        levels=[
+            LevelSpec(name="region", id_fields=["id"]),
+            LevelSpec(name="store", id_fields=["id"]),
+            LevelSpec(name="product", id_fields=["id"]),
+        ]
+    )
+    packer = HierarchicalPacker(spec)
+    nested = packer.pack(flat, "region")
+
+    print_subsection("Starting Data (Region Level)")
+    print(nested)
+
+    # Example 1: Calculate metrics at the product level
+    print_subsection("Example 1: Calculate Product Metrics")
+    print("Adding profit margin and revenue calculations to each product:\n")
+
+    fields = {
+        "region": {
+            "store": {
+                "product": {
+                    # Calculate new metrics
+                    "revenue": pl.field("price") * pl.field("units_sold"),
+                    "total_cost": pl.field("cost") * pl.field("units_sold"),
+                    "profit": (pl.field("price") - pl.field("cost")) * pl.field("units_sold"),
+                    "margin_pct": (
+                        (pl.field("price") - pl.field("cost")) / pl.field("price") * 100
+                    ).round(1),
                 }
-            ]
-        }
-    )
-
-    print("Original DataFrame:")
-    print(df)
-    print()
-
-    # Work with deeply nested structures
-    fields = {
-        "company": {
-            "name": None,
-            "departments": {
-                "name": None,
-                "employees": {
-                    "name": None,
-                    "salary": lambda x: x * 1.1,  # 10% raise
-                    "bonus": pl.field("salary") * 0.1,  # Bonus based on original salary
-                },
-            },
+            }
         }
     }
 
-    exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
-    result = df.select(exprs)
-
-    print("After applying raises and calculating bonuses:")
+    result = apply_nested_operations(nested, fields, struct_mode="with_fields")
+    print("Result with calculated fields:")
     print(result)
-    print()
 
-
-def example_7_conditional_transformations():
-    """Example 7: Conditional transformations using expressions."""
-    print("=" * 80)
-    print("Example 7: Conditional Transformations")
-    print("=" * 80)
-
-    df = pl.DataFrame(
-        {
-            "customer": [
-                {"name": "Alice", "age": 25, "spending": 1000},
-                {"name": "Bob", "age": 65, "spending": 500},
-                {"name": "Charlie", "age": 30, "spending": 2000},
+    # Unpack to see the product details
+    product_metrics = packer.unpack(result, "product")
+    print("\nUnpacked to see all product metrics:")
+    print(
+        product_metrics.select(
+            [
+                "region.id",
+                "region.store.id",
+                "region.store.product.name",
+                "region.store.product.revenue",
+                "region.store.product.profit",
+                "region.store.product.margin_pct",
             ]
-        }
+        )
     )
 
-    print("Original DataFrame:")
-    print(df)
-    print()
-
-    # Apply conditional logic
-    fields = {
-        "customer": {
-            "name": None,
-            "age": None,
-            "spending": None,
-            "discount": pl.when(pl.field("age") >= 65)
-            .then(0.15)
-            .when(pl.field("spending") > 1500)
-            .then(0.10)
-            .otherwise(0.0),  # Conditional discount
-            "final_amount": pl.field("spending")
-            * (
-                1
-                - pl.when(pl.field("age") >= 65)
-                .then(0.15)
-                .when(pl.field("spending") > 1500)
-                .then(0.10)
-                .otherwise(0.0)
-            ),
-            "customer_type": pl.when(pl.field("age") >= 65)
-            .then(pl.lit("Senior"))
-            .when(pl.field("spending") > 1500)
-            .then(pl.lit("VIP"))
-            .otherwise(pl.lit("Regular")),
-        }
-    }
-
-    exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
-    result = df.select(exprs)
-
-    print("After applying conditional logic:")
-    print(result)
-    print()
+    return result
 
 
-def example_8_convenience_function():
-    """Example 8: Using the convenience function apply_nested_operations."""
-    print("=" * 80)
-    print("Example 8: Using apply_nested_operations Convenience Function")
-    print("=" * 80)
-
-    df = pl.DataFrame(
-        {
-            "data": [
-                {"value": 10, "multiplier": 2},
-                {"value": 20, "multiplier": 3},
-                {"value": 30, "multiplier": 4},
-            ]
-        }
+def demonstrate_conditional_transformations():
+    """Demonstrate conditional logic in nested expressions."""
+    print_section(
+        "PART 4: Conditional Transformations",
+        "Apply business logic using when/then/otherwise expressions\n" "within nested structures.",
     )
 
-    print("Original DataFrame:")
-    print(df)
-    print()
-
-    # Using the convenience function with with_columns
-    result = apply_nested_operations(
-        df,
-        {
-            "data": {
-                "value": lambda x: x * 2,
-                "multiplier": None,
-                "result": pl.field("value") * pl.field("multiplier"),
-            }
-        },
-        struct_mode="with_fields",
-        use_with_columns=True,  # Use with_columns instead of select
-    )
-
-    print("After applying operations (using with_columns):")
-    print(result)
-    print()
-
-    # Using select mode
-    result2 = apply_nested_operations(
-        df,
-        {
-            "data": {
-                "value": lambda x: x * 2,
-                "result": pl.field("value") * pl.field("multiplier"),
-            }
-        },
-        struct_mode="select",  # Only keep specified fields
-    )
-
-    print("After applying operations (select mode):")
-    print(result2)
-    print()
-
-
-def example_9_complex_real_world():
-    """Example 9: Complex real-world scenario."""
-    print("=" * 80)
-    print("Example 9: Complex Real-World Scenario")
-    print("=" * 80)
-
-    # E-commerce order processing
-    df = pl.DataFrame(
+    # Create order data with customer tiers
+    orders = pl.DataFrame(
         {
             "order_id": [1001, 1002, 1003],
             "customer": [
-                {"id": 1, "name": "Alice", "tier": "Gold"},
-                {"id": 2, "name": "Bob", "tier": "Silver"},
-                {"id": 3, "name": "Charlie", "tier": "Gold"},
+                {"name": "Alice", "tier": "Gold", "years_member": 5},
+                {"name": "Bob", "tier": "Silver", "years_member": 2},
+                {"name": "Charlie", "tier": "Bronze", "years_member": 1},
             ],
             "items": [
                 [
-                    {"sku": "A001", "name": "Laptop", "price": 1000.0, "qty": 1},
-                    {"sku": "A002", "name": "Mouse", "price": 25.0, "qty": 2},
+                    {"product": "Laptop", "price": 999.99, "qty": 1},
+                    {"product": "Mouse", "price": 49.99, "qty": 2},
                 ],
                 [
-                    {"sku": "B001", "name": "Keyboard", "price": 75.0, "qty": 1},
+                    {"product": "Keyboard", "price": 129.99, "qty": 1},
                 ],
                 [
-                    {"sku": "A001", "name": "Laptop", "price": 1000.0, "qty": 2},
-                    {"sku": "A003", "name": "Monitor", "price": 300.0, "qty": 1},
+                    {"product": "Monitor", "price": 349.99, "qty": 2},
+                    {"product": "Cable", "price": 19.99, "qty": 3},
                 ],
-            ],
-            "shipping": [
-                {"method": "Express", "cost": 20.0},
-                {"method": "Standard", "cost": 10.0},
-                {"method": "Express", "cost": 20.0},
             ],
         }
     )
 
-    print("Original DataFrame:")
-    print(df)
-    print()
+    print_subsection("Input: Order Data")
+    print(orders)
 
-    # Complex transformations
+    # Apply tiered discounts
     fields = {
-        "order_id": None,
         "customer": {
-            "id": None,
-            "name": None,
-            "tier": None,
-            "tier_discount": pl.when(pl.field("tier") == "Gold")
-            .then(0.10)
+            # Calculate discount based on tier
+            "discount_pct": pl.when(pl.field("tier") == "Gold")
+            .then(15)
             .when(pl.field("tier") == "Silver")
-            .then(0.05)
-            .otherwise(0.0),
+            .then(10)
+            .otherwise(5),
+            # Loyalty bonus for long-term members
+            "loyalty_bonus": pl.when(pl.field("years_member") >= 5)
+            .then(pl.lit("VIP"))
+            .when(pl.field("years_member") >= 3)
+            .then(pl.lit("Preferred"))
+            .otherwise(pl.lit("Standard")),
         },
         "items": {
-            "sku": None,
-            "name": None,
-            "price": None,
-            "qty": None,
             "line_total": pl.field("price") * pl.field("qty"),
-            "discounted_price": pl.field("price")
-            * (1 - pl.when(pl.field("price") > 500).then(0.05).otherwise(0.0)),
-        },
-        "shipping": {
-            "method": None,
-            "cost": lambda x: x * 1.1,  # Add 10% handling fee
+            # Flag high-value items
+            "is_high_value": pl.field("price") > 100,
         },
     }
 
-    exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
-    result = df.select(exprs)
+    result = apply_nested_operations(orders, fields, struct_mode="with_fields")
 
-    print("After complex transformations:")
+    print_subsection("Result: Orders with Business Logic Applied")
     print(result)
-    print()
 
 
-def example_10_aggregations_in_nested():
-    """Example 10: Using aggregations within nested structures."""
-    print("=" * 80)
-    print("Example 10: Aggregations in Nested Structures")
-    print("=" * 80)
+def demonstrate_select_vs_with_fields():
+    """Demonstrate the difference between select and with_fields modes."""
+    print_section(
+        "PART 5: Select Mode vs With Fields Mode",
+        "- select mode: Only keep explicitly specified fields\n"
+        "- with_fields mode: Keep all fields, add/modify specified ones",
+    )
 
-    df = pl.DataFrame(
+    data = pl.DataFrame(
         {
-            "id": [1, 2],
-            "team": [
-                {
-                    "name": "Team A",
-                    "members": [
-                        {"name": "Alice", "score": 85},
-                        {"name": "Bob", "score": 90},
-                        {"name": "Charlie", "score": 75},
-                    ],
-                },
-                {
-                    "name": "Team B",
-                    "members": [
-                        {"name": "Diana", "score": 95},
-                        {"name": "Eve", "score": 88},
-                    ],
-                },
-            ],
+            "product": [
+                {"name": "Widget", "price": 10.0, "cost": 5.0, "stock": 100, "sku": "W001"},
+                {"name": "Gadget", "price": 20.0, "cost": 8.0, "stock": 50, "sku": "G001"},
+            ]
         }
     )
 
-    print("Original DataFrame:")
-    print(df)
-    print()
+    print_subsection("Input Data")
+    print(data)
 
-    # Add aggregations
-    fields = {
-        "team": {
-            "members": {
-                "above_average": pl.field("score")
-                > pl.field("score").mean(),  # Compare to list mean
-            },
+    # Select mode - only keep specified fields
+    select_fields = {
+        "product": {
+            "name": None,
+            "price": lambda x: x * 1.1,  # 10% price increase
+            "profit": pl.field("price") - pl.field("cost"),
         }
     }
 
-    exprs = generate_nested_exprs(fields, df.schema, struct_mode="with_fields")
-    result = df.with_columns(exprs)
+    result_select = apply_nested_operations(data, select_fields, struct_mode="select")
+    print_subsection("Select Mode Result")
+    print("Only name, price, and profit are kept (cost, stock, sku dropped):")
+    print(result_select)
 
-    print("After adding aggregations:")
-    print(result)
-    print()
+    # With fields mode - keep all, modify some
+    with_fields = {
+        "product": {
+            "price": lambda x: x * 1.1,  # 10% price increase
+            "profit": pl.field("price") - pl.field("cost"),
+        }
+    }
+
+    result_with = apply_nested_operations(data, with_fields, struct_mode="with_fields")
+    print_subsection("With Fields Mode Result")
+    print("All original fields kept, price modified, profit added:")
+    print(result_with)
+
+
+# =============================================================================
+# PART 5: NORMALIZE AND DENORMALIZE
+# =============================================================================
+
+
+def demonstrate_normalize_denormalize():
+    """Demonstrate splitting and reconstructing hierarchical data."""
+    print_section(
+        "PART 6: Normalize and Denormalize",
+        "Split hierarchical data into separate tables per level,\n"
+        "then reconstruct the nested structure.",
+    )
+
+    # Create sample data
+    regions, stores, products = create_database_tables()
+
+    spec = HierarchySpec.from_levels(
+        LevelSpec(name="region", id_fields=["id"]),
+        LevelSpec(name="store", id_fields=["id"], parent_keys=["region_id"]),
+        LevelSpec(name="product", id_fields=["id"], parent_keys=["store_id"]),
+    )
+    packer = HierarchicalPacker(spec)
+
+    # Build nested structure
+    nested = packer.build_from_tables(
+        {
+            "region": regions,
+            "store": stores,
+            "product": products,
+        }
+    )
+
+    print_subsection("Input: Nested Hierarchy")
+    print(nested)
+
+    # Normalize - split into separate tables
+    normalized = packer.normalize(nested)
+
+    print_subsection("Normalized: Separate Tables Per Level")
+    for level_name, table in normalized.items():
+        print(f"\n{level_name.upper()} table:")
+        print(table)
+
+    # Denormalize - reconstruct
+    reconstructed = packer.denormalize(normalized)
+
+    print_subsection("Denormalized: Reconstructed Hierarchy")
+    print(reconstructed)
+
+
+# =============================================================================
+# PART 6: VALIDATION
+# =============================================================================
+
+
+def demonstrate_validation():
+    """Demonstrate validation features."""
+    print_section(
+        "PART 7: Data Validation",
+        "HierarchicalPacker can validate data integrity:\n"
+        "- Check for null values in key columns\n"
+        "- Ensure uniform values when aggregating",
+    )
+
+    spec = HierarchySpec(
+        levels=[
+            LevelSpec(name="parent", id_fields=["id"]),
+            LevelSpec(name="child", id_fields=["id"]),
+        ]
+    )
+    packer = HierarchicalPacker(spec)
+
+    # Data with null key
+    bad_data = pl.DataFrame(
+        {
+            "parent.id": ["p1", None, "p3"],  # Null in key!
+            "parent.child.id": ["c1", "c2", "c3"],
+            "parent.child.value": [10, 20, 30],
+        }
+    )
+
+    print_subsection("Data with Null Key")
+    print(bad_data)
+
+    # Validate without raising
+    errors = packer.validate(bad_data, raise_on_error=False)
+    print("\nValidation errors found:")
+    for error in errors:
+        print(f"  - {error}")
+
+
+# =============================================================================
+# PART 7: REAL-WORLD WORKFLOW
+# =============================================================================
+
+
+def demonstrate_complete_workflow():
+    """Demonstrate a complete real-world analytics workflow."""
+    print_section(
+        "PART 8: Complete Analytics Workflow",
+        "A realistic end-to-end example combining all features:\n"
+        "1. Load data from 'database tables'\n"
+        "2. Build nested hierarchy\n"
+        "3. Calculate metrics at multiple levels\n"
+        "4. Apply business rules\n"
+        "5. Generate reports at different granularities",
+    )
+
+    # Step 1: Load data
+    print_subsection("Step 1: Load Data")
+    regions, stores, products = create_database_tables()
+    print(f"Loaded {len(regions)} regions, {len(stores)} stores, {len(products)} products")
+
+    # Step 2: Build hierarchy
+    print_subsection("Step 2: Build Hierarchy")
+    spec = HierarchySpec.from_levels(
+        LevelSpec(name="region", id_fields=["id"]),
+        LevelSpec(name="store", id_fields=["id"], parent_keys=["region_id"]),
+        LevelSpec(name="product", id_fields=["id"], parent_keys=["store_id"]),
+    )
+    packer = HierarchicalPacker(spec)
+
+    nested = packer.build_from_tables(
+        {
+            "region": regions,
+            "store": stores,
+            "product": products,
+        }
+    )
+    print("Hierarchy built successfully")
+
+    # Step 3: Unpack and calculate product-level metrics
+    print_subsection("Step 3: Calculate Product Metrics")
+    flat = packer.unpack(nested, "product")
+
+    # Use nexpresso for cleaner transformations
+    product_metrics = flat.with_columns(
+        [
+            (
+                pl.col("region.store.product.price") * pl.col("region.store.product.units_sold")
+            ).alias("revenue"),
+            (
+                (pl.col("region.store.product.price") - pl.col("region.store.product.cost"))
+                * pl.col("region.store.product.units_sold")
+            ).alias("profit"),
+        ]
+    )
+
+    print("Product-level metrics calculated:")
+    print(
+        product_metrics.select(
+            ["region.name", "region.store.name", "region.store.product.name", "revenue", "profit"]
+        )
+    )
+
+    # Step 4: Aggregate to store level
+    print_subsection("Step 4: Store-Level Summary")
+    store_summary = (
+        product_metrics.group_by(
+            ["region.id", "region.name", "region.store.id", "region.store.name"]
+        )
+        .agg(
+            [
+                pl.col("revenue").sum().alias("total_revenue"),
+                pl.col("profit").sum().alias("total_profit"),
+                pl.col("region.store.product.units_sold").sum().alias("total_units"),
+                pl.col("region.store.product.name").count().alias("product_count"),
+            ]
+        )
+        .sort("total_revenue", descending=True)
+    )
+
+    print("Store performance ranking:")
+    print(store_summary)
+
+    # Step 5: Region-level summary
+    print_subsection("Step 5: Region-Level Summary")
+    region_summary = (
+        store_summary.group_by(["region.id", "region.name"])
+        .agg(
+            [
+                pl.col("total_revenue").sum().alias("region_revenue"),
+                pl.col("total_profit").sum().alias("region_profit"),
+                pl.col("total_units").sum().alias("region_units"),
+                pl.col("region.store.id").count().alias("store_count"),
+            ]
+        )
+        .sort("region_revenue", descending=True)
+    )
+
+    print("Region performance:")
+    print(region_summary)
+
+    print_subsection("Workflow Complete!")
+    print(
+        "This demonstrates how nexpresso enables clean, maintainable\n"
+        "data pipelines for hierarchical data analysis."
+    )
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 
 def main():
     """Run all examples."""
     print("\n" + "=" * 80)
-    print("POLARS-NEXPRESSO - COMPREHENSIVE EXAMPLES")
+    print("  POLARS NEXPRESSO - COMPREHENSIVE EXAMPLES")
+    print("  Working with Hierarchical and Nested Data")
+    print("=" * 80)
+
+    # Part 1 & 2: Building hierarchy and pack/unpack
+    nested, packer = demonstrate_hierarchy_building()
+    flat = demonstrate_pack_unpack(nested, packer)
+
+    # Part 3 & 4: Nested expressions
+    demonstrate_nested_expressions(flat)
+    demonstrate_conditional_transformations()
+
+    # Part 5: Select vs with_fields
+    demonstrate_select_vs_with_fields()
+
+    # Part 6: Normalize/Denormalize
+    demonstrate_normalize_denormalize()
+
+    # Part 7: Validation
+    demonstrate_validation()
+
+    # Part 8: Complete workflow
+    demonstrate_complete_workflow()
+
+    print("\n" + "=" * 80)
+    print("  ALL EXAMPLES COMPLETED SUCCESSFULLY!")
     print("=" * 80 + "\n")
-
-    example_1_basic_column_operations()
-    example_2_nested_struct_operations()
-    example_3_select_mode()
-    example_4_with_fields_mode()
-    example_5_lists_of_structs()
-    example_6_deeply_nested()
-    example_7_conditional_transformations()
-    example_8_convenience_function()
-    example_9_complex_real_world()
-    example_10_aggregations_in_nested()
-
-    print("=" * 80)
-    print("All examples completed!")
-    print("=" * 80)
 
 
 if __name__ == "__main__":
