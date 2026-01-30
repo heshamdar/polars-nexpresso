@@ -819,15 +819,8 @@ class TestPromoteAttribute:
         assert nyc_first == "Broadway"
         assert nyc_last == "5th Ave"
 
-    def test_single_raises_on_non_uniform(self, promote_packer, promote_df):
-        """Single agg raises when values differ within a group."""
-        with pytest.raises(HierarchyValidationError, match="non-uniform"):
-            promote_packer.promote_attribute(
-                promote_df, "population", from_level="city", to_level="country", agg="single"
-            )
-
-    def test_single_succeeds_when_uniform(self, promote_packer):
-        """Single agg works when all values are the same per group."""
+    def test_single_uniform(self, promote_packer):
+        """Single agg returns the unique value when all values are identical."""
         df = pl.DataFrame(
             {
                 "country.code": ["US", "US"],
@@ -841,6 +834,15 @@ class TestPromoteAttribute:
             df, "currency", from_level="city", to_level="country", agg="single"
         )
         assert result.select("country.currency").to_series().to_list()[0] == "USD"
+
+    def test_single_non_uniform_returns_first_unique(self, promote_packer, promote_df):
+        """Single agg with non-uniform values returns the first unique value."""
+        result = promote_packer.promote_attribute(
+            promote_df, "population", from_level="city", to_level="country", agg="single"
+        )
+        # US has NYC(8M) and LA(4M) — non-uniform, returns first unique
+        us_val = result.filter(pl.col("country.code") == "US").select("country.population").item()
+        assert us_val in (8_000_000, 4_000_000)
 
     def test_alias_parameter(self, promote_packer, promote_df):
         """Custom alias for the output column."""

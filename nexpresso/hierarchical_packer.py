@@ -883,8 +883,6 @@ class HierarchicalPacker:
             KeyError: If either level is not found.
             ValueError: If ``from_level`` is not the immediate child of ``to_level``,
                 or if the attribute does not exist at ``from_level``.
-            HierarchyValidationError: If ``agg="single"`` and values are not
-                uniform within groups.
 
         Examples:
             >>> result = packer.promote_attribute(
@@ -941,7 +939,7 @@ class HierarchicalPacker:
         # Apply aggregation on the list
         out_field = alias or attribute
         out_col = f"{to_meta.prefix}{self._escape_field(out_field)}"
-        agg_expr = self._apply_list_agg(extract, agg, from_level, packed_lf, out_col)
+        agg_expr = self._apply_list_agg(extract, agg)
 
         result = packed_lf.with_columns(agg_expr.alias(out_col))
         return self._match_frame_type(result, frame)
@@ -950,19 +948,15 @@ class HierarchicalPacker:
         self,
         list_expr: pl.Expr,
         agg: PromoteAggregation,
-        from_level: str,
-        packed_lf: pl.LazyFrame,
-        out_col: str,
     ) -> pl.Expr:
         """
         Apply an aggregation to a ``List[T]`` expression produced by ``list.eval``.
 
+        All operations are fully lazy — no eager collection is performed.
+
         Args:
             list_expr: Expression producing a ``List[T]`` column.
             agg: The aggregation name.
-            from_level: Source level name (for error messages).
-            packed_lf: The packed LazyFrame (used for eager validation in ``"single"``).
-            out_col: Output column name (for error messages).
 
         Returns:
             Expression producing the aggregated result.
@@ -970,7 +964,7 @@ class HierarchicalPacker:
         if agg == "list":
             return list_expr
         elif agg == "set":
-            return list_expr.list.eval(pl.element().unique())
+            return list_expr.list.eval(pl.element().drop_nulls().unique())
         elif agg == "sum":
             return list_expr.list.sum()
         elif agg == "mean":
@@ -986,21 +980,11 @@ class HierarchicalPacker:
         elif agg == "count":
             return list_expr.list.len()
         elif agg == "single":
-            # Validate that every list contains at most one unique non-null value.
-            check = packed_lf.select(list_expr.alias("__check"))
-            check_df = check.collect()
-            for row_vals in check_df["__check"].to_list():
-                if row_vals is not None:
-                    unique_vals = set(v for v in row_vals if v is not None)
-                    if len(unique_vals) > 1:
-                        raise HierarchyValidationError(
-                            f"Column '{out_col}' has non-uniform values within "
-                            "groups. Values at coarser granularity should be "
-                            "identical when using 'single' aggregation.",
-                            level=from_level,
-                            details={"column": out_col, "unique_values": unique_vals},
-                        )
-            return list_expr.list.first()
+            # Deduplicate and take the single unique non-null value.
+            # If a group has multiple distinct values the result is
+            # non-deterministic (first unique value). Use ``validate()``
+            # beforehand if strict uniformity must be enforced.
+            return list_expr.list.eval(pl.element().drop_nulls().unique()).list.first()
         else:
             raise ValueError(
                 f"Unknown aggregation '{agg}'. Expected one of: "
