@@ -15,7 +15,7 @@ Example
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, TypeVar
 
@@ -846,6 +846,20 @@ class HierarchicalPacker:
         # Return the prefix pattern that would match this level's columns
         return list(meta.id_columns) + list(meta.required_columns)
 
+    # Mapping from aggregation name to a callable that transforms a List[T] expr.
+    _LIST_AGGREGATIONS: dict[PromoteAggregation, Callable[[pl.Expr], pl.Expr]] = {
+        "list": lambda e: e,
+        "set": lambda e: e.list.eval(pl.element().drop_nulls().unique()),
+        "sum": lambda e: e.list.sum(),
+        "mean": lambda e: e.list.mean(),
+        "min": lambda e: e.list.min(),
+        "max": lambda e: e.list.max(),
+        "first": lambda e: e.list.first(),
+        "last": lambda e: e.list.last(),
+        "count": lambda e: e.list.len(),
+        "single": lambda e: e.list.eval(pl.element().drop_nulls().unique()).list.first(),
+    }
+
     def promote_attribute(
         self,
         frame: FrameT,
@@ -892,7 +906,6 @@ class HierarchicalPacker:
         """
         from_idx = self.spec.index_of(from_level)
         to_idx = self.spec.index_of(to_level)
-
         if from_idx != to_idx + 1:
             raise ValueError(
                 f"from_level '{from_level}' must be the immediate child of "
@@ -903,20 +916,31 @@ class HierarchicalPacker:
         to_meta = self._levels_meta[to_idx]
 
         # Pack so from_level becomes a list-of-struct column.
-        packed = self.pack(frame, from_level)
-        packed_lf = self._to_lazy(packed)
-        packed_schema = packed_lf.collect_schema()
-
-        # The packed column for from_level (e.g. "country.city")
+        packed_lf = self._to_lazy(self.pack(frame, from_level))
         list_col = from_meta.path
-        if list_col not in packed_schema:
+
+        # Validate the attribute exists inside the nested struct.
+        self._validate_list_struct_field(packed_lf.collect_schema(), list_col, attribute, from_level)
+
+        # Extract → aggregate → alias with the target-level naming convention.
+        extract = pl.col(list_col).list.eval(pl.element().struct.field(attribute))
+        out_col = f"{to_meta.prefix}{self._escape_field(alias or attribute)}"
+        agg_fn = self._LIST_AGGREGATIONS[agg]
+
+        result = packed_lf.with_columns(agg_fn(extract).alias(out_col))
+        return self._match_frame_type(result, frame)
+
+    @staticmethod
+    def _validate_list_struct_field(
+        schema: pl.Schema, list_col: str, attribute: str, level_name: str
+    ) -> None:
+        """Raise ``ValueError`` if *attribute* is not a field of the struct inside *list_col*."""
+        if list_col not in schema:
             raise ValueError(
                 f"Expected packed column '{list_col}' not found in schema. "
-                f"Available columns: {list(packed_schema.keys())}"
+                f"Available columns: {list(schema.keys())}"
             )
-
-        # Validate the attribute exists inside the struct
-        dtype = packed_schema[list_col]
+        dtype = schema[list_col]
         inner = dtype.inner if isinstance(dtype, pl.List) else dtype
         if not isinstance(inner, pl.Struct):
             raise ValueError(
@@ -925,70 +949,8 @@ class HierarchicalPacker:
         field_names = [f.name for f in inner.fields]
         if attribute not in field_names:
             raise ValueError(
-                f"Attribute '{attribute}' not found at level '{from_level}'. "
+                f"Attribute '{attribute}' not found at level '{level_name}'. "
                 f"Available fields: {field_names}"
-            )
-
-        # Build extraction expression:
-        #   pl.col("<list_col>").list.eval(pl.element().struct.field("<attr>"))
-        # This yields a List[T] column — one list per row.
-        extract = pl.col(list_col).list.eval(
-            pl.element().struct.field(attribute)
-        )
-
-        # Apply aggregation on the list
-        out_field = alias or attribute
-        out_col = f"{to_meta.prefix}{self._escape_field(out_field)}"
-        agg_expr = self._apply_list_agg(extract, agg)
-
-        result = packed_lf.with_columns(agg_expr.alias(out_col))
-        return self._match_frame_type(result, frame)
-
-    def _apply_list_agg(
-        self,
-        list_expr: pl.Expr,
-        agg: PromoteAggregation,
-    ) -> pl.Expr:
-        """
-        Apply an aggregation to a ``List[T]`` expression produced by ``list.eval``.
-
-        All operations are fully lazy — no eager collection is performed.
-
-        Args:
-            list_expr: Expression producing a ``List[T]`` column.
-            agg: The aggregation name.
-
-        Returns:
-            Expression producing the aggregated result.
-        """
-        if agg == "list":
-            return list_expr
-        elif agg == "set":
-            return list_expr.list.eval(pl.element().drop_nulls().unique())
-        elif agg == "sum":
-            return list_expr.list.sum()
-        elif agg == "mean":
-            return list_expr.list.mean()
-        elif agg == "min":
-            return list_expr.list.min()
-        elif agg == "max":
-            return list_expr.list.max()
-        elif agg == "first":
-            return list_expr.list.first()
-        elif agg == "last":
-            return list_expr.list.last()
-        elif agg == "count":
-            return list_expr.list.len()
-        elif agg == "single":
-            # Deduplicate and take the single unique non-null value.
-            # If a group has multiple distinct values the result is
-            # non-deterministic (first unique value). Use ``validate()``
-            # beforehand if strict uniformity must be enforced.
-            return list_expr.list.eval(pl.element().drop_nulls().unique()).list.first()
-        else:
-            raise ValueError(
-                f"Unknown aggregation '{agg}'. Expected one of: "
-                "list, set, sum, mean, min, max, first, last, count, single."
             )
 
     # ------------------------------------------------------------------
