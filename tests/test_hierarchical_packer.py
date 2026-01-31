@@ -698,3 +698,194 @@ class TestGetLevelColumns:
         child_cols = packer.get_level_columns("child")
         assert "parent.child.id" in child_cols
         assert "parent.child.code" in child_cols
+
+
+# =============================================================================
+# Promote Attribute Tests
+# =============================================================================
+
+
+class TestPromoteAttribute:
+    """Tests for the promote_attribute method."""
+
+    @pytest.fixture()
+    def promote_spec(self):
+        return HierarchySpec(
+            levels=[
+                LevelSpec(name="country", id_fields=["code"]),
+                LevelSpec(name="city", id_fields=["id"]),
+                LevelSpec(name="street", id_fields=["name"]),
+            ]
+        )
+
+    @pytest.fixture()
+    def promote_packer(self, promote_spec):
+        return HierarchicalPacker(promote_spec)
+
+    @pytest.fixture()
+    def promote_df(self):
+        return pl.DataFrame(
+            {
+                "country.code": ["US", "US", "US", "CA", "CA"],
+                "country.name": ["United States", "United States", "United States", "Canada", "Canada"],
+                "country.city.id": ["NYC", "NYC", "LA", "TOR", "TOR"],
+                "country.city.population": [8_000_000, 8_000_000, 4_000_000, 3_000_000, 3_000_000],
+                "country.city.street.name": ["Broadway", "5th Ave", "Sunset Blvd", "Queen St", "King St"],
+                "country.city.street.length_km": [21.0, 10.0, 35.0, 5.0, 3.0],
+            }
+        )
+
+    def test_sum_city_to_country(self, promote_packer, promote_df):
+        """Sum city populations to country level."""
+        result = promote_packer.promote_attribute(
+            promote_df, "population", from_level="city", to_level="country", agg="sum"
+        )
+        # US: NYC(8M) + LA(4M) = 12M, CA: TOR(3M) = 3M
+        vals = result.sort("country.code").select("country.population").to_series().to_list()
+        assert vals == [3_000_000, 12_000_000]
+
+    def test_sum_street_to_city(self, promote_packer, promote_df):
+        """Sum street lengths to city level."""
+        result = promote_packer.promote_attribute(
+            promote_df, "length_km", from_level="street", to_level="city", agg="sum"
+        )
+        vals = dict(
+            zip(
+                result.select("country.city.id").to_series().to_list(),
+                result.select("country.city.length_km").to_series().to_list(),
+            )
+        )
+        assert vals["NYC"] == 31.0
+        assert vals["LA"] == 35.0
+        assert vals["TOR"] == 8.0
+
+    def test_list_aggregation(self, promote_packer, promote_df):
+        """Collect street lengths as list at city level."""
+        result = promote_packer.promote_attribute(
+            promote_df, "length_km", from_level="street", to_level="city", agg="list"
+        )
+        nyc_row = result.filter(pl.col("country.city.id") == "NYC")
+        lengths = nyc_row.select("country.city.length_km").to_series().to_list()[0]
+        assert sorted(lengths) == [10.0, 21.0]
+
+    def test_set_aggregation(self, promote_packer, promote_df):
+        """Collect unique values."""
+        result = promote_packer.promote_attribute(
+            promote_df, "id", from_level="city", to_level="country", agg="set",
+            alias="city_ids",
+        )
+        assert "country.city_ids" in result.columns
+        us_row = result.filter(pl.col("country.code") == "US")
+        ids = us_row.select("country.city_ids").to_series().to_list()[0]
+        assert sorted(ids) == ["LA", "NYC"]
+
+    def test_mean_aggregation(self, promote_packer, promote_df):
+        result = promote_packer.promote_attribute(
+            promote_df, "length_km", from_level="street", to_level="city", agg="mean"
+        )
+        nyc_row = result.filter(pl.col("country.city.id") == "NYC")
+        assert nyc_row.select("country.city.length_km").to_series().to_list()[0] == 15.5
+
+    def test_min_max(self, promote_packer, promote_df):
+        r_min = promote_packer.promote_attribute(
+            promote_df, "length_km", from_level="street", to_level="city", agg="min"
+        )
+        r_max = promote_packer.promote_attribute(
+            promote_df, "length_km", from_level="street", to_level="city", agg="max"
+        )
+        nyc_min = r_min.filter(pl.col("country.city.id") == "NYC").select("country.city.length_km").item()
+        nyc_max = r_max.filter(pl.col("country.city.id") == "NYC").select("country.city.length_km").item()
+        assert nyc_min == 10.0
+        assert nyc_max == 21.0
+
+    def test_count_aggregation(self, promote_packer, promote_df):
+        result = promote_packer.promote_attribute(
+            promote_df, "length_km", from_level="street", to_level="city", agg="count"
+        )
+        nyc_count = result.filter(pl.col("country.city.id") == "NYC").select("country.city.length_km").item()
+        assert nyc_count == 2
+
+    def test_first_last(self, promote_packer, promote_df):
+        r_first = promote_packer.promote_attribute(
+            promote_df, "name", from_level="street", to_level="city", agg="first",
+            alias="first_street",
+        )
+        r_last = promote_packer.promote_attribute(
+            promote_df, "name", from_level="street", to_level="city", agg="last",
+            alias="last_street",
+        )
+        nyc_first = r_first.filter(pl.col("country.city.id") == "NYC").select("country.city.first_street").item()
+        nyc_last = r_last.filter(pl.col("country.city.id") == "NYC").select("country.city.last_street").item()
+        assert nyc_first == "Broadway"
+        assert nyc_last == "5th Ave"
+
+    def test_single_uniform(self, promote_packer):
+        """Single agg returns the unique value when all values are identical."""
+        df = pl.DataFrame(
+            {
+                "country.code": ["US", "US"],
+                "country.city.id": ["NYC", "LA"],
+                "country.city.currency": ["USD", "USD"],
+                "country.city.street.name": ["Broadway", "Sunset"],
+                "country.city.street.length_km": [21.0, 35.0],
+            }
+        )
+        result = promote_packer.promote_attribute(
+            df, "currency", from_level="city", to_level="country", agg="single"
+        )
+        assert result.select("country.currency").to_series().to_list()[0] == "USD"
+
+    def test_single_non_uniform_returns_first_unique(self, promote_packer, promote_df):
+        """Single agg with non-uniform values returns the first unique value."""
+        result = promote_packer.promote_attribute(
+            promote_df, "population", from_level="city", to_level="country", agg="single"
+        )
+        # US has NYC(8M) and LA(4M) — non-uniform, returns first unique
+        us_val = result.filter(pl.col("country.code") == "US").select("country.population").item()
+        assert us_val in (8_000_000, 4_000_000)
+
+    def test_alias_parameter(self, promote_packer, promote_df):
+        """Custom alias for the output column."""
+        result = promote_packer.promote_attribute(
+            promote_df, "length_km", from_level="street", to_level="city",
+            agg="sum", alias="total_street_length",
+        )
+        assert "country.city.total_street_length" in result.columns
+
+    def test_invalid_direction_raises(self, promote_packer, promote_df):
+        """Promoting from coarser to finer level raises ValueError."""
+        with pytest.raises(ValueError, match="must be the immediate child"):
+            promote_packer.promote_attribute(
+                promote_df, "code", from_level="country", to_level="city", agg="list"
+            )
+
+    def test_non_adjacent_levels_raises(self, promote_packer, promote_df):
+        """Skipping levels raises ValueError."""
+        with pytest.raises(ValueError, match="must be the immediate child"):
+            promote_packer.promote_attribute(
+                promote_df, "length_km", from_level="street", to_level="country", agg="sum"
+            )
+
+    def test_missing_attribute_raises(self, promote_packer, promote_df):
+        """Missing attribute raises ValueError."""
+        with pytest.raises(ValueError, match="not found"):
+            promote_packer.promote_attribute(
+                promote_df, "nonexistent", from_level="street", to_level="city", agg="sum"
+            )
+
+    def test_from_packed_frame(self, promote_packer, promote_df):
+        """Works correctly when input frame is already packed."""
+        packed = promote_packer.pack(promote_df, "city")
+        result = promote_packer.promote_attribute(
+            packed, "population", from_level="city", to_level="country", agg="sum"
+        )
+        assert "country.population" in result.columns
+        vals = result.sort("country.code").select("country.population").to_series().to_list()
+        assert vals == [3_000_000, 12_000_000]
+
+    def test_preserves_frame_type_lazy(self, promote_packer, promote_df):
+        """Returns LazyFrame when input is LazyFrame."""
+        result = promote_packer.promote_attribute(
+            promote_df.lazy(), "length_km", from_level="street", to_level="city", agg="sum"
+        )
+        assert isinstance(result, pl.LazyFrame)

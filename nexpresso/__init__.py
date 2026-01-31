@@ -15,6 +15,7 @@ from nexpresso.hierarchical_packer import (
     HierarchySpec,
     HierarchyValidationError,
     LevelSpec,
+    PromoteAggregation,
 )
 from nexpresso.structuring_utils import convert_polars_schema, unnest_all, unnest_rename
 
@@ -31,6 +32,7 @@ __all__ = [
     "HierarchySpec",
     "HierarchyValidationError",
     "LevelSpec",
+    "PromoteAggregation",
     # Structuring utilities
     "convert_polars_schema",
     "unnest_all",

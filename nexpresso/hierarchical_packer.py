@@ -15,7 +15,7 @@ Example
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, TypeVar
 
@@ -26,6 +26,9 @@ FrameT = TypeVar("FrameT", pl.LazyFrame, pl.DataFrame)
 
 ColumnSelector = str | pl.Expr
 ExtraColumnsMode = Literal["preserve", "drop", "error"]
+PromoteAggregation = Literal[
+    "list", "set", "sum", "mean", "min", "max", "first", "last", "count", "single"
+]
 
 ROW_ID_COLUMN = "__hier_row_id"
 DEFAULT_SEPARATOR = "."
@@ -36,6 +39,7 @@ __all__ = [
     "HierarchySpec",
     "HierarchicalPacker",
     "HierarchyValidationError",
+    "PromoteAggregation",
 ]
 
 
@@ -841,6 +845,113 @@ class HierarchicalPacker:
         meta = self._levels_meta[self.spec.index_of(level)]
         # Return the prefix pattern that would match this level's columns
         return list(meta.id_columns) + list(meta.required_columns)
+
+    # Mapping from aggregation name to a callable that transforms a List[T] expr.
+    _LIST_AGGREGATIONS: dict[PromoteAggregation, Callable[[pl.Expr], pl.Expr]] = {
+        "list": lambda e: e,
+        "set": lambda e: e.list.eval(pl.element().drop_nulls().unique()),
+        "sum": lambda e: e.list.sum(),
+        "mean": lambda e: e.list.mean(),
+        "min": lambda e: e.list.min(),
+        "max": lambda e: e.list.max(),
+        "first": lambda e: e.list.first(),
+        "last": lambda e: e.list.last(),
+        "count": lambda e: e.list.len(),
+        "single": lambda e: e.list.eval(pl.element().drop_nulls().unique()).list.first(),
+    }
+
+    def promote_attribute(
+        self,
+        frame: FrameT,
+        attribute: str,
+        *,
+        from_level: str,
+        to_level: str,
+        agg: PromoteAggregation = "list",
+        alias: str | None = None,
+    ) -> FrameT:
+        """
+        Promote an attribute from a child level to its immediate parent level.
+
+        Packs the frame so that ``from_level`` is a nested list-of-struct column,
+        then uses ``list.eval`` / ``list.<agg>`` to extract and aggregate the
+        attribute — no explode / group_by round-trips.
+
+        Args:
+            frame: The input frame (at any granularity).
+            attribute: Unqualified field name at ``from_level`` (e.g. ``"population"``).
+            from_level: The level where the attribute currently lives.  Must be an
+                immediate child of ``to_level``.
+            to_level: The coarser level to promote the attribute to.
+            agg: Aggregation strategy:
+                ``"list"`` | ``"set"`` | ``"sum"`` | ``"mean"`` | ``"min"`` |
+                ``"max"`` | ``"first"`` | ``"last"`` | ``"count"`` | ``"single"``.
+            alias: Optional output field name (unqualified).  Defaults to
+                ``attribute``, qualified with the ``to_level`` prefix.
+
+        Returns:
+            Frame at ``to_level`` granularity with the promoted column added.
+            Preserves input type (DataFrame / LazyFrame).
+
+        Raises:
+            KeyError: If either level is not found.
+            ValueError: If ``from_level`` is not the immediate child of ``to_level``,
+                or if the attribute does not exist at ``from_level``.
+
+        Examples:
+            >>> result = packer.promote_attribute(
+            ...     flat_df, "population",
+            ...     from_level="city", to_level="country", agg="sum",
+            ... )
+        """
+        from_idx = self.spec.index_of(from_level)
+        to_idx = self.spec.index_of(to_level)
+        if from_idx != to_idx + 1:
+            raise ValueError(
+                f"from_level '{from_level}' must be the immediate child of "
+                f"to_level '{to_level}'. Got indices {from_idx} and {to_idx}."
+            )
+
+        from_meta = self._levels_meta[from_idx]
+        to_meta = self._levels_meta[to_idx]
+
+        # Pack so from_level becomes a list-of-struct column.
+        packed_lf = self._to_lazy(self.pack(frame, from_level))
+        list_col = from_meta.path
+
+        # Validate the attribute exists inside the nested struct.
+        self._validate_list_struct_field(packed_lf.collect_schema(), list_col, attribute, from_level)
+
+        # Extract → aggregate → alias with the target-level naming convention.
+        extract = pl.col(list_col).list.eval(pl.element().struct.field(attribute))
+        out_col = f"{to_meta.prefix}{self._escape_field(alias or attribute)}"
+        agg_fn = self._LIST_AGGREGATIONS[agg]
+
+        result = packed_lf.with_columns(agg_fn(extract).alias(out_col))
+        return self._match_frame_type(result, frame)
+
+    @staticmethod
+    def _validate_list_struct_field(
+        schema: pl.Schema, list_col: str, attribute: str, level_name: str
+    ) -> None:
+        """Raise ``ValueError`` if *attribute* is not a field of the struct inside *list_col*."""
+        if list_col not in schema:
+            raise ValueError(
+                f"Expected packed column '{list_col}' not found in schema. "
+                f"Available columns: {list(schema.keys())}"
+            )
+        dtype = schema[list_col]
+        inner = dtype.inner if isinstance(dtype, pl.List) else dtype
+        if not isinstance(inner, pl.Struct):
+            raise ValueError(
+                f"Expected struct inside list column '{list_col}', got {inner}."
+            )
+        field_names = [f.name for f in inner.fields]
+        if attribute not in field_names:
+            raise ValueError(
+                f"Attribute '{attribute}' not found at level '{level_name}'. "
+                f"Available fields: {field_names}"
+            )
 
     # ------------------------------------------------------------------
     # Separator Escaping
