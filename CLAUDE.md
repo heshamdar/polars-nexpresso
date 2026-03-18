@@ -2,7 +2,7 @@
 
 This document provides comprehensive guidance for AI assistants working with the polars-nexpresso codebase. It covers architecture, conventions, workflows, and best practices.
 
-**Last Updated:** 2026-01-30
+**Last Updated:** 2026-03-18
 **Version:** 0.2.0
 
 ---
@@ -165,6 +165,7 @@ from nexpresso import (
     HierarchySpec,                 # Hierarchy specification
     LevelSpec,                     # Level specification
     HierarchyValidationError,      # Custom exception
+    PromoteAggregation,            # Type alias for promote_attribute agg modes
 )
 
 # From structuring_utils.py
@@ -818,7 +819,38 @@ class NestedExpressionBuilder:
         return expressions
 ```
 
-### Pattern 6: Immutable Specifications
+### Pattern 6: Attribute Promotion
+
+**Aggregate child-level attributes up to a parent level:**
+
+```python
+from nexpresso import HierarchicalPacker, HierarchySpec, LevelSpec
+
+spec = HierarchySpec.from_levels(
+    LevelSpec(name="country", id_fields=["country_id"]),
+    LevelSpec(name="city", id_fields=["city_id"], parent_keys=["country_id"]),
+)
+packer = HierarchicalPacker(spec)
+
+# Promote a child attribute to the parent level with aggregation
+# agg options: "list", "set", "sum", "mean", "min", "max",
+#              "first", "last", "count", "single"
+result = packer.promote_attribute(
+    flat_df,
+    "population",
+    from_level="city",
+    to_level="country",
+    agg="sum",            # Sum city populations into country total
+    alias="total_population",
+)
+```
+
+Constraints:
+- `from_level` must be the **immediate child** of `to_level` (no skipping levels)
+- The input `frame` must be at the same granularity as `from_level`
+- Returns same type as input (DataFrame / LazyFrame)
+
+### Pattern 7: Immutable Specifications
 
 **Use frozen dataclasses for configuration:**
 
@@ -1156,6 +1188,18 @@ nested = packer.build_from_tables({
     "region": regions_df,
     "store": stores_df,
 })
+
+# Promote a child attribute to parent level
+from nexpresso import PromoteAggregation
+
+result = packer.promote_attribute(
+    flat_df,
+    "revenue",
+    from_level="store",
+    to_level="region",
+    agg="sum",          # or: "list","set","mean","min","max","first","last","count","single"
+    alias="total_revenue",
+)
 ```
 
 ### File Modification Checklist
