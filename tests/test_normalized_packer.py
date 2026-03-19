@@ -7,7 +7,6 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from nexpresso import (
-    F,
     HierarchySpec,
     HierarchyValidationError,
     LevelAttribute,
@@ -372,7 +371,7 @@ class TestAnyChildSatisfies:
         result = two_level_packer.any_child_satisfies(
             from_level="store",
             to_level="region",
-            condition=F("revenue") > 180_000,
+            condition=pl.element().struct.field("revenue") > 180_000,
         ).collect()
         # Only r1 has store s2 with 200k
         assert result.height == 1
@@ -383,7 +382,7 @@ class TestAnyChildSatisfies:
         result = two_level_packer.any_child_satisfies(
             from_level="store",
             to_level="region",
-            condition=F("revenue") > 50_000,
+            condition=pl.element().struct.field("revenue") > 50_000,
         ).collect()
         assert result.height == 2
 
@@ -392,16 +391,17 @@ class TestAnyChildSatisfies:
         result = two_level_packer.any_child_satisfies(
             from_level="store",
             to_level="region",
-            condition=F("revenue") > 1_000_000,
+            condition=pl.element().struct.field("revenue") > 1_000_000,
         ).collect()
         assert result.height == 0
 
     def test_compound_condition(self, two_level_packer: NormalizedPacker) -> None:
-        """Test with compound LevelExpr condition."""
+        """Test with compound Polars expression condition."""
         result = two_level_packer.any_child_satisfies(
             from_level="store",
             to_level="region",
-            condition=(F("revenue") > 100_000) & (F("name") == "Store B"),
+            condition=(pl.element().struct.field("revenue") > 100_000)
+            & (pl.element().struct.field("name") == "Store B"),
         ).collect()
         assert result.height == 1
         assert result["region.id"].to_list() == ["r1"]
@@ -411,7 +411,7 @@ class TestAnyChildSatisfies:
             three_level_packer.any_child_satisfies(
                 from_level="product",
                 to_level="region",
-                condition=F("price") > 10,
+                condition=pl.element().struct.field("price") > 10,
             )
 
 
@@ -428,7 +428,7 @@ class TestAllChildrenSatisfy:
         result = two_level_packer.all_children_satisfy(
             from_level="store",
             to_level="region",
-            condition=F("revenue") > 120_000,
+            condition=pl.element().struct.field("revenue") > 120_000,
         ).collect()
         # r1 has s1 (100k < 120k), so r1 fails
         # r2 has s3 (150k > 120k), so r2 passes
@@ -452,7 +452,7 @@ class TestAllChildrenSatisfy:
         result = packer.all_children_satisfy(
             from_level="store",
             to_level="region",
-            condition=F("revenue") > 200,
+            condition=pl.element().struct.field("revenue") > 200,
         ).collect()
         assert result.height == 1
         assert result["region.id"].to_list() == ["r2"]
@@ -462,7 +462,7 @@ class TestAllChildrenSatisfy:
         result = two_level_packer.all_children_satisfy(
             from_level="store",
             to_level="region",
-            condition=F("revenue") > 0,
+            condition=pl.element().struct.field("revenue") > 0,
         ).collect()
         assert result.height == 2
 

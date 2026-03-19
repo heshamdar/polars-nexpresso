@@ -4,6 +4,9 @@ These tests verify that both :class:`NestedBackend` (wrapping
 :class:`HierarchicalPacker`) and :class:`NormalizedPacker` produce
 identical results for the same operations on the same data, validating
 that the normalized backend is a correct alternative to physical nesting.
+
+Both backends accept the SAME Polars expression syntax — conditions use
+``pl.element().struct.field()`` — no separate DSL is needed.
 """
 
 from __future__ import annotations
@@ -13,7 +16,6 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from nexpresso import (
-    F,
     HierarchicalPacker,
     HierarchySpec,
     LevelAttribute,
@@ -222,12 +224,15 @@ class TestPromoteAttributeEquivalence:
 
 
 class TestAnyChildSatisfiesEquivalence:
-    """Verify existential filters produce same results from both backends."""
+    """Verify existential filters produce same results from both backends.
+
+    Both backends receive the EXACT SAME pl.Expr — no DSL translation needed.
+    """
 
     def test_revenue_filter(
         self, nested_backend: NestedBackend, normalized_backend: NormalizedPacker
     ) -> None:
-        condition = F("revenue") > 180_000
+        condition = pl.element().struct.field("revenue") > 180_000
 
         nested_result = (
             nested_backend.any_child_satisfies(
@@ -250,7 +255,10 @@ class TestAnyChildSatisfiesEquivalence:
     def test_compound_condition(
         self, nested_backend: NestedBackend, normalized_backend: NormalizedPacker
     ) -> None:
-        condition = (F("revenue") >= 100_000) & (F("name") == "Alpha")
+        condition = (
+            (pl.element().struct.field("revenue") >= 100_000)
+            & (pl.element().struct.field("name") == "Alpha")
+        )
 
         nested_ids = (
             nested_backend.any_child_satisfies(
@@ -284,7 +292,7 @@ class TestAllChildrenSatisfyEquivalence:
     def test_all_revenue_above_threshold(
         self, nested_backend: NestedBackend, normalized_backend: NormalizedPacker
     ) -> None:
-        condition = F("revenue") > 120_000
+        condition = pl.element().struct.field("revenue") > 120_000
 
         nested_ids = sorted(
             nested_backend.all_children_satisfy(
@@ -340,31 +348,32 @@ class TestEnrichEquivalence:
 
 
 # ============================================================================
-# LevelExpr compilation equivalence
+# Expression equivalence (nested and flat produce same filter results)
 # ============================================================================
 
 
-class TestLevelExprCompilation:
-    """Verify that the same LevelExpr produces equivalent results on nested
-    and flat data."""
+class TestExpressionEquivalence:
+    """Verify that the same pl.Expr produces equivalent results on nested
+    and flat data — proving the translation is correct."""
 
     def test_filter_same_result(self) -> None:
-        """F("x") > 3 filters identically on nested and flat data."""
+        """pl.element().struct.field("x") > 3 filters identically."""
         data = [{"x": 1, "y": "a"}, {"x": 5, "y": "b"}, {"x": 3, "y": "c"}]
 
-        # Flat
+        # Flat (via translation)
+        from nexpresso.normalized_packer import _translate_nested_to_flat
+
         flat_df = pl.DataFrame(data)
-        flat_cond = (F("x") > 3).to_flat_expr()
+        cond = pl.element().struct.field("x") > 3
+        flat_cond = _translate_nested_to_flat(cond)
         flat_result = flat_df.filter(flat_cond).sort("x")
 
-        # Nested
+        # Nested — apply the original expression inside list.eval
         nested_df = pl.DataFrame({"items": [data]})
-        nested_cond = (F("x") > 3).to_nested_expr()
-        # Filter elements within the list
         nested_result = (
             nested_df.select(
                 pl.col("items").list.eval(
-                    pl.when(nested_cond).then(pl.element()).otherwise(None)
+                    pl.when(cond).then(pl.element()).otherwise(None)
                 )
             )
             .explode("items")
@@ -376,17 +385,19 @@ class TestLevelExprCompilation:
         assert_frame_equal(flat_result, nested_result)
 
     def test_arithmetic_same_result(self) -> None:
-        """F("a") * F("b") computes identically on nested and flat data."""
+        """Arithmetic expressions translate correctly."""
+        from nexpresso.normalized_packer import _translate_nested_to_flat
+
         data = [{"a": 2, "b": 3}, {"a": 4, "b": 5}]
 
         flat_df = pl.DataFrame(data)
-        flat_expr = (F("a") * F("b")).to_flat_expr()
-        flat_vals = flat_df.select(flat_expr)["a"].to_list()
+        expr = pl.element().struct.field("a") * pl.element().struct.field("b")
+        flat_expr = _translate_nested_to_flat(expr)
+        flat_vals = flat_df.select(flat_expr.alias("product"))["product"].to_list()
 
         nested_df = pl.DataFrame({"items": [data]})
-        nested_expr = (F("a") * F("b")).to_nested_expr()
         nested_vals = nested_df.select(
-            pl.col("items").list.eval(nested_expr)
+            pl.col("items").list.eval(expr)
         )["items"].to_list()[0]
 
         assert flat_vals == nested_vals

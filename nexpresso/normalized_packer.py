@@ -9,7 +9,8 @@ Polars predicate/projection pushdown for performance.
 
 Typical usage::
 
-    from nexpresso import NormalizedPacker, HierarchySpec, LevelSpec, F
+    import polars as pl
+    from nexpresso import NormalizedPacker, HierarchySpec, LevelSpec
 
     spec = HierarchySpec.from_levels(
         LevelSpec(name="region", id_fields=["id"]),
@@ -29,17 +30,18 @@ Typical usage::
         "revenue", from_level="store", to_level="region", agg="sum"
     )
 
-    # Filter using backend-agnostic condition
+    # Filter using standard Polars expressions (same syntax as HierarchicalPacker)
     filtered = npacker.any_child_satisfies(
         from_level="store", to_level="region",
-        condition=F("revenue") > 100_000,
+        condition=pl.element().struct.field("revenue") > 100_000,
     )
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal
+from typing import Any, Literal
 
 import polars as pl
 
@@ -52,7 +54,6 @@ from nexpresso.hierarchical_packer import (
     LevelMetadata,
     PromoteAggregation,
 )
-from nexpresso.level_expr import LevelExpr
 
 DEFAULT_SEPARATOR = "."
 DEFAULT_ESCAPE_CHAR = "\\"
@@ -74,6 +75,55 @@ _FLAT_AGGREGATIONS: dict[PromoteAggregation, Callable[[pl.Expr], pl.Expr]] = {
     "count": lambda col: col.count(),
     "single": lambda col: col.drop_nulls().unique().first(),
 }
+
+
+# ============================================================================
+# Expression translation (nested → flat)
+# ============================================================================
+
+
+def _translate_nested_to_flat(expr: pl.Expr, prefix: str = "") -> pl.Expr:
+    """Translate a nested Polars condition to a flat column-based condition.
+
+    Converts ``pl.element().struct.field("x")`` patterns to ``pl.col("prefix.x")``
+    by serializing the expression to JSON, walking the tree, and deserializing.
+    This allows users to write the exact same Polars expressions for both nested
+    and normalized backends.
+
+    Args:
+        expr: A Polars expression using ``pl.element().struct.field()`` syntax.
+        prefix: Column name prefix to prepend to translated field names.
+
+    Returns:
+        A new ``pl.Expr`` with flat column references.
+    """
+    raw = expr.meta.serialize(format="json")
+    tree = json.loads(raw)
+    transformed = _walk_expr_tree(tree, prefix)
+    return pl.Expr.deserialize(json.dumps(transformed).encode(), format="json")
+
+
+def _walk_expr_tree(node: Any, prefix: str) -> Any:
+    """Recursively walk a serialized expression tree.
+
+    Replaces ``Element + StructExpr/FieldByName`` patterns with
+    ``Column`` references using the given *prefix*.
+    """
+    if isinstance(node, dict):
+        if "Function" in node:
+            fn = node["Function"]
+            if (
+                fn.get("input") == ["Element"]
+                and isinstance(fn.get("function"), dict)
+                and "StructExpr" in fn["function"]
+                and "FieldByName" in fn["function"]["StructExpr"]
+            ):
+                field_name: str = fn["function"]["StructExpr"]["FieldByName"]
+                return {"Column": f"{prefix}{field_name}"}
+        return {k: _walk_expr_tree(v, prefix) for k, v in node.items()}
+    elif isinstance(node, list):
+        return [_walk_expr_tree(item, prefix) for item in node]
+    return node
 
 
 # ============================================================================
@@ -378,7 +428,7 @@ class NormalizedPacker:
         *,
         from_level: str,
         to_level: str,
-        condition: LevelExpr,
+        condition: pl.Expr,
     ) -> pl.LazyFrame:
         """Filter to parent rows where at least one child matches *condition*.
 
@@ -387,7 +437,9 @@ class NormalizedPacker:
         Args:
             from_level: Child level whose rows are tested.
             to_level: Parent level; one row per entity in the result.
-            condition: A :class:`~nexpresso.level_expr.LevelExpr` condition.
+            condition: A Polars expression using
+                ``pl.element().struct.field()`` syntax (same as the nested
+                backend).  Internally translated to flat column references.
 
         Returns:
             Filtered ``pl.LazyFrame`` at *to_level* granularity.
@@ -404,8 +456,9 @@ class NormalizedPacker:
         from_spec = self.spec.levels[from_idx]
         parent_keys = list(from_spec.parent_keys or [])
 
-        # Filter child table by condition (flat, no prefix — raw child columns)
-        flat_cond = condition.to_flat_expr(prefix="")
+        # Translate nested expression to flat column references (no prefix —
+        # raw child columns)
+        flat_cond = _translate_nested_to_flat(condition, prefix="")
         matching_children = child_table.filter(flat_cond)
 
         # Get distinct parent keys from matching children
@@ -430,7 +483,7 @@ class NormalizedPacker:
         *,
         from_level: str,
         to_level: str,
-        condition: LevelExpr,
+        condition: pl.Expr,
     ) -> pl.LazyFrame:
         """Filter to parent rows where **every** child matches *condition*.
 
@@ -441,7 +494,9 @@ class NormalizedPacker:
         Args:
             from_level: Child level whose rows are tested.
             to_level: Parent level; one row per entity in the result.
-            condition: A :class:`~nexpresso.level_expr.LevelExpr` condition.
+            condition: A Polars expression using
+                ``pl.element().struct.field()`` syntax (same as the nested
+                backend).  Internally translated to flat column references.
 
         Returns:
             Filtered ``pl.LazyFrame`` at *to_level* granularity.
@@ -458,7 +513,7 @@ class NormalizedPacker:
         from_spec = self.spec.levels[from_idx]
         parent_keys = list(from_spec.parent_keys or [])
 
-        flat_cond = condition.to_flat_expr(prefix="")
+        flat_cond = _translate_nested_to_flat(condition, prefix="")
 
         # Count total children per parent
         total_counts = child_table.group_by(parent_keys).agg(
@@ -834,4 +889,5 @@ class NormalizedPacker:
 
 __all__ = [
     "NormalizedPacker",
+    "_translate_nested_to_flat",
 ]

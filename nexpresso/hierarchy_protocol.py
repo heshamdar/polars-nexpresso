@@ -12,10 +12,11 @@ It also provides :class:`NestedBackend`, an adapter that wraps an existing
 
 Typical usage::
 
-    from nexpresso import F, NestedBackend, NormalizedPacker
+    import polars as pl
+    from nexpresso import NestedBackend, NormalizedPacker
 
-    # Use the same condition with either backend
-    cond = F("revenue") > 100_000
+    # Use the SAME Polars expression with either backend
+    cond = pl.element().struct.field("revenue") > 100_000
 
     # Normalized backend
     result_n = npacker.any_child_satisfies(
@@ -41,7 +42,6 @@ from nexpresso.hierarchical_packer import (
     LevelAttribute,
     PromoteAggregation,
 )
-from nexpresso.level_expr import LevelExpr
 
 # ============================================================================
 # Protocol
@@ -123,9 +123,14 @@ class HierarchyOperator(Protocol):
         *,
         from_level: str,
         to_level: str,
-        condition: LevelExpr,
+        condition: pl.Expr,
     ) -> pl.LazyFrame:
-        """Filter to parent rows where at least one child matches *condition*."""
+        """Filter to parent rows where at least one child matches *condition*.
+
+        *condition* should use ``pl.element().struct.field()`` syntax.
+        The nested backend passes it through directly; the normalized
+        backend translates it to flat column references automatically.
+        """
         ...
 
     def all_children_satisfy(
@@ -133,9 +138,12 @@ class HierarchyOperator(Protocol):
         *,
         from_level: str,
         to_level: str,
-        condition: LevelExpr,
+        condition: pl.Expr,
     ) -> pl.LazyFrame:
-        """Filter to parent rows where every child matches *condition*."""
+        """Filter to parent rows where every child matches *condition*.
+
+        *condition* should use ``pl.element().struct.field()`` syntax.
+        """
         ...
 
     def enrich(
@@ -159,9 +167,10 @@ class HierarchyOperator(Protocol):
 class NestedBackend:
     """Adapter wrapping a :class:`HierarchicalPacker` and a packed frame.
 
-    Exposes the :class:`HierarchyOperator` interface by translating
-    :class:`LevelExpr` conditions to nested Polars expressions
-    (``pl.element().struct.field(...)``).
+    Exposes the :class:`HierarchyOperator` interface.  Conditions are
+    standard Polars expressions using ``pl.element().struct.field()``
+    syntax, which are passed through directly to the nested packer
+    (no translation needed).
 
     The *frame* argument should be packed at **root level** (or at least at
     the coarsest level you intend to query).
@@ -261,16 +270,16 @@ class NestedBackend:
         *,
         from_level: str,
         to_level: str,
-        condition: LevelExpr,
+        condition: pl.Expr,
     ) -> pl.LazyFrame:
-        nested_cond = condition.to_nested_expr()
+        # Condition is already a pl.Expr in nested form — pass through
         # Pack at from_level so from_level appears as List[Struct] column
         frame_at_from = self._frame_at_level(from_level)
         result = self._packer.any_child_satisfies(
             frame_at_from,
             from_level=from_level,
             to_level=to_level,
-            condition=nested_cond,
+            condition=condition,
         )
         return self._packer._to_lazy(result)
 
@@ -279,15 +288,15 @@ class NestedBackend:
         *,
         from_level: str,
         to_level: str,
-        condition: LevelExpr,
+        condition: pl.Expr,
     ) -> pl.LazyFrame:
-        nested_cond = condition.to_nested_expr()
+        # Condition is already a pl.Expr in nested form — pass through
         frame_at_from = self._frame_at_level(from_level)
         result = self._packer.all_children_satisfy(
             frame_at_from,
             from_level=from_level,
             to_level=to_level,
-            condition=nested_cond,
+            condition=condition,
         )
         return self._packer._to_lazy(result)
 
