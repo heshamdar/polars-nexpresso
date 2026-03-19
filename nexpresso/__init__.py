@@ -14,6 +14,7 @@ from nexpresso.hierarchical_packer import (
     HierarchicalPacker,
     HierarchySpec,
     HierarchyValidationError,
+    LevelAttribute,
     LevelSpec,
     PromoteAggregation,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "HierarchicalPacker",
     "HierarchySpec",
     "HierarchyValidationError",
+    "LevelAttribute",
     "LevelSpec",
     "PromoteAggregation",
     # Structuring utilities

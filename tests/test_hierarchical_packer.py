@@ -12,6 +12,7 @@ from nexpresso.hierarchical_packer import (
     HierarchicalPacker,
     HierarchySpec,
     HierarchyValidationError,
+    LevelAttribute,
     LevelSpec,
 )
 
@@ -887,5 +888,305 @@ class TestPromoteAttribute:
         """Returns LazyFrame when input is LazyFrame."""
         result = promote_packer.promote_attribute(
             promote_df.lazy(), "length_km", from_level="street", to_level="city", agg="sum"
+        )
+        assert isinstance(result, pl.LazyFrame)
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures for attribute_expr / enrich / existential tests
+# ---------------------------------------------------------------------------
+
+CROSS_LEVEL_SPEC = HierarchySpec(
+    levels=[
+        LevelSpec(name="country", id_fields=["code"]),
+        LevelSpec(name="city", id_fields=["id"]),
+        LevelSpec(name="street", id_fields=["name"]),
+    ]
+)
+
+CROSS_LEVEL_DF = pl.DataFrame(
+    {
+        "country.code": ["US", "US", "US", "CA", "CA"],
+        "country.name": ["United States"] * 3 + ["Canada"] * 2,
+        "country.city.id": ["NYC", "NYC", "LA", "TOR", "TOR"],
+        "country.city.population": [8_000_000, 8_000_000, 4_000_000, 3_000_000, 3_000_000],
+        "country.city.street.name": ["Broadway", "5th Ave", "Sunset Blvd", "Queen St", "King St"],
+        "country.city.street.length_km": [21.0, 10.0, 35.0, 5.0, 3.0],
+    }
+)
+
+
+@pytest.fixture()
+def cl_packer():
+    return HierarchicalPacker(CROSS_LEVEL_SPEC)
+
+
+@pytest.fixture()
+def cl_df():
+    return CROSS_LEVEL_DF.clone()
+
+
+# ---------------------------------------------------------------------------
+# TestAttributeExpr
+# ---------------------------------------------------------------------------
+
+
+class TestAttributeExpr:
+    """Tests for HierarchicalPacker.attribute_expr."""
+
+    def test_same_level_returns_column(self, cl_packer, cl_df):
+        """Same-level access returns the attribute as a direct column expr."""
+        packed = cl_packer.pack(cl_df, "city")  # country-level frame
+        expr = cl_packer.attribute_expr("name", "country", "country")
+        result = sorted(packed.select(expr).to_series().to_list())
+        assert result == ["Canada", "United States"]
+
+    def test_immediate_child_sum(self, cl_packer, cl_df):
+        """Cross-level sum aggregation over immediate child level."""
+        packed = cl_packer.pack(cl_df, "city")
+        expr = cl_packer.attribute_expr("population", "city", "country", "sum")
+        vals = dict(
+            zip(
+                packed.select("country.code").to_series().to_list(),
+                packed.select(expr).to_series().to_list(),
+            )
+        )
+        assert vals["US"] == 12_000_000
+        assert vals["CA"] == 3_000_000
+
+    def test_immediate_child_count(self, cl_packer, cl_df):
+        """Cross-level count gives number of child entities."""
+        packed = cl_packer.pack(cl_df, "city")
+        expr = cl_packer.attribute_expr("id", "city", "country", "count")
+        vals = dict(
+            zip(
+                packed.select("country.code").to_series().to_list(),
+                packed.select(expr).to_series().to_list(),
+            )
+        )
+        assert vals["US"] == 2  # NYC and LA
+        assert vals["CA"] == 1  # TOR
+
+    def test_two_hop_sum(self, cl_packer, cl_df):
+        """Sum across two hops (street → country) cascades correctly."""
+        packed = cl_packer.pack(cl_df, "city")
+        expr = cl_packer.attribute_expr("length_km", "street", "country", "sum")
+        vals = dict(
+            zip(
+                packed.select("country.code").to_series().to_list(),
+                packed.select(expr).to_series().to_list(),
+            )
+        )
+        # US: Broadway(21) + 5th Ave(10) + Sunset Blvd(35) = 66
+        assert vals["US"] == pytest.approx(66.0)
+        # CA: Queen St(5) + King St(3) = 8
+        assert vals["CA"] == pytest.approx(8.0)
+
+    def test_two_hop_count(self, cl_packer, cl_df):
+        """Count across two hops gives total number of from_level entities."""
+        packed = cl_packer.pack(cl_df, "city")
+        expr = cl_packer.attribute_expr("name", "street", "country", "count")
+        vals = dict(
+            zip(
+                packed.select("country.code").to_series().to_list(),
+                packed.select(expr).to_series().to_list(),
+            )
+        )
+        assert vals["US"] == 3  # Broadway, 5th Ave, Sunset Blvd
+        assert vals["CA"] == 2  # Queen St, King St
+
+    def test_used_as_filter(self, cl_packer, cl_df):
+        """attribute_expr result can be used directly in filter()."""
+        packed = cl_packer.pack(cl_df, "city")
+        expr = cl_packer.attribute_expr("id", "city", "country", "count")
+        result = packed.filter(expr > 1)
+        assert result.select("country.code").to_series().to_list() == ["US"]
+
+    def test_used_as_sort_key(self, cl_packer, cl_df):
+        """attribute_expr result can be used as a sort key."""
+        packed = cl_packer.pack(cl_df, "city")
+        expr = cl_packer.attribute_expr("population", "city", "country", "sum")
+        result = packed.sort(expr, descending=True).select("country.code").to_series().to_list()
+        assert result[0] == "US"
+
+    def test_expression_arithmetic(self, cl_packer, cl_df):
+        """Two attribute_expr results compose naturally with Polars arithmetic."""
+        packed = cl_packer.pack(cl_df, "city")
+        city_count = cl_packer.attribute_expr("id", "city", "country", "count")
+        total_pop = cl_packer.attribute_expr("population", "city", "country", "sum")
+        result = packed.with_columns((total_pop / city_count).alias("avg_pop"))
+        us_row = result.filter(pl.col("country.code") == "US")
+        assert us_row.select("avg_pop").item() == pytest.approx(6_000_000.0)
+
+    def test_coarser_from_level_raises(self, cl_packer, cl_df):
+        """Requesting attribute from a coarser level raises ValueError."""
+        with pytest.raises(ValueError, match="coarser"):
+            cl_packer.attribute_expr("code", "country", "city")
+
+    def test_preserves_lazyframe(self, cl_packer, cl_df):
+        """Works on LazyFrame; result is a plain pl.Expr regardless."""
+        packed = cl_packer.pack(cl_df.lazy(), "city")
+        expr = cl_packer.attribute_expr("id", "city", "country", "count")
+        result = packed.filter(expr >= 1).collect()
+        assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# TestEnrich
+# ---------------------------------------------------------------------------
+
+
+class TestEnrich:
+    """Tests for HierarchicalPacker.enrich."""
+
+    def test_single_spec(self, cl_packer, cl_df):
+        """enrich with a single LevelAttribute adds the column."""
+        packed = cl_packer.pack(cl_df, "city")
+        result = cl_packer.enrich(
+            packed,
+            LevelAttribute("id", "city", "count", alias="city_count"),
+            at_level="country",
+        )
+        assert "country.city_count" in result.columns
+        vals = dict(
+            zip(
+                result.select("country.code").to_series().to_list(),
+                result.select("country.city_count").to_series().to_list(),
+            )
+        )
+        assert vals["US"] == 2
+        assert vals["CA"] == 1
+
+    def test_multiple_specs(self, cl_packer, cl_df):
+        """enrich adds multiple attribute columns at once."""
+        packed = cl_packer.pack(cl_df, "city")
+        result = cl_packer.enrich(
+            packed,
+            LevelAttribute("id", "city", "count", alias="city_count"),
+            LevelAttribute("population", "city", "sum", alias="total_pop"),
+            at_level="country",
+        )
+        assert "country.city_count" in result.columns
+        assert "country.total_pop" in result.columns
+
+    def test_same_level_spec(self, cl_packer, cl_df):
+        """enrich works for same-level attribute access."""
+        packed = cl_packer.pack(cl_df, "city")
+        result = cl_packer.enrich(
+            packed,
+            LevelAttribute("name", "country", "single", alias="cname"),
+            at_level="country",
+        )
+        assert "country.cname" in result.columns
+
+    def test_default_alias(self, cl_packer, cl_df):
+        """When alias is None, column name defaults to the attribute name."""
+        packed = cl_packer.pack(cl_df, "city")
+        result = cl_packer.enrich(
+            packed,
+            LevelAttribute("population", "city", "sum"),
+            at_level="country",
+        )
+        assert "country.population" in result.columns
+
+    def test_preserves_lazyframe(self, cl_packer, cl_df):
+        """enrich preserves LazyFrame type."""
+        packed = cl_packer.pack(cl_df.lazy(), "city")
+        result = cl_packer.enrich(
+            packed,
+            LevelAttribute("id", "city", "count", alias="city_count"),
+            at_level="country",
+        )
+        assert isinstance(result, pl.LazyFrame)
+
+
+# ---------------------------------------------------------------------------
+# TestAnyAllChildSatisfies
+# ---------------------------------------------------------------------------
+
+
+class TestAnyAllChildSatisfies:
+    """Tests for any_child_satisfies and all_children_satisfy."""
+
+    def test_any_child_satisfies_basic(self, cl_packer, cl_df):
+        """Filter countries where any city has population > 5M."""
+        packed = cl_packer.pack(cl_df, "city")
+        result = cl_packer.any_child_satisfies(
+            packed,
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 5_000_000,
+        )
+        codes = sorted(result.select("country.code").to_series().to_list())
+        assert codes == ["US"]  # only US has NYC(8M) > 5M
+
+    def test_any_child_satisfies_all_pass(self, cl_packer, cl_df):
+        """When all entities have qualifying children, all rows are returned."""
+        packed = cl_packer.pack(cl_df, "city")
+        result = cl_packer.any_child_satisfies(
+            packed,
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 0,
+        )
+        assert len(result) == len(packed)
+
+    def test_any_child_satisfies_none_pass(self, cl_packer, cl_df):
+        """When no entities have qualifying children, result is empty."""
+        packed = cl_packer.pack(cl_df, "city")
+        result = cl_packer.any_child_satisfies(
+            packed,
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 1_000_000_000,
+        )
+        assert len(result) == 0
+
+    def test_all_children_satisfy_basic(self, cl_packer, cl_df):
+        """Filter countries where ALL cities have population > 2M."""
+        packed = cl_packer.pack(cl_df, "city")
+        result = cl_packer.all_children_satisfy(
+            packed,
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 2_000_000,
+        )
+        # US: NYC(8M) > 2M ✓, LA(4M) > 2M ✓  → pass
+        # CA: TOR(3M) > 2M ✓                   → pass
+        codes = sorted(result.select("country.code").to_series().to_list())
+        assert codes == ["CA", "US"]
+
+    def test_all_children_satisfy_partial(self, cl_packer, cl_df):
+        """Filter countries where ALL cities have population > 5M."""
+        packed = cl_packer.pack(cl_df, "city")
+        result = cl_packer.all_children_satisfy(
+            packed,
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 5_000_000,
+        )
+        # US: NYC(8M) ✓ but LA(4M) ✗  → fail
+        # CA: TOR(3M) ✗               → fail
+        assert len(result) == 0
+
+    def test_non_adjacent_levels_raises(self, cl_packer, cl_df):
+        """Skipping a level raises ValueError."""
+        packed = cl_packer.pack(cl_df, "city")
+        with pytest.raises(ValueError, match="immediate child"):
+            cl_packer.any_child_satisfies(
+                packed,
+                from_level="street",
+                to_level="country",
+                condition=pl.element().struct.field("length_km") > 10,
+            )
+
+    def test_preserves_lazyframe(self, cl_packer, cl_df):
+        """any_child_satisfies preserves LazyFrame type."""
+        packed = cl_packer.pack(cl_df.lazy(), "city")
+        result = cl_packer.any_child_satisfies(
+            packed,
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 5_000_000,
         )
         assert isinstance(result, pl.LazyFrame)
