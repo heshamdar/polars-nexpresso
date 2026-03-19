@@ -20,6 +20,9 @@ from nexpresso.hierarchical_packer import (
     PromoteAggregation,
     SchemaValidationResult,
 )
+from nexpresso.hierarchy_protocol import HierarchyOperator, NestedBackend
+from nexpresso.level_expr import F, FieldRef, LevelExpr
+from nexpresso.normalized_packer import NormalizedPacker
 from nexpresso.structuring_utils import convert_polars_schema, unnest_all, unnest_rename
 
 __version__ = "0.3.0"
@@ -39,6 +42,15 @@ __all__ = [
     "LevelSpec",
     "PromoteAggregation",
     "SchemaValidationResult",
+    # Normalized packer
+    "NormalizedPacker",
+    # Hierarchy protocol
+    "HierarchyOperator",
+    "NestedBackend",
+    # Level expression DSL
+    "F",
+    "FieldRef",
+    "LevelExpr",
     # Structuring utilities
     "convert_polars_schema",
     "unnest_all",

@@ -9,7 +9,6 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from nexpresso.hierarchical_packer import (
-    DiscoveredLevel,
     HierarchicalPacker,
     HierarchySpec,
     HierarchyValidationError,
