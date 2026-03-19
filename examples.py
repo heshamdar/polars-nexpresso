@@ -29,6 +29,7 @@ import polars as pl
 from nexpresso import (
     HierarchicalPacker,
     HierarchySpec,
+    LevelAttribute,
     LevelSpec,
     apply_nested_operations,
 )
@@ -606,6 +607,133 @@ def demonstrate_complete_workflow():
 # =============================================================================
 
 
+def demonstrate_cross_level_operations():
+    """
+    Part 9: Cross-level operations with attribute_expr, enrich, and existential filters.
+
+    Shows how to query and annotate a packed frame using attributes from a
+    different (child) level — including filtering, enriching, and existential
+    predicates — without any bespoke boilerplate.
+    """
+    print("\n" + "=" * 80)
+    print("Part 9: Cross-Level Operations")
+    print("=" * 80)
+
+    # Build a simple region → store hierarchy with revenue and store-count data.
+    spec = HierarchySpec.from_levels(
+        LevelSpec(name="region", id_fields=["id"]),
+        LevelSpec(name="store", id_fields=["id"], parent_keys=["region_id"]),
+    )
+    packer = HierarchicalPacker(spec)
+
+    flat_df = pl.DataFrame(
+        {
+            "region.id": ["north", "north", "south", "south", "south"],
+            "region.name": ["North", "North", "South", "South", "South"],
+            "region.store.id": ["n1", "n2", "s1", "s2", "s3"],
+            "region.store.revenue": [120_000.0, 85_000.0, 200_000.0, 95_000.0, 310_000.0],
+            "region.store.staff_count": [12, 8, 25, 10, 30],
+        }
+    )
+
+    # Pack so stores are nested inside each region row.
+    packed = packer.pack(flat_df, "store")
+
+    print("\nPacked (region-level) frame:")
+    print(packed.drop("region.store"))  # hide nested column for readability
+
+    # ------------------------------------------------------------------
+    # 9a. attribute_expr — core primitive returning a plain pl.Expr
+    # ------------------------------------------------------------------
+    print("\n--- 9a. attribute_expr: filter, annotate, and sort with one API ---")
+
+    store_count = packer.attribute_expr("id", "store", "region", "count")
+    total_revenue = packer.attribute_expr("revenue", "store", "region", "sum")
+
+    # Filter: only regions with more than 2 stores
+    many_stores = packed.filter(store_count > 2)
+    print(f"\nRegions with > 2 stores: {many_stores['region.id'].to_list()}")
+
+    # Annotate: add computed columns (standard Polars with_columns)
+    annotated = packed.with_columns(
+        store_count.alias("region.store_count"),
+        total_revenue.alias("region.total_revenue"),
+    )
+    print("\nAnnotated with store_count and total_revenue:")
+    print(annotated.select("region.id", "region.store_count", "region.total_revenue"))
+
+    # Sort: rank regions by total revenue descending
+    ranked = packed.sort(total_revenue, descending=True)
+    print(f"\nRegions ranked by total revenue: {ranked['region.id'].to_list()}")
+
+    # Arithmetic: combine two exprs natively with Polars operators
+    avg_revenue = total_revenue / store_count
+    print("\nAverage revenue per store by region:")
+    print(packed.with_columns(avg_revenue.alias("region.avg_revenue_per_store"))
+          .select("region.id", "region.avg_revenue_per_store"))
+
+    # ------------------------------------------------------------------
+    # 9b. enrich — batch-annotate with multiple LevelAttribute specs
+    # ------------------------------------------------------------------
+    print("\n--- 9b. enrich: add multiple attributes in one call ---")
+
+    enriched = packer.enrich(
+        packed,
+        LevelAttribute("id", "store", "count", alias="store_count"),
+        LevelAttribute("revenue", "store", "sum", alias="total_revenue"),
+        LevelAttribute("revenue", "store", "max", alias="top_store_revenue"),
+        LevelAttribute("staff_count", "store", "sum", alias="total_staff"),
+        at_level="region",
+    )
+    print(
+        enriched.select(
+            "region.id",
+            "region.store_count",
+            "region.total_revenue",
+            "region.top_store_revenue",
+            "region.total_staff",
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 9c. any_child_satisfies / all_children_satisfy — existential filters
+    # ------------------------------------------------------------------
+    print("\n--- 9c. Existential predicates ---")
+
+    # Regions where ANY store earns more than 150 K
+    high_earner_regions = packer.any_child_satisfies(
+        packed,
+        from_level="store",
+        to_level="region",
+        condition=pl.element().struct.field("revenue") > 150_000,
+    )
+    print(
+        f"\nRegions with at least one store earning > 150K: "
+        f"{high_earner_regions['region.id'].to_list()}"
+    )
+
+    # Regions where ALL stores have at least 8 staff
+    well_staffed_regions = packer.all_children_satisfy(
+        packed,
+        from_level="store",
+        to_level="region",
+        condition=pl.element().struct.field("staff_count") >= 8,
+    )
+    print(
+        f"Regions where all stores have >= 8 staff: "
+        f"{well_staffed_regions['region.id'].to_list()}"
+    )
+
+    # ------------------------------------------------------------------
+    # 9d. Same-level (trivial) case — identical API, no special handling
+    # ------------------------------------------------------------------
+    print("\n--- 9d. Same-level access (trivial case, same API) ---")
+
+    region_name = packer.attribute_expr("name", "region", "region")
+    print("Region names via attribute_expr (same-level):")
+    print(packed.select(region_name.alias("name")))
+
+
 def main():
     """Run all examples."""
     print("\n" + "=" * 80)
@@ -632,6 +760,9 @@ def main():
 
     # Part 8: Complete workflow
     demonstrate_complete_workflow()
+
+    # Part 9: Cross-level operations
+    demonstrate_cross_level_operations()
 
     print("\n" + "=" * 80)
     print("  ALL EXAMPLES COMPLETED SUCCESSFULLY!")

@@ -36,6 +36,7 @@ DEFAULT_ESCAPE_CHAR = "\\"
 
 __all__ = [
     "LevelSpec",
+    "LevelAttribute",
     "HierarchySpec",
     "HierarchicalPacker",
     "HierarchyValidationError",
@@ -111,6 +112,29 @@ class LevelMetadata:
     required_columns: tuple[str, ...]
     required_exprs: tuple[pl.Expr, ...]
     order_by: tuple[pl.Expr, ...]
+
+
+@dataclass(frozen=True)
+class LevelAttribute:
+    """
+    Declarative specification of an attribute derived from a particular level.
+
+    Used with :meth:`HierarchicalPacker.enrich` to annotate a packed frame with
+    multiple cross-level attributes in a single call.
+
+    Args:
+        attribute: Column / field name at ``from_level``.
+        from_level: The level where the attribute lives.  May be the same as
+            the target level (same-level access) or any descendant.
+        agg: Aggregation applied when rolling up to the target level.
+            Defaults to ``"list"``.
+        alias: Output column name (unqualified).  Defaults to ``attribute``.
+    """
+
+    attribute: str
+    from_level: str
+    agg: PromoteAggregation = "list"
+    alias: str | None = None
 
 
 @dataclass(frozen=True)
@@ -860,6 +884,303 @@ class HierarchicalPacker:
         "single": lambda e: e.list.eval(pl.element().drop_nulls().unique()).list.first(),
     }
 
+    # Like _LIST_AGGREGATIONS but used at intermediate levels when traversing more
+    # than one hop.  The only difference is "count": at intermediate hops we sum
+    # the per-child counts rather than re-counting the outer list length.
+    _INTERMEDIATE_AGGREGATIONS: dict[PromoteAggregation, Callable[[pl.Expr], pl.Expr]] = {
+        "list": lambda e: e,
+        "set": lambda e: e.list.eval(pl.element().drop_nulls().unique()),
+        "sum": lambda e: e.list.sum(),
+        "mean": lambda e: e.list.mean(),
+        "min": lambda e: e.list.min(),
+        "max": lambda e: e.list.max(),
+        "first": lambda e: e.list.first(),
+        "last": lambda e: e.list.last(),
+        "count": lambda e: e.list.sum(),  # sum inner counts rather than re-counting
+        "single": lambda e: e.list.eval(pl.element().drop_nulls().unique()).list.first(),
+    }
+
+    def attribute_expr(
+        self,
+        attribute: str,
+        from_level: str,
+        to_level: str,
+        agg: PromoteAggregation = "list",
+    ) -> pl.Expr:
+        """
+        Return a Polars expression that computes an aggregated attribute on a
+        frame already packed at ``to_level`` granularity.
+
+        The expression can be passed directly to standard Polars operations
+        (``filter``, ``with_columns``, ``sort``, arithmetic, …) so the full
+        Polars expression algebra is available without any bespoke wrappers::
+
+            packed = packer.pack(flat_df, "city")
+            expr   = packer.attribute_expr("id", "city", "country", "count")
+
+            packed.filter(expr > 10)                      # filter
+            packed.with_columns(expr.alias("city_count")) # annotate
+            packed.sort(expr, descending=True)            # sort
+            (expr / packer.attribute_expr("revenue", "city", "country", "sum"))
+                                                          # arithmetic
+
+        **Same-level (trivial) case** — when ``from_level == to_level`` the
+        attribute is already a scalar column at that granularity; ``agg`` is
+        not applied and the expression is simply ``pl.col(attribute)``.
+
+        **Cross-level** — navigates the nested list-of-struct structure produced
+        by :meth:`pack`, applying the aggregation at each level.  For depths
+        greater than one hop the aggregation cascades: ``"count"`` sums inner
+        counts correctly; ``"mean"`` gives a mean-of-means approximation for
+        unequal group sizes.
+
+        Args:
+            attribute: Unqualified field name at ``from_level``
+                (e.g. ``"population"``).
+            from_level: Level where the attribute lives.  Must be ``to_level``
+                or a descendant.
+            to_level: Level at which the expression is evaluated.  The frame
+                passed to Polars must be packed at this granularity.
+            agg: How to aggregate when ``from_level != to_level``:
+                ``"list"`` | ``"set"`` | ``"sum"`` | ``"mean"`` | ``"min"`` |
+                ``"max"`` | ``"first"`` | ``"last"`` | ``"count"`` | ``"single"``.
+
+        Returns:
+            A ``pl.Expr`` ready for use with any Polars DataFrame / LazyFrame
+            operation.
+
+        Raises:
+            KeyError: If either level is not found.
+            ValueError: If ``from_level`` is coarser than ``to_level``.
+
+        Examples:
+            >>> packed = packer.pack(flat_df, "city")
+            >>> expr = packer.attribute_expr("id", "city", "country", "count")
+            >>> packed.filter(expr > 10)
+        """
+        from_idx = self.spec.index_of(from_level)
+        to_idx = self.spec.index_of(to_level)
+
+        if from_idx < to_idx:
+            raise ValueError(
+                f"from_level '{from_level}' (index {from_idx}) must be at the same or finer "
+                f"granularity as to_level '{to_level}' (index {to_idx}). "
+                "Attributes cannot be derived from a coarser level."
+            )
+
+        to_meta = self._levels_meta[to_idx]
+
+        # Same-level: the attribute is already a direct scalar column.
+        if from_idx == to_idx:
+            return pl.col(f"{to_meta.prefix}{self._escape_field(attribute)}")
+
+        # Cross-level: build the expression by navigating the nested structure
+        # from the innermost level (from_level) outward to to_level.
+        #
+        # traverse[0] = immediate child of to_level (outermost nested column)
+        # traverse[-1] = from_idx (from_level, innermost)
+        traverse = list(range(to_idx + 1, from_idx + 1))
+        n_hops = len(traverse)
+
+        final_agg = self._LIST_AGGREGATIONS[agg]
+        intermediate_agg = self._INTERMEDIATE_AGGREGATIONS[agg]
+
+        # Innermost expression: extract the attribute from a from_level element.
+        inner: pl.Expr = pl.element().struct.field(attribute)
+
+        # Wrap each intermediate hop (from from_level outward, excluding the
+        # outermost column access which is handled below).
+        for hop in range(n_hops - 1, 0, -1):
+            parent_meta = self._levels_meta[traverse[hop - 1]]
+            child_meta = self._levels_meta[traverse[hop]]
+            field_in_parent = child_meta.path[len(parent_meta.prefix):]
+
+            # The innermost hop uses final_agg; all others use intermediate_agg.
+            agg_fn = final_agg if (hop == n_hops - 1) else intermediate_agg
+            inner = agg_fn(pl.element().struct.field(field_in_parent).list.eval(inner))
+
+        # Outermost: reference the actual column rather than pl.element().
+        imm_child_meta = self._levels_meta[traverse[0]]
+        outer_agg = final_agg if n_hops == 1 else intermediate_agg
+        return outer_agg(pl.col(imm_child_meta.path).list.eval(inner))
+
+    def enrich(
+        self,
+        frame: FrameT,
+        *specs: LevelAttribute,
+        at_level: str,
+    ) -> FrameT:
+        """
+        Add multiple cross-level attribute columns to a packed frame in one call.
+
+        Each :class:`LevelAttribute` spec is converted to an expression via
+        :meth:`attribute_expr` and applied together with ``with_columns``.
+
+        The frame must already be packed at ``at_level`` granularity (i.e.
+        produced by :meth:`pack` or :meth:`build_from_tables`).
+
+        Args:
+            frame: Packed frame at ``at_level`` granularity.
+            *specs: One or more :class:`LevelAttribute` specs describing the
+                attributes to derive and their aggregation strategies.
+            at_level: The granularity level of ``frame``.
+
+        Returns:
+            Frame with new attribute columns appended, preserving input type.
+
+        Raises:
+            KeyError: If any level name is not found in the hierarchy.
+            ValueError: If any ``from_level`` is coarser than ``at_level``.
+
+        Examples:
+            >>> from nexpresso import LevelAttribute
+            >>> packed_country = packer.pack(flat_df, "city")
+            >>> result = packer.enrich(
+            ...     packed_country,
+            ...     LevelAttribute("id", "city", "count", alias="city_count"),
+            ...     LevelAttribute("revenue", "city", "sum", alias="total_revenue"),
+            ...     at_level="country",
+            ... )
+        """
+        to_meta = self._levels_meta[self.spec.index_of(at_level)]
+        exprs = []
+        for spec in specs:
+            expr = self.attribute_expr(spec.attribute, spec.from_level, at_level, spec.agg)
+            col_name = f"{to_meta.prefix}{self._escape_field(spec.alias or spec.attribute)}"
+            exprs.append(expr.alias(col_name))
+        lf = self._to_lazy(frame).with_columns(exprs)
+        return self._match_frame_type(lf, frame)
+
+    def any_child_satisfies(
+        self,
+        frame: FrameT,
+        *,
+        from_level: str,
+        to_level: str,
+        condition: pl.Expr,
+    ) -> FrameT:
+        """
+        Filter a packed frame to rows where **at least one** child satisfies a
+        condition.
+
+        The frame must be packed at ``to_level`` granularity so that
+        ``from_level`` data is accessible as a nested list-of-struct column.
+        ``from_level`` must be the immediate child of ``to_level``.
+
+        The ``condition`` expression should be written using ``pl.element()``
+        to refer to individual child struct elements::
+
+            packer.any_child_satisfies(
+                packed_country,
+                from_level="city",
+                to_level="country",
+                condition=pl.element().struct.field("population") > 1_000_000,
+            )
+
+        Args:
+            frame: Packed frame at ``to_level`` granularity.
+            from_level: Immediate child level whose elements are tested.
+            to_level: Parent level; one row per entity in the result.
+            condition: Boolean expression evaluated per child element using
+                ``pl.element()``.
+
+        Returns:
+            Filtered frame preserving input type (DataFrame / LazyFrame).
+
+        Raises:
+            KeyError: If either level is not found.
+            ValueError: If ``from_level`` is not the immediate child of
+                ``to_level``.
+
+        Examples:
+            >>> packed = packer.pack(flat_df, "city")
+            >>> result = packer.any_child_satisfies(
+            ...     packed,
+            ...     from_level="city",
+            ...     to_level="country",
+            ...     condition=pl.element().struct.field("population") > 1_000_000,
+            ... )
+        """
+        from_idx = self.spec.index_of(from_level)
+        to_idx = self.spec.index_of(to_level)
+        if from_idx != to_idx + 1:
+            raise ValueError(
+                f"from_level '{from_level}' must be the immediate child of "
+                f"to_level '{to_level}' for existential predicates. "
+                f"Got indices {from_idx} and {to_idx}."
+            )
+        from_meta = self._levels_meta[from_idx]
+        mask = pl.col(from_meta.path).list.eval(condition.cast(pl.UInt8)).list.sum() > 0
+        lf = self._to_lazy(frame).filter(mask)
+        return self._match_frame_type(lf, frame)
+
+    def all_children_satisfy(
+        self,
+        frame: FrameT,
+        *,
+        from_level: str,
+        to_level: str,
+        condition: pl.Expr,
+    ) -> FrameT:
+        """
+        Filter a packed frame to rows where **every** child satisfies a
+        condition.
+
+        Entities with no children pass the filter (vacuous truth).
+
+        The frame must be packed at ``to_level`` granularity so that
+        ``from_level`` data is accessible as a nested list-of-struct column.
+        ``from_level`` must be the immediate child of ``to_level``.
+
+        The ``condition`` expression should be written using ``pl.element()``
+        to refer to individual child struct elements::
+
+            packer.all_children_satisfy(
+                packed_country,
+                from_level="city",
+                to_level="country",
+                condition=pl.element().struct.field("population") > 10_000,
+            )
+
+        Args:
+            frame: Packed frame at ``to_level`` granularity.
+            from_level: Immediate child level whose elements are tested.
+            to_level: Parent level; one row per entity in the result.
+            condition: Boolean expression evaluated per child element using
+                ``pl.element()``.
+
+        Returns:
+            Filtered frame preserving input type (DataFrame / LazyFrame).
+
+        Raises:
+            KeyError: If either level is not found.
+            ValueError: If ``from_level`` is not the immediate child of
+                ``to_level``.
+
+        Examples:
+            >>> packed = packer.pack(flat_df, "city")
+            >>> result = packer.all_children_satisfy(
+            ...     packed,
+            ...     from_level="city",
+            ...     to_level="country",
+            ...     condition=pl.element().struct.field("population") > 10_000,
+            ... )
+        """
+        from_idx = self.spec.index_of(from_level)
+        to_idx = self.spec.index_of(to_level)
+        if from_idx != to_idx + 1:
+            raise ValueError(
+                f"from_level '{from_level}' must be the immediate child of "
+                f"to_level '{to_level}' for existential predicates. "
+                f"Got indices {from_idx} and {to_idx}."
+            )
+        from_meta = self._levels_meta[from_idx]
+        child_col = pl.col(from_meta.path)
+        evaluated = child_col.list.eval(condition.cast(pl.UInt8))
+        mask = evaluated.list.sum() == child_col.list.len()
+        lf = self._to_lazy(frame).filter(mask)
+        return self._match_frame_type(lf, frame)
+
     def promote_attribute(
         self,
         frame: FrameT,
@@ -917,17 +1238,17 @@ class HierarchicalPacker:
 
         # Pack so from_level becomes a list-of-struct column.
         packed_lf = self._to_lazy(self.pack(frame, from_level))
-        list_col = from_meta.path
 
         # Validate the attribute exists inside the nested struct.
-        self._validate_list_struct_field(packed_lf.collect_schema(), list_col, attribute, from_level)
+        self._validate_list_struct_field(
+            packed_lf.collect_schema(), from_meta.path, attribute, from_level
+        )
 
-        # Extract → aggregate → alias with the target-level naming convention.
-        extract = pl.col(list_col).list.eval(pl.element().struct.field(attribute))
+        # Delegate expression generation to attribute_expr, then alias.
+        expr = self.attribute_expr(attribute, from_level, to_level, agg)
         out_col = f"{to_meta.prefix}{self._escape_field(alias or attribute)}"
-        agg_fn = self._LIST_AGGREGATIONS[agg]
 
-        result = packed_lf.with_columns(agg_fn(extract).alias(out_col))
+        result = packed_lf.with_columns(expr.alias(out_col))
         return self._match_frame_type(result, frame)
 
     @staticmethod
