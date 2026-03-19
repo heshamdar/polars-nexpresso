@@ -35,9 +35,52 @@ ROW_ID_COLUMN = "__hier_row_id"
 DEFAULT_SEPARATOR = "."
 DEFAULT_ESCAPE_CHAR = "\\"
 
+
+def _split_path_static(
+    path: str,
+    separator: str = DEFAULT_SEPARATOR,
+    escape_char: str = DEFAULT_ESCAPE_CHAR,
+) -> list[str]:
+    """
+    Split a path by separator, respecting escaped separators.
+
+    Standalone version of :meth:`HierarchicalPacker._split_path` for use
+    without an instance (e.g. in :meth:`HierarchicalPacker.discover_levels`).
+
+    Args:
+        path: The path string to split.
+        separator: Separator character between path components.
+        escape_char: Character used to escape literal separators in field names.
+
+    Returns:
+        List of path components.
+    """
+    if not path:
+        return []
+
+    components: list[str] = []
+    current: list[str] = []
+    i = 0
+    while i < len(path):
+        if path[i] == escape_char and i + 1 < len(path):
+            current.append(path[i + 1])
+            i += 2
+        elif path[i] == separator:
+            components.append("".join(current))
+            current = []
+            i += 1
+        else:
+            current.append(path[i])
+            i += 1
+
+    components.append("".join(current))
+    return components
+
 __all__ = [
     "LevelSpec",
     "LevelAttribute",
+    "DiscoveredLevel",
+    "SchemaValidationResult",
     "HierarchySpec",
     "HierarchicalPacker",
     "HierarchyValidationError",
@@ -137,6 +180,59 @@ class LevelAttribute:
     from_level: str
     agg: PromoteAggregation = "list"
     alias: str | None = None
+
+
+@dataclass(frozen=True)
+class DiscoveredLevel:
+    """
+    A hierarchy level inferred from schema inspection.
+
+    Produced by :meth:`HierarchicalPacker.discover_levels` when examining a
+    schema without a pre-existing :class:`HierarchySpec`.
+
+    Args:
+        name: Inferred level name (the path component, e.g. ``"city"``).
+        depth: Zero-based depth in the hierarchy tree (0 = root).
+        path: Full separator-joined path from root to this level
+            (e.g. ``"country.city"``).
+        fields: Non-level scalar field names at this level.
+        parent: Name of the parent level, or ``None`` for the root.
+        is_packed: ``True`` if this level was discovered inside a
+            ``List[Struct]`` or ``Struct`` type rather than from flat
+            dotted column names.
+    """
+
+    name: str
+    depth: int
+    path: str
+    fields: tuple[str, ...]
+    parent: str | None
+    is_packed: bool = False
+
+
+@dataclass(frozen=True)
+class SchemaValidationResult:
+    """
+    Result of schema compatibility validation.
+
+    Produced by :meth:`HierarchicalPacker.validate_schema`.
+
+    Args:
+        is_compatible: ``True`` if the schema is usable with this packer.
+        inferred_level: The current packing level inferred from the schema,
+            or ``None`` if inference failed.
+        present_levels: Level names whose columns/fields were found.
+        missing_levels: Level names whose expected columns are absent.
+        errors: Fatal incompatibilities (human-readable descriptions).
+        warnings: Non-fatal issues (e.g. missing optional fields).
+    """
+
+    is_compatible: bool
+    inferred_level: str | None
+    present_levels: list[str]
+    missing_levels: list[str]
+    errors: list[str]
+    warnings: list[str]
 
 
 @dataclass(frozen=True)
@@ -682,6 +778,149 @@ class HierarchicalPacker:
             if meta.ancestor_keys:
                 lines.append(f"       Ancestor keys: {', '.join(meta.ancestor_keys)}")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Hierarchy Discovery
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _discover_from_struct(
+        dtype: pl.Struct,
+        parent_path: tuple[str, ...],
+        levels: dict[tuple[str, ...], set[str]],
+        packed_paths: set[tuple[str, ...]],
+    ) -> None:
+        """
+        Recursively discover levels inside a ``Struct`` dtype.
+
+        For each struct field whose dtype is ``List[Struct]`` or ``Struct``
+        (with further nested fields), a child level is registered.  Other
+        fields are recorded as data fields of ``parent_path``.
+
+        Args:
+            dtype: The Struct data type to inspect.
+            parent_path: Tuple of path components leading to this struct.
+            levels: Mutable dict mapping level path tuples to their field name sets.
+            packed_paths: Mutable set tracking which paths were found inside packed columns.
+        """
+        for struct_field in dtype.fields:
+            inner = struct_field.dtype
+            # Unwrap List wrapper
+            inner_unwrapped = inner.inner if isinstance(inner, pl.List) else inner
+
+            if isinstance(inner_unwrapped, pl.Struct) and inner_unwrapped.fields:
+                # This field represents a child level
+                child_path = parent_path + (struct_field.name,)
+                if child_path not in levels:
+                    levels[child_path] = set()
+                packed_paths.add(child_path)
+                HierarchicalPacker._discover_from_struct(
+                    inner_unwrapped, child_path, levels, packed_paths
+                )
+            else:
+                # Scalar or non-hierarchical field at the current level
+                levels[parent_path].add(struct_field.name)
+
+    @staticmethod
+    def discover_levels(
+        schema_or_frame: SchemaInput,
+        *,
+        separator: str = DEFAULT_SEPARATOR,
+        escape_char: str = DEFAULT_ESCAPE_CHAR,
+    ) -> list[DiscoveredLevel]:
+        """
+        Infer hierarchy levels from a schema without a pre-existing spec.
+
+        Examines column names (splitting by ``separator``) and nested
+        ``List[Struct]`` / ``Struct`` types to determine what hierarchy levels
+        the data contains.
+
+        This is a **static method** — no :class:`HierarchicalPacker` instance
+        is needed.
+
+        Args:
+            schema_or_frame: A ``pl.Schema``, ``pl.DataFrame``, or ``pl.LazyFrame``
+                to inspect.
+            separator: Separator character between path components.
+                Defaults to ``"."``.
+            escape_char: Character used to escape literal separators in field
+                names.  Defaults to ``"\\\\"``.
+
+        Returns:
+            List of :class:`DiscoveredLevel` objects sorted by depth then name.
+
+        Examples:
+            >>> df = pl.DataFrame({
+            ...     "country.code": ["US"],
+            ...     "country.city.id": ["NYC"],
+            ...     "country.city.name": ["New York"],
+            ... })
+            >>> levels = HierarchicalPacker.discover_levels(df)
+            >>> [lvl.name for lvl in levels]
+            ['country', 'city']
+        """
+        schema = HierarchicalPacker._extract_schema(schema_or_frame)
+
+        # level path tuple → set of field names at that level
+        levels: dict[tuple[str, ...], set[str]] = {}
+        # Paths discovered inside packed columns
+        packed_paths: set[tuple[str, ...]] = set()
+
+        for col_name, col_dtype in schema.items():
+            parts = _split_path_static(col_name, separator, escape_char)
+
+            # Check if this column is a packed nested type
+            inner = col_dtype.inner if isinstance(col_dtype, pl.List) else col_dtype
+            if isinstance(inner, pl.Struct) and inner.fields:
+                # The column path IS a level, and the struct contains child data
+                level_path = tuple(parts)
+                if level_path not in levels:
+                    levels[level_path] = set()
+                packed_paths.add(level_path)
+                HierarchicalPacker._discover_from_struct(
+                    inner, level_path, levels, packed_paths
+                )
+            elif len(parts) >= 2:
+                # Flat scalar column: components except last form the level path
+                level_path = tuple(parts[:-1])
+                field_name = parts[-1]
+                if level_path not in levels:
+                    levels[level_path] = set()
+                levels[level_path].add(field_name)
+            # else: single-component scalar column — not hierarchical, skip
+
+        # Ensure all intermediate paths exist (e.g. if we only saw
+        # "country.city.street.name", the "country" level should exist too)
+        all_paths = list(levels.keys())
+        for path in all_paths:
+            for i in range(1, len(path)):
+                prefix = path[:i]
+                if prefix not in levels:
+                    levels[prefix] = set()
+
+        if not levels:
+            return []
+
+        # Build DiscoveredLevel objects sorted by depth then name
+        result: list[DiscoveredLevel] = []
+        for path_tuple in sorted(levels.keys(), key=lambda p: (len(p), p)):
+            name = path_tuple[-1]
+            depth = len(path_tuple) - 1
+            full_path = separator.join(path_tuple)
+            parent = path_tuple[-2] if len(path_tuple) > 1 else None
+            is_packed = path_tuple in packed_paths
+            result.append(
+                DiscoveredLevel(
+                    name=name,
+                    depth=depth,
+                    path=full_path,
+                    fields=tuple(sorted(levels[path_tuple])),
+                    parent=parent,
+                    is_packed=is_packed,
+                )
+            )
+
+        return result
 
     # ------------------------------------------------------------------
     # Public API
@@ -1236,6 +1475,136 @@ class HierarchicalPacker:
                     errors.append(error)
 
         return errors
+
+    def validate_schema(
+        self,
+        schema_or_frame: SchemaInput,
+        *,
+        expected_level: str | None = None,
+    ) -> SchemaValidationResult:
+        """
+        Validate whether this packer's hierarchy spec is compatible with a schema.
+
+        Performs structural validation (column existence, type compatibility)
+        without inspecting actual data values.  For data validation (null keys,
+        uniformity), use :meth:`validate`.
+
+        Args:
+            schema_or_frame: A ``pl.Schema``, ``pl.DataFrame``, or ``pl.LazyFrame``
+                to validate against.
+            expected_level: If provided, also verify that the schema represents
+                data at this specific packing level.  If ``None``, the level is
+                inferred automatically.
+
+        Returns:
+            A :class:`SchemaValidationResult` with detailed compatibility info.
+
+        Examples:
+            >>> result = packer.validate_schema(df)
+            >>> if not result.is_compatible:
+            ...     for err in result.errors:
+            ...         print(err)
+        """
+        schema = self._extract_schema(schema_or_frame)
+        errors: list[str] = []
+        warnings: list[str] = []
+        present: list[str] = []
+        missing: list[str] = []
+
+        # Infer current level
+        inferred_level: str | None = None
+        try:
+            inferred_level = self.infer_current_level(schema)
+        except ValueError:
+            warnings.append(
+                "Could not infer current packing level from schema. "
+                f"Schema columns: {list(schema.keys())}"
+            )
+
+        # Check expected level
+        if expected_level is not None and inferred_level is not None:
+            if expected_level != inferred_level:
+                errors.append(
+                    f"Expected data at level '{expected_level}' but inferred "
+                    f"level is '{inferred_level}'."
+                )
+
+        # Validate each level
+        for meta in self._levels_meta:
+            level_found = False
+
+            # --- Check flat columns ---
+            flat_id_found: list[str] = []
+            flat_id_missing: list[str] = []
+            for id_col in meta.id_columns:
+                if id_col in schema:
+                    flat_id_found.append(id_col)
+                    # Type check: should be a scalar, not nested
+                    col_dtype = schema[id_col]
+                    if isinstance(col_dtype, (pl.List, pl.Struct, pl.Array)):
+                        errors.append(
+                            f"[Level: {meta.name}] Key column '{id_col}' has "
+                            f"type {col_dtype} but expected a scalar type."
+                        )
+                else:
+                    flat_id_missing.append(id_col)
+
+            if flat_id_found:
+                level_found = True
+                if flat_id_missing:
+                    warnings.append(
+                        f"[Level: {meta.name}] Some key columns missing from flat schema: "
+                        f"{flat_id_missing}. Found: {flat_id_found}."
+                    )
+
+            # --- Check packed column ---
+            if meta.path in schema:
+                col_dtype = schema[meta.path]
+                inner = col_dtype.inner if isinstance(col_dtype, pl.List) else col_dtype
+                if isinstance(inner, pl.Struct) and inner.fields:
+                    level_found = True
+                    # Check struct contains expected id fields (short names)
+                    struct_field_names = {f.name for f in inner.fields}
+                    short_ids = [
+                        col[len(meta.prefix) :] for col in meta.id_columns
+                    ]
+                    missing_ids = [
+                        sid for sid in short_ids if sid not in struct_field_names
+                    ]
+                    if missing_ids:
+                        errors.append(
+                            f"[Level: {meta.name}] Packed column '{meta.path}' "
+                            f"is missing expected key fields: {missing_ids}. "
+                            f"Struct fields: {sorted(struct_field_names)}."
+                        )
+                elif not flat_id_found:
+                    # Path exists but is not a Struct — unexpected type
+                    warnings.append(
+                        f"[Level: {meta.name}] Column '{meta.path}' exists but "
+                        f"has type {col_dtype}, expected List[Struct] or Struct."
+                    )
+
+            if level_found:
+                present.append(meta.name)
+            else:
+                missing.append(meta.name)
+
+        # If no levels found at all, that's definitely incompatible
+        if not present:
+            errors.append(
+                "No hierarchy levels found in schema. "
+                f"Expected columns with prefix patterns like: "
+                f"{[m.prefix for m in self._levels_meta[:3]]}..."
+            )
+
+        return SchemaValidationResult(
+            is_compatible=len(errors) == 0,
+            inferred_level=inferred_level,
+            present_levels=present,
+            missing_levels=missing,
+            errors=errors,
+            warnings=warnings,
+        )
 
     def get_level_columns(self, level: str) -> list[str]:
         """

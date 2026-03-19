@@ -9,11 +9,13 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from nexpresso.hierarchical_packer import (
+    DiscoveredLevel,
     HierarchicalPacker,
     HierarchySpec,
     HierarchyValidationError,
     LevelAttribute,
     LevelSpec,
+    SchemaValidationResult,
 )
 
 TEST_HIERARCHY = HierarchySpec(
@@ -1406,3 +1408,305 @@ class TestUsabilityHelpers:
         desc = packer.describe()
         assert "code" in desc  # country key
         assert "number" in desc  # building key
+
+
+# =============================================================================
+# Hierarchy Discovery Tests
+# =============================================================================
+
+
+class TestDiscoverLevels:
+    """Tests for hierarchy discovery from schema."""
+
+    def test_discover_from_flat_schema(self, apartment_level_df):
+        """Discover levels from a fully flat DataFrame."""
+        levels = HierarchicalPacker.discover_levels(apartment_level_df)
+        names = [lvl.name for lvl in levels]
+        assert names == ["country", "city", "street", "building", "apartment"]
+
+    def test_discover_depths(self, apartment_level_df):
+        """Discovered levels have correct depths."""
+        levels = HierarchicalPacker.discover_levels(apartment_level_df)
+        depths = {lvl.name: lvl.depth for lvl in levels}
+        assert depths == {
+            "country": 0,
+            "city": 1,
+            "street": 2,
+            "building": 3,
+            "apartment": 4,
+        }
+
+    def test_discover_paths(self, apartment_level_df):
+        """Discovered levels have correct full paths."""
+        levels = HierarchicalPacker.discover_levels(apartment_level_df)
+        paths = {lvl.name: lvl.path for lvl in levels}
+        assert paths["country"] == "country"
+        assert paths["city"] == "country.city"
+        assert paths["apartment"] == "country.city.street.building.apartment"
+
+    def test_discover_parents(self, apartment_level_df):
+        """Discovered levels have correct parent references."""
+        levels = HierarchicalPacker.discover_levels(apartment_level_df)
+        parents = {lvl.name: lvl.parent for lvl in levels}
+        assert parents["country"] is None
+        assert parents["city"] == "country"
+        assert parents["street"] == "city"
+        assert parents["building"] == "street"
+        assert parents["apartment"] == "building"
+
+    def test_discover_fields_correct(self, apartment_level_df):
+        """Discovered levels report correct non-level field names."""
+        levels = HierarchicalPacker.discover_levels(apartment_level_df)
+        fields_by_name = {lvl.name: lvl.fields for lvl in levels}
+        assert "code" in fields_by_name["country"]
+        assert "id" in fields_by_name["city"]
+        assert "name" in fields_by_name["city"]
+        assert "area" in fields_by_name["apartment"]
+
+    def test_discover_flat_not_packed(self, apartment_level_df):
+        """Flat schema levels should not be marked as packed."""
+        levels = HierarchicalPacker.discover_levels(apartment_level_df)
+        assert all(not lvl.is_packed for lvl in levels)
+
+    def test_discover_from_packed_schema(self, packer, apartment_level_df):
+        """Discover levels from a packed DataFrame."""
+        packed = packer.pack(apartment_level_df, "city")
+        levels = HierarchicalPacker.discover_levels(packed)
+        names = [lvl.name for lvl in levels]
+        assert "country" in names
+        assert "city" in names
+        assert "street" in names
+        assert "building" in names
+        assert "apartment" in names
+
+    def test_discover_packed_levels_marked(self, packer, apartment_level_df):
+        """Levels inside packed columns should be marked is_packed=True."""
+        packed = packer.pack(apartment_level_df, "city")
+        levels = HierarchicalPacker.discover_levels(packed)
+        by_name = {lvl.name: lvl for lvl in levels}
+        # country is flat, city is a packed List[Struct] column
+        assert not by_name["country"].is_packed
+        assert by_name["city"].is_packed
+        # levels inside the struct are also packed
+        assert by_name["street"].is_packed
+
+    def test_discover_from_partially_packed(self, packer, apartment_level_df):
+        """Discover levels from partially packed data."""
+        packed = packer.pack(apartment_level_df, "street")
+        levels = HierarchicalPacker.discover_levels(packed)
+        names = [lvl.name for lvl in levels]
+        # All 5 levels should still be discoverable
+        assert len(names) == 5
+        by_name = {lvl.name: lvl for lvl in levels}
+        # country and city are flat
+        assert not by_name["country"].is_packed
+        assert not by_name["city"].is_packed
+        # street is packed (it's a List[Struct] column)
+        assert by_name["street"].is_packed
+
+    def test_discover_single_level(self):
+        """Schema with only one level."""
+        schema = pl.Schema({"entity.id": pl.String, "entity.name": pl.String})
+        levels = HierarchicalPacker.discover_levels(schema)
+        assert len(levels) == 1
+        assert levels[0].name == "entity"
+        assert levels[0].depth == 0
+        assert levels[0].parent is None
+        assert set(levels[0].fields) == {"id", "name"}
+
+    def test_discover_custom_separator(self):
+        """Discovery with non-default separator."""
+        schema = pl.Schema({
+            "region/code": pl.String,
+            "region/city/id": pl.String,
+        })
+        levels = HierarchicalPacker.discover_levels(schema, separator="/")
+        names = [lvl.name for lvl in levels]
+        assert names == ["region", "city"]
+
+    def test_discover_sibling_branches(self):
+        """Struct with multiple List[Struct] fields (sibling branches)."""
+        # A city with both "street" and "park" as List[Struct] children
+        schema = pl.Schema({
+            "city.name": pl.String,
+            "city": pl.List(
+                pl.Struct({
+                    "id": pl.String,
+                    "street": pl.List(pl.Struct({"name": pl.String})),
+                    "park": pl.List(pl.Struct({"name": pl.String, "area": pl.Float64})),
+                })
+            ),
+        })
+        levels = HierarchicalPacker.discover_levels(schema)
+        names = [lvl.name for lvl in levels]
+        assert "city" in names
+        assert "street" in names
+        assert "park" in names
+        # Both siblings should have same parent
+        by_name = {lvl.name: lvl for lvl in levels}
+        assert by_name["street"].parent == "city"
+        assert by_name["park"].parent == "city"
+        assert by_name["street"].depth == by_name["park"].depth
+
+    def test_discover_empty_schema(self):
+        """Empty schema returns empty list."""
+        levels = HierarchicalPacker.discover_levels(pl.Schema({}))
+        assert levels == []
+
+    def test_discover_no_hierarchy_columns(self):
+        """Schema with only top-level columns (no separator) returns empty."""
+        schema = pl.Schema({"foo": pl.String, "bar": pl.Int64})
+        levels = HierarchicalPacker.discover_levels(schema)
+        assert levels == []
+
+    def test_discover_accepts_lazyframe(self, apartment_level_df):
+        """Works with LazyFrame input."""
+        levels_df = HierarchicalPacker.discover_levels(apartment_level_df)
+        levels_lf = HierarchicalPacker.discover_levels(apartment_level_df.lazy())
+        assert levels_df == levels_lf
+
+    def test_discover_accepts_schema(self, apartment_level_df):
+        """Works with pl.Schema input."""
+        levels_df = HierarchicalPacker.discover_levels(apartment_level_df)
+        levels_schema = HierarchicalPacker.discover_levels(apartment_level_df.schema)
+        assert levels_df == levels_schema
+
+    def test_discover_depth_ordering(self, apartment_level_df):
+        """Results are ordered by depth then name."""
+        levels = HierarchicalPacker.discover_levels(apartment_level_df)
+        depths = [lvl.depth for lvl in levels]
+        assert depths == sorted(depths)
+
+    def test_discover_intermediate_levels_created(self):
+        """Levels with no direct fields are still discovered as intermediates."""
+        # Only leaf columns exist, but intermediate levels should be inferred
+        schema = pl.Schema({
+            "a.b.c.value": pl.Int64,
+        })
+        levels = HierarchicalPacker.discover_levels(schema)
+        names = [lvl.name for lvl in levels]
+        assert "a" in names
+        assert "b" in names
+        assert "c" in names
+
+
+# =============================================================================
+# Schema Validation Tests
+# =============================================================================
+
+
+class TestValidateSchema:
+    """Tests for schema compatibility validation."""
+
+    def test_compatible_flat_schema(self, packer, apartment_level_df):
+        """Flat schema matching the hierarchy is compatible."""
+        result = packer.validate_schema(apartment_level_df)
+        assert result.is_compatible
+        assert result.inferred_level == "apartment"
+        assert len(result.errors) == 0
+        assert len(result.present_levels) == 5
+
+    def test_compatible_packed_schema(self, packer, apartment_level_df):
+        """Packed schema is compatible."""
+        packed = packer.pack(apartment_level_df, "city")
+        result = packer.validate_schema(packed)
+        assert result.is_compatible
+        assert result.inferred_level == "country"
+
+    def test_incompatible_no_hierarchy_columns(self, packer):
+        """Schema with no hierarchy columns is incompatible."""
+        schema = pl.Schema({"foo": pl.String, "bar": pl.Int64})
+        result = packer.validate_schema(schema)
+        assert not result.is_compatible
+        assert len(result.errors) > 0
+        assert len(result.missing_levels) > 0
+        assert len(result.present_levels) == 0
+
+    def test_partial_levels_missing(self, packer, apartment_level_df):
+        """Schema with some levels missing reports them."""
+        df = apartment_level_df.drop(
+            "country.city.street.building.apartment.id",
+            "country.city.street.building.apartment.area",
+        )
+        result = packer.validate_schema(df)
+        assert "apartment" in result.missing_levels
+
+    def test_expected_level_matches(self, packer, apartment_level_df):
+        """Specifying expected_level that matches is fine."""
+        result = packer.validate_schema(apartment_level_df, expected_level="apartment")
+        assert result.is_compatible
+
+    def test_expected_level_mismatch(self, packer, apartment_level_df):
+        """Specifying wrong expected_level produces an error."""
+        result = packer.validate_schema(apartment_level_df, expected_level="city")
+        assert not result.is_compatible
+        assert any("expected" in e.lower() for e in result.errors)
+
+    def test_wrong_column_types(self, packer):
+        """Columns with wrong types produce errors."""
+        schema = pl.Schema({
+            "country.code": pl.List(pl.String),  # Should be scalar
+            "country.city.id": pl.String,
+            "country.city.name": pl.String,
+            "country.city.street.name": pl.String,
+            "country.city.street.building.number": pl.Int64,
+            "country.city.street.building.id": pl.String,
+            "country.city.street.building.apartment.id": pl.String,
+            "country.city.street.building.apartment.area": pl.Float64,
+        })
+        result = packer.validate_schema(schema)
+        assert any("type" in e.lower() for e in result.errors)
+
+    def test_accepts_lazyframe(self, packer, apartment_level_df):
+        """Works with LazyFrame input."""
+        result = packer.validate_schema(apartment_level_df.lazy())
+        assert result.is_compatible
+
+    def test_accepts_schema_object(self, packer, apartment_level_df):
+        """Works with pl.Schema input."""
+        result = packer.validate_schema(apartment_level_df.schema)
+        assert result.is_compatible
+
+    def test_result_fields_populated(self, packer, apartment_level_df):
+        """All result fields are populated correctly."""
+        result = packer.validate_schema(apartment_level_df)
+        assert isinstance(result, SchemaValidationResult)
+        assert isinstance(result.is_compatible, bool)
+        assert isinstance(result.present_levels, list)
+        assert isinstance(result.missing_levels, list)
+        assert isinstance(result.errors, list)
+        assert isinstance(result.warnings, list)
+
+    def test_present_and_missing_levels_disjoint(self, packer, apartment_level_df):
+        """present_levels and missing_levels should not overlap."""
+        # Full schema
+        result = packer.validate_schema(apartment_level_df)
+        assert set(result.present_levels).isdisjoint(set(result.missing_levels))
+
+        # Partial schema
+        df = apartment_level_df.drop(
+            "country.city.street.building.apartment.id",
+            "country.city.street.building.apartment.area",
+        )
+        result = packer.validate_schema(df)
+        assert set(result.present_levels).isdisjoint(set(result.missing_levels))
+
+    def test_packed_struct_missing_id_field(self, packer, apartment_level_df):
+        """Packed struct missing expected key field produces error."""
+        # Create a packed schema where we manually drop a key field from the struct
+        # by constructing a schema with a malformed packed column
+        schema = pl.Schema({
+            "country.code": pl.String,
+            "country.city": pl.List(
+                pl.Struct({
+                    # "id" is missing — it's a key for city level
+                    "name": pl.String,
+                    "street": pl.List(pl.Struct({"name": pl.String})),
+                })
+            ),
+        })
+        result = packer.validate_schema(schema)
+        assert any(
+            "missing" in e.lower() and "key" in e.lower()
+            for e in result.errors
+        )

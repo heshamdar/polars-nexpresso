@@ -11,12 +11,14 @@ from nexpresso.expressions import (
     generate_nested_exprs,
 )
 from nexpresso.hierarchical_packer import (
+    DiscoveredLevel,
     HierarchicalPacker,
     HierarchySpec,
     HierarchyValidationError,
     LevelAttribute,
     LevelSpec,
     PromoteAggregation,
+    SchemaValidationResult,
 )
 from nexpresso.structuring_utils import convert_polars_schema, unnest_all, unnest_rename
 
@@ -29,12 +31,14 @@ __all__ = [
     "generate_nested_exprs",
     "apply_nested_operations",
     # Hierarchical packer
+    "DiscoveredLevel",
     "HierarchicalPacker",
     "HierarchySpec",
     "HierarchyValidationError",
     "LevelAttribute",
     "LevelSpec",
     "PromoteAggregation",
+    "SchemaValidationResult",
     # Structuring utilities
     "convert_polars_schema",
     "unnest_all",
