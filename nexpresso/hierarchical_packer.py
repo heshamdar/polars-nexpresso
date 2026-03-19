@@ -29,6 +29,7 @@ ExtraColumnsMode = Literal["preserve", "drop", "error"]
 PromoteAggregation = Literal[
     "list", "set", "sum", "mean", "min", "max", "first", "last", "count", "single"
 ]
+SchemaInput = pl.Schema | pl.DataFrame | pl.LazyFrame
 
 ROW_ID_COLUMN = "__hier_row_id"
 DEFAULT_SEPARATOR = "."
@@ -41,6 +42,7 @@ __all__ = [
     "HierarchicalPacker",
     "HierarchyValidationError",
     "PromoteAggregation",
+    "SchemaInput",
 ]
 
 
@@ -301,6 +303,385 @@ class HierarchicalPacker:
         self.validate_on_pack: bool = validate_on_pack
         self._levels_meta: list[LevelMetadata] = self._build_metadata()
         self._computed_exprs: dict[str, Expr] = self._collect_computed_exprs()
+
+    # ------------------------------------------------------------------
+    # Introspection Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_schema(schema_or_frame: SchemaInput) -> pl.Schema:
+        """Extract a ``pl.Schema`` from a Schema, DataFrame, or LazyFrame."""
+        if isinstance(schema_or_frame, pl.LazyFrame):
+            return schema_or_frame.collect_schema()
+        if isinstance(schema_or_frame, pl.DataFrame):
+            return schema_or_frame.schema
+        return schema_or_frame
+
+    @property
+    def level_names(self) -> list[str]:
+        """
+        Return all level names ordered from root (coarsest) to leaf (finest).
+
+        Returns:
+            List of level name strings.
+
+        Examples:
+            >>> packer.level_names
+            ['country', 'city', 'street']
+        """
+        return [m.name for m in self._levels_meta]
+
+    @property
+    def root_level(self) -> str:
+        """
+        Return the name of the coarsest (root) level.
+
+        Returns:
+            Root level name.
+
+        Examples:
+            >>> packer.root_level
+            'country'
+        """
+        return self._levels_meta[0].name
+
+    @property
+    def leaf_level(self) -> str:
+        """
+        Return the name of the finest (leaf) level.
+
+        Returns:
+            Leaf level name.
+
+        Examples:
+            >>> packer.leaf_level
+            'street'
+        """
+        return self._levels_meta[-1].name
+
+    def get_ancestor_levels(self, level: str) -> list[str]:
+        """
+        Return all ancestor level names above ``level``, ordered root → parent.
+
+        Args:
+            level: The level whose ancestors to retrieve.
+
+        Returns:
+            List of ancestor level names. Empty list if ``level`` is the root.
+
+        Raises:
+            KeyError: If ``level`` is not found in the hierarchy.
+
+        Examples:
+            >>> packer.get_ancestor_levels('street')
+            ['country', 'city']
+            >>> packer.get_ancestor_levels('country')
+            []
+        """
+        idx = self.spec.index_of(level)
+        return [m.name for m in self._levels_meta[:idx]]
+
+    def get_descendant_levels(self, level: str) -> list[str]:
+        """
+        Return all descendant level names below ``level``, ordered child → leaf.
+
+        Args:
+            level: The level whose descendants to retrieve.
+
+        Returns:
+            List of descendant level names. Empty list if ``level`` is the leaf.
+
+        Raises:
+            KeyError: If ``level`` is not found in the hierarchy.
+
+        Examples:
+            >>> packer.get_descendant_levels('country')
+            ['city', 'street']
+            >>> packer.get_descendant_levels('street')
+            []
+        """
+        idx = self.spec.index_of(level)
+        return [m.name for m in self._levels_meta[idx + 1 :]]
+
+    def get_level_keys(
+        self,
+        level: str,
+        *,
+        include_ancestors: bool = False,
+        form: Literal["short", "long"] = "short",
+    ) -> list[str]:
+        """
+        Return the identifying key column names for ``level``.
+
+        Args:
+            level: The level whose keys to retrieve.
+            include_ancestors: If ``True``, also include all ancestor key columns
+                before the level's own keys. Forces ``form="long"`` to avoid
+                ambiguity between same-named keys at different levels.
+            form: Output form for column names.
+                - ``"short"``: unqualified field name only (e.g. ``"id"``).
+                - ``"long"``: fully qualified path (e.g. ``"country.city.id"``).
+                Defaults to ``"short"``.
+
+        Returns:
+            List of key column name strings.
+
+        Raises:
+            KeyError: If ``level`` is not found in the hierarchy.
+
+        Examples:
+            >>> packer.get_level_keys('city')
+            ['id', 'name']
+            >>> packer.get_level_keys('city', form='long')
+            ['country.city.id', 'country.city.name']
+            >>> packer.get_level_keys('city', include_ancestors=True)
+            ['country.code', 'country.city.id', 'country.city.name']
+        """
+        meta = self._levels_meta[self.spec.index_of(level)]
+        if include_ancestors:
+            # Always use long form to avoid ambiguity when ancestor keys are included,
+            # since multiple levels may share the same short key name (e.g. "id").
+            return list(meta.ancestor_keys) + list(meta.id_columns)
+        if form == "long":
+            return list(meta.id_columns)
+        # short form: strip the level prefix from each qualified id column
+        return [col[len(meta.prefix) :] for col in meta.id_columns]
+
+    def get_level_fields(
+        self,
+        level: str,
+        schema_or_frame: SchemaInput,
+        *,
+        form: Literal["short", "long"] = "short",
+    ) -> list[str]:
+        """
+        Return all column/field names that belong to ``level`` in the given schema.
+
+        Works with both flat (fully unpacked) and packed schemas.  In a flat
+        schema every hierarchy column is a top-level column with a dotted prefix;
+        in a packed schema the level's own fields live inside a
+        ``List[Struct]`` or ``Struct`` column.
+
+        Args:
+            level: The level whose fields to extract.
+            schema_or_frame: A ``pl.Schema``, ``pl.DataFrame``, or ``pl.LazyFrame``
+                whose schema is inspected.
+            form: Output form for field names.
+                - ``"short"``: unqualified field name only (e.g. ``"name"``).
+                - ``"long"``: fully qualified dotted path
+                  (e.g. ``"country.city.street.name"``).
+                Defaults to ``"short"``.
+
+        Returns:
+            List of field name strings for the requested level.
+
+        Raises:
+            KeyError: If ``level`` is not found in the hierarchy.
+
+        Examples:
+            >>> # Flat schema
+            >>> packer.get_level_fields('city', flat_df)
+            ['id', 'name', 'population']
+            >>> packer.get_level_fields('city', flat_df, form='long')
+            ['country.city.id', 'country.city.name', 'country.city.population']
+            >>> # Packed schema
+            >>> city_packed = packer.pack(flat_df, 'city')
+            >>> packer.get_level_fields('city', city_packed)
+            ['id', 'name', 'population']
+        """
+        schema = self._extract_schema(schema_or_frame)
+        meta = self._levels_meta[self.spec.index_of(level)]
+
+        # Collect names of immediate child levels to exclude their columns
+        child_level_names = {m.name for m in self._levels_meta[meta.index + 1 :]}
+
+        # ---- Packed case: the level's path is a column in the schema ----
+        if meta.path in schema:
+            dtype = schema[meta.path]
+            # Unwrap List wrapper if present
+            inner = dtype.inner if isinstance(dtype, pl.List) else dtype
+            if isinstance(inner, pl.Struct):
+                fields: list[str] = []
+                for f in inner.fields:
+                    # Exclude sub-hierarchy fields (child level structs/lists)
+                    if f.name in child_level_names:
+                        continue
+                    if form == "long":
+                        fields.append(f"{meta.prefix}{f.name}")
+                    else:
+                        fields.append(f.name)
+                return fields
+
+        # ---- Flat case: level columns are top-level with prefix ----
+        if not meta.prefix:
+            # Root level — should not normally appear without a prefix
+            return []
+
+        result: list[str] = []
+        for col in schema.keys():
+            if not col.startswith(meta.prefix):
+                continue
+            remainder = col[len(meta.prefix) :]
+            # Exclude columns that belong to child levels
+            if any(remainder == n or remainder.startswith(n + self.separator) for n in child_level_names):
+                continue
+            if form == "long":
+                result.append(col)
+            else:
+                result.append(remainder)
+        return result
+
+    def infer_current_level(self, schema_or_frame: SchemaInput) -> str:
+        """
+        Infer which hierarchy level each row currently represents.
+
+        Inspects the schema to determine whether the data is fully flat (rows
+        represent the leaf level) or partially packed (rows represent some
+        intermediate or root level).
+
+        Args:
+            schema_or_frame: A ``pl.Schema``, ``pl.DataFrame``, or ``pl.LazyFrame``
+                to inspect.
+
+        Returns:
+            The name of the level each row currently represents.
+
+        Raises:
+            ValueError: If the schema does not match any recognisable hierarchy
+                state.
+
+        Examples:
+            >>> packer.infer_current_level(flat_df)
+            'apartment'
+            >>> packer.infer_current_level(packer.pack(flat_df, 'city'))
+            'city'
+        """
+        schema = self._extract_schema(schema_or_frame)
+
+        for meta in self._levels_meta:
+            if meta.path not in schema:
+                continue
+            dtype = schema[meta.path]
+            if isinstance(dtype, (pl.List, pl.Struct)):
+                # This level is packed as a nested column → rows are at parent level
+                if meta.index == 0:
+                    return meta.name
+                return self._levels_meta[meta.index - 1].name
+
+        # No packed column found — check whether flat leaf-level columns exist
+        leaf_meta = self._levels_meta[-1]
+        has_leaf_cols = leaf_meta.prefix and any(
+            col.startswith(leaf_meta.prefix) for col in schema.keys()
+        )
+        if has_leaf_cols:
+            return leaf_meta.name
+
+        # Fall back: look for the deepest level whose flat columns are present
+        for meta in reversed(self._levels_meta):
+            if meta.prefix and any(col.startswith(meta.prefix) for col in schema.keys()):
+                return meta.name
+
+        raise ValueError(
+            "Cannot infer current level: the schema does not match any recognisable "
+            f"hierarchy state. Schema columns: {list(schema.keys())}"
+        )
+
+    def get_level_schema(
+        self,
+        level: str,
+        schema_or_frame: SchemaInput,
+    ) -> dict[str, pl.DataType]:
+        """
+        Return a mapping of field name → data type for all fields at ``level``.
+
+        Works with both flat and packed schemas (see :meth:`get_level_fields`).
+
+        Args:
+            level: The level whose field types to retrieve.
+            schema_or_frame: A ``pl.Schema``, ``pl.DataFrame``, or ``pl.LazyFrame``
+                whose schema is inspected.
+
+        Returns:
+            Dictionary mapping short field names to their ``pl.DataType``.
+
+        Raises:
+            KeyError: If ``level`` is not found in the hierarchy.
+
+        Examples:
+            >>> packer.get_level_schema('city', flat_df)
+            {'id': String, 'name': String, 'population': Int64}
+        """
+        schema = self._extract_schema(schema_or_frame)
+        meta = self._levels_meta[self.spec.index_of(level)]
+
+        child_level_names = {m.name for m in self._levels_meta[meta.index + 1 :]}
+
+        # Packed case
+        if meta.path in schema:
+            dtype = schema[meta.path]
+            inner = dtype.inner if isinstance(dtype, pl.List) else dtype
+            if isinstance(inner, pl.Struct):
+                return {
+                    f.name: f.dtype  # type: ignore[misc]
+                    for f in inner.fields
+                    if f.name not in child_level_names
+                }
+
+        # Flat case
+        if not meta.prefix:
+            return {}
+
+        result: dict[str, pl.DataType] = {}
+        for col, dtype in schema.items():
+            if not col.startswith(meta.prefix):
+                continue
+            remainder = col[len(meta.prefix) :]
+            if any(remainder == n or remainder.startswith(n + self.separator) for n in child_level_names):
+                continue
+            result[remainder] = dtype
+        return result
+
+    def describe(self) -> str:
+        """
+        Return a human-readable summary of the hierarchy structure.
+
+        Returns:
+            Multi-line string describing all levels, their paths, keys, and
+            ancestor keys.
+
+        Examples:
+            >>> print(packer.describe())
+            HierarchicalPacker (separator=".")
+              Levels (3):
+                0. country  (root)
+                   Path: "country"
+                   Keys: code
+                1. city
+                   Path: "country.city"
+                   Keys: id, name
+                   Ancestor keys: country.code
+                2. street  (leaf)
+                   Path: "country.city.street"
+                   Keys: name
+                   Ancestor keys: country.code, country.city.id, country.city.name
+        """
+        n = len(self._levels_meta)
+        lines: list[str] = [f'HierarchicalPacker (separator="{self.separator}")']
+        lines.append(f"  Levels ({n}):")
+        for meta in self._levels_meta:
+            tags: list[str] = []
+            if meta.index == 0:
+                tags.append("root")
+            if meta.index == n - 1:
+                tags.append("leaf")
+            tag_str = f"  ({', '.join(tags)})" if tags else ""
+            lines.append(f"    {meta.index}. {meta.name}{tag_str}")
+            lines.append(f'       Path: "{meta.path}"')
+            keys_str = ", ".join(col[len(meta.prefix) :] for col in meta.id_columns) if meta.id_columns else "(none)"
+            lines.append(f"       Keys: {keys_str}")
+            if meta.ancestor_keys:
+                lines.append(f"       Ancestor keys: {', '.join(meta.ancestor_keys)}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Public API

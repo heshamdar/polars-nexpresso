@@ -1190,3 +1190,219 @@ class TestAnyAllChildSatisfies:
             condition=pl.element().struct.field("population") > 5_000_000,
         )
         assert isinstance(result, pl.LazyFrame)
+
+# =============================================================================
+# Usability Helper Tests
+# =============================================================================
+
+
+class TestUsabilityHelpers:
+    """Tests for introspection and navigation helper methods."""
+
+    # ------------------------------------------------------------------
+    # Properties: level_names, root_level, leaf_level
+    # ------------------------------------------------------------------
+
+    def test_level_names(self, packer):
+        assert packer.level_names == ["country", "city", "street", "building", "apartment"]
+
+    def test_root_level(self, packer):
+        assert packer.root_level == "country"
+
+    def test_leaf_level(self, packer):
+        assert packer.leaf_level == "apartment"
+
+    # ------------------------------------------------------------------
+    # get_ancestor_levels / get_descendant_levels
+    # ------------------------------------------------------------------
+
+    def test_get_ancestor_levels_root_returns_empty(self, packer):
+        assert packer.get_ancestor_levels("country") == []
+
+    def test_get_ancestor_levels_middle(self, packer):
+        assert packer.get_ancestor_levels("street") == ["country", "city"]
+
+    def test_get_ancestor_levels_leaf(self, packer):
+        assert packer.get_ancestor_levels("apartment") == [
+            "country",
+            "city",
+            "street",
+            "building",
+        ]
+
+    def test_get_descendant_levels_leaf_returns_empty(self, packer):
+        assert packer.get_descendant_levels("apartment") == []
+
+    def test_get_descendant_levels_middle(self, packer):
+        assert packer.get_descendant_levels("city") == ["street", "building", "apartment"]
+
+    def test_get_descendant_levels_root(self, packer):
+        assert packer.get_descendant_levels("country") == [
+            "city",
+            "street",
+            "building",
+            "apartment",
+        ]
+
+    def test_get_ancestor_levels_unknown_raises(self, packer):
+        with pytest.raises(KeyError, match="unknown"):
+            packer.get_ancestor_levels("unknown")
+
+    # ------------------------------------------------------------------
+    # get_level_keys
+    # ------------------------------------------------------------------
+
+    def test_get_level_keys_short_root(self, packer):
+        assert packer.get_level_keys("country") == ["code"]
+
+    def test_get_level_keys_short_multi_key(self, packer):
+        assert packer.get_level_keys("city") == ["id", "name"]
+
+    def test_get_level_keys_long(self, packer):
+        assert packer.get_level_keys("city", form="long") == [
+            "country.city.id",
+            "country.city.name",
+        ]
+
+    def test_get_level_keys_with_ancestors(self, packer):
+        keys = packer.get_level_keys("city", include_ancestors=True)
+        assert keys == ["country.code", "country.city.id", "country.city.name"]
+
+    def test_get_level_keys_ancestors_always_long_form(self, packer):
+        # include_ancestors=True always forces long form regardless of form argument
+        keys_default = packer.get_level_keys("city", include_ancestors=True)
+        keys_explicit_long = packer.get_level_keys("city", include_ancestors=True, form="long")
+        assert keys_default == keys_explicit_long
+        assert all("." in k for k in keys_default), "ancestor keys should be fully qualified"
+
+    def test_get_level_keys_leaf_with_ancestors(self, packer):
+        keys = packer.get_level_keys("apartment", include_ancestors=True)
+        assert "country.code" in keys
+        assert "country.city.street.building.apartment.id" in keys
+
+    # ------------------------------------------------------------------
+    # get_level_fields — flat schema
+    # ------------------------------------------------------------------
+
+    def test_get_level_fields_flat_short(self, packer, apartment_level_df):
+        fields = packer.get_level_fields("building", apartment_level_df)
+        assert set(fields) == {"number", "id"}
+
+    def test_get_level_fields_flat_long(self, packer, apartment_level_df):
+        fields = packer.get_level_fields("building", apartment_level_df, form="long")
+        assert set(fields) == {
+            "country.city.street.building.number",
+            "country.city.street.building.id",
+        }
+
+    def test_get_level_fields_excludes_child_columns(self, packer, apartment_level_df):
+        # city fields should NOT include street/building/apartment columns
+        fields = packer.get_level_fields("city", apartment_level_df)
+        assert "id" in fields
+        assert "name" in fields
+        assert "street" not in fields
+        # should not include apartment or street sub-fields
+        assert not any("street" in f for f in fields)
+
+    def test_get_level_fields_accepts_schema(self, packer, apartment_level_df):
+        fields_from_df = packer.get_level_fields("city", apartment_level_df)
+        fields_from_schema = packer.get_level_fields("city", apartment_level_df.schema)
+        assert fields_from_df == fields_from_schema
+
+    def test_get_level_fields_accepts_lazyframe(self, packer, apartment_level_df):
+        fields_from_df = packer.get_level_fields("city", apartment_level_df)
+        fields_from_lazy = packer.get_level_fields("city", apartment_level_df.lazy())
+        assert fields_from_df == fields_from_lazy
+
+    # ------------------------------------------------------------------
+    # get_level_fields — packed schema
+    # ------------------------------------------------------------------
+
+    def test_get_level_fields_packed_short(self, packer, apartment_level_df):
+        packed = packer.pack(apartment_level_df, "city")
+        fields = packer.get_level_fields("city", packed)
+        # city struct fields should be id and name (not street sub-struct)
+        assert "id" in fields
+        assert "name" in fields
+        assert "street" not in fields
+
+    def test_get_level_fields_packed_long(self, packer, apartment_level_df):
+        packed = packer.pack(apartment_level_df, "city")
+        fields = packer.get_level_fields("city", packed, form="long")
+        assert "country.city.id" in fields
+        assert "country.city.name" in fields
+        assert not any("street" in f for f in fields)
+
+    # ------------------------------------------------------------------
+    # infer_current_level
+    # ------------------------------------------------------------------
+
+    def test_infer_current_level_flat_is_leaf(self, packer, apartment_level_df):
+        assert packer.infer_current_level(apartment_level_df) == "apartment"
+
+    def test_infer_current_level_packed_to_street(self, packer, apartment_level_df):
+        # pack(df, "street") packs street and below into a List[Struct] column,
+        # so each row represents a city (the level above the first packed column).
+        packed = packer.pack(apartment_level_df, "street")
+        assert packer.infer_current_level(packed) == "city"
+
+    def test_infer_current_level_packed_to_city(self, packer, apartment_level_df):
+        # pack(df, "city") packs city and below, so each row represents a country.
+        packed = packer.pack(apartment_level_df, "city")
+        assert packer.infer_current_level(packed) == "country"
+
+    def test_infer_current_level_packed_to_country(self, packer, apartment_level_df):
+        packed = packer.pack(apartment_level_df, "country")
+        assert packer.infer_current_level(packed) == "country"
+
+    def test_infer_current_level_accepts_schema(self, packer, apartment_level_df):
+        assert packer.infer_current_level(apartment_level_df.schema) == "apartment"
+
+    def test_infer_current_level_accepts_lazyframe(self, packer, apartment_level_df):
+        assert packer.infer_current_level(apartment_level_df.lazy()) == "apartment"
+
+    # ------------------------------------------------------------------
+    # get_level_schema
+    # ------------------------------------------------------------------
+
+    def test_get_level_schema_flat(self, packer, apartment_level_df):
+        level_schema = packer.get_level_schema("building", apartment_level_df)
+        assert "number" in level_schema
+        assert "id" in level_schema
+        assert "apartment" not in level_schema
+
+    def test_get_level_schema_packed(self, packer, apartment_level_df):
+        packed = packer.pack(apartment_level_df, "city")
+        level_schema = packer.get_level_schema("city", packed)
+        assert "id" in level_schema
+        assert "name" in level_schema
+        # child struct should be excluded
+        assert "street" not in level_schema
+
+    def test_get_level_schema_returns_correct_types(self, packer, apartment_level_df):
+        level_schema = packer.get_level_schema("country", apartment_level_df)
+        assert "code" in level_schema
+        assert level_schema["code"] == pl.String
+
+    # ------------------------------------------------------------------
+    # describe
+    # ------------------------------------------------------------------
+
+    def test_describe_contains_level_names(self, packer):
+        desc = packer.describe()
+        for name in packer.level_names:
+            assert name in desc
+
+    def test_describe_contains_root_leaf_tags(self, packer):
+        desc = packer.describe()
+        assert "root" in desc
+        assert "leaf" in desc
+
+    def test_describe_contains_separator(self, packer):
+        desc = packer.describe()
+        assert 'separator="."' in desc
+
+    def test_describe_contains_key_names(self, packer):
+        desc = packer.describe()
+        assert "code" in desc  # country key
+        assert "number" in desc  # building key
