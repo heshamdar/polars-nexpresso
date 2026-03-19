@@ -170,3 +170,79 @@ class TestTranslationWithPrefix:
         df = pl.DataFrame({"x": [1, -1, 0]})
         result = df.filter(flat)
         assert result["x"].to_list() == [1]
+
+
+# ============================================================================
+# _translate_field_to_col tests
+# ============================================================================
+
+
+class TestTranslateFieldToCol:
+    """Test _translate_field_to_col() — pl.field() → pl.col() translation."""
+
+    def test_simple_field_reference(self) -> None:
+        """pl.field("x") → pl.col("x")."""
+        from nexpresso.normalized_packer import _translate_field_to_col
+
+        expr = pl.field("x")
+        translated = _translate_field_to_col(expr)
+
+        df = pl.DataFrame({"x": [1, 2, 3]})
+        result = df.select(translated)
+        assert result["x"].to_list() == [1, 2, 3]
+
+    def test_arithmetic_with_field(self) -> None:
+        """pl.field("a") + pl.field("b") translates correctly."""
+        from nexpresso.normalized_packer import _translate_field_to_col
+
+        expr = pl.field("a") + pl.field("b")
+        translated = _translate_field_to_col(expr)
+
+        df = pl.DataFrame({"a": [1, 2], "b": [10, 20]})
+        result = df.select(translated.alias("sum"))
+        assert result["sum"].to_list() == [11, 22]
+
+    def test_subtraction_with_field(self) -> None:
+        """pl.field("revenue") - pl.field("cost") translates correctly."""
+        from nexpresso.normalized_packer import _translate_field_to_col
+
+        expr = pl.field("revenue") - pl.field("cost")
+        translated = _translate_field_to_col(expr)
+
+        df = pl.DataFrame({"revenue": [100, 200], "cost": [30, 80]})
+        result = df.select(translated.alias("profit"))
+        assert result["profit"].to_list() == [70, 120]
+
+    def test_field_with_literal(self) -> None:
+        """pl.field("x") * 2 translates correctly."""
+        from nexpresso.normalized_packer import _translate_field_to_col
+
+        expr = pl.field("x") * 2
+        translated = _translate_field_to_col(expr)
+
+        df = pl.DataFrame({"x": [5, 10]})
+        result = df.select(translated.alias("doubled"))
+        assert result["doubled"].to_list() == [10, 20]
+
+    def test_comparison_with_field(self) -> None:
+        """pl.field("x") > 5 translates correctly."""
+        from nexpresso.normalized_packer import _translate_field_to_col
+
+        expr = pl.field("x") > 5
+        translated = _translate_field_to_col(expr)
+
+        df = pl.DataFrame({"x": [3, 7, 5, 10]})
+        result = df.filter(translated)
+        assert result["x"].to_list() == [7, 10]
+
+    def test_literal_passes_through(self) -> None:
+        """pl.lit(42) passes through unchanged."""
+        from nexpresso.normalized_packer import _translate_field_to_col
+
+        expr = pl.lit(42)
+        translated = _translate_field_to_col(expr)
+
+        df = pl.DataFrame({"x": [1, 2]})
+        # lit(42) produces a single scalar; use with_columns for broadcast
+        result = df.with_columns(translated.alias("val"))
+        assert result["val"].to_list() == [42, 42]

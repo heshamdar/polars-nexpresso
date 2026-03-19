@@ -720,3 +720,143 @@ class TestEquivalenceWithHierarchicalPacker:
             norm_result.select(shared_cols),
             hier_result.select(shared_cols),
         )
+
+
+# ============================================================================
+# apply() tests
+# ============================================================================
+
+
+class TestApply:
+    """Tests for NormalizedPacker.apply()."""
+
+    @pytest.fixture
+    def packer_with_cost(self, two_level_spec: HierarchySpec) -> NormalizedPacker:
+        """Packer with stores that have revenue and cost columns."""
+        regions = pl.DataFrame({"id": ["r1", "r2"], "name": ["North", "South"]})
+        stores = pl.DataFrame({
+            "id": ["s1", "s2", "s3"],
+            "name": ["A", "B", "C"],
+            "revenue": [100, 200, 150],
+            "cost": [30, 80, 60],
+            "region_id": ["r1", "r1", "r2"],
+        })
+        return NormalizedPacker(
+            two_level_spec, tables={"region": regions, "store": stores}
+        )
+
+    def test_none_preserves_column(self, packer_with_cost: NormalizedPacker) -> None:
+        """FieldValue None keeps the column unchanged."""
+        result = (
+            packer_with_cost.apply({"revenue": None}, at_level="store")
+            .collect()
+            .sort("region.store.id")
+        )
+        assert result["region.store.revenue"].to_list() == [100, 200, 150]
+
+    def test_lambda_transforms_column(
+        self, packer_with_cost: NormalizedPacker
+    ) -> None:
+        """Lambda FieldValue applies transformation."""
+        result = (
+            packer_with_cost.apply(
+                {"revenue": lambda x: x * 2}, at_level="store"
+            )
+            .collect()
+            .sort("region.store.id")
+        )
+        assert result["region.store.revenue"].to_list() == [200, 400, 300]
+
+    def test_pl_field_expression(self, packer_with_cost: NormalizedPacker) -> None:
+        """pl.field() expression computes new column."""
+        result = (
+            packer_with_cost.apply(
+                {"profit": pl.field("revenue") - pl.field("cost")},
+                at_level="store",
+            )
+            .collect()
+            .sort("region.store.id")
+        )
+        assert result["region.store.profit"].to_list() == [70, 120, 90]
+
+    def test_multiple_fields(self, packer_with_cost: NormalizedPacker) -> None:
+        """Multiple field specs applied together."""
+        result = (
+            packer_with_cost.apply(
+                {
+                    "revenue": lambda x: x * 2,
+                    "profit": pl.field("revenue") - pl.field("cost"),
+                },
+                at_level="store",
+            )
+            .collect()
+            .sort("region.store.id")
+        )
+        assert result["region.store.revenue"].to_list() == [200, 400, 300]
+        assert result["region.store.profit"].to_list() == [70, 120, 90]
+
+    def test_struct_mode_with_fields(
+        self, packer_with_cost: NormalizedPacker
+    ) -> None:
+        """with_fields mode preserves unmentioned columns."""
+        result = (
+            packer_with_cost.apply(
+                {"revenue": lambda x: x * 2},
+                at_level="store",
+                struct_mode="with_fields",
+            )
+            .collect()
+            .sort("region.store.id")
+        )
+        assert "region.store.cost" in result.columns
+        assert result["region.store.revenue"].to_list() == [200, 400, 300]
+
+    def test_struct_mode_select(self, packer_with_cost: NormalizedPacker) -> None:
+        """select mode only keeps specified columns at root level."""
+        # select mode at root level avoids FK join issues
+        result = (
+            packer_with_cost.apply(
+                {"name": lambda x: x.str.to_uppercase()},
+                at_level="region",
+                struct_mode="select",
+            )
+            .collect()
+            .sort("region.name")
+        )
+        region_cols = [c for c in result.columns if c.startswith("region.")]
+        assert region_cols == ["region.name"]
+        assert result["region.name"].to_list() == ["NORTH", "SOUTH"]
+
+    def test_dict_field_raises(self, packer_with_cost: NormalizedPacker) -> None:
+        """Nested dict specs raise TypeError on flat tables."""
+        with pytest.raises(TypeError, match="Nested dict specs"):
+            packer_with_cost.apply(
+                {"revenue": {"sub": None}}, at_level="store"
+            )
+
+    def test_apply_at_root_level(self, packer_with_cost: NormalizedPacker) -> None:
+        """Apply works at the root level too."""
+        result = (
+            packer_with_cost.apply(
+                {"name": lambda x: x.str.to_uppercase()}, at_level="region"
+            )
+            .collect()
+            .sort("region.id")
+        )
+        assert result["region.name"].to_list() == ["NORTH", "SOUTH"]
+
+    def test_apply_does_not_mutate_tables(
+        self, packer_with_cost: NormalizedPacker
+    ) -> None:
+        """apply() should not permanently modify the internal tables."""
+        packer_with_cost.apply(
+            {"revenue": lambda x: x * 100}, at_level="store"
+        )
+        result = (
+            packer_with_cost.apply(
+                {"revenue": None}, at_level="store"
+            )
+            .collect()
+            .sort("region.store.id")
+        )
+        assert result["region.store.revenue"].to_list() == [100, 200, 150]

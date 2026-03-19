@@ -45,6 +45,7 @@ from typing import Any, Literal
 
 import polars as pl
 
+from nexpresso.expressions import FieldValue, StructMode
 from nexpresso.hierarchical_packer import (
     ColumnSelector,
     HierarchicalPacker,
@@ -124,6 +125,108 @@ def _walk_expr_tree(node: Any, prefix: str) -> Any:
     elif isinstance(node, list):
         return [_walk_expr_tree(item, prefix) for item in node]
     return node
+
+
+# ============================================================================
+# Expression translation (pl.field → pl.col)
+# ============================================================================
+
+
+def _translate_field_to_col(expr: pl.Expr) -> pl.Expr:
+    """Translate ``pl.field("x")`` references to ``pl.col("x")``.
+
+    This enables expressions written for struct contexts (using
+    ``pl.field()`` to reference sibling fields) to work on flat tables
+    where the same fields are regular columns.
+
+    Args:
+        expr: A Polars expression potentially containing ``pl.field()`` refs.
+
+    Returns:
+        A new ``pl.Expr`` with ``Field`` nodes replaced by ``Column`` nodes.
+    """
+    raw = expr.meta.serialize(format="json")
+    tree = json.loads(raw)
+    transformed = _walk_field_to_col(tree)
+    return pl.Expr.deserialize(json.dumps(transformed).encode(), format="json")
+
+
+def _walk_field_to_col(node: Any) -> Any:
+    """Recursively replace ``{"Field": ["name"]}`` with ``{"Column": "name"}``."""
+    if isinstance(node, dict):
+        if "Field" in node:
+            field_val = node["Field"]
+            if isinstance(field_val, list) and len(field_val) == 1:
+                return {"Column": field_val[0]}
+        return {k: _walk_field_to_col(v) for k, v in node.items()}
+    elif isinstance(node, list):
+        return [_walk_field_to_col(item) for item in node]
+    return node
+
+
+def _apply_fields_flat(
+    table: pl.LazyFrame,
+    fields: dict[str, FieldValue],
+    struct_mode: StructMode = "with_fields",
+) -> pl.LazyFrame:
+    """Apply a ``FieldValue`` dict spec to a flat table.
+
+    Translates the dict-based field specification (designed for nested
+    struct navigation) into simple column operations on a flat table.
+
+    Args:
+        table: A flat ``LazyFrame`` with unqualified column names.
+        fields: Dict mapping column names to operations (same ``FieldValue``
+            format as :func:`~nexpresso.expressions.generate_nested_exprs`).
+        struct_mode: ``"with_fields"`` preserves unmentioned columns;
+            ``"select"`` keeps only specified columns.
+
+    Returns:
+        Modified ``LazyFrame``.
+
+    Raises:
+        TypeError: If a ``FieldValue`` is a nested dict (not supported on
+            flat tables).
+    """
+    schema = table.collect_schema()
+    exprs: list[pl.Expr] = []
+
+    for col_name, field_spec in fields.items():
+        if col_name not in schema and not isinstance(field_spec, pl.Expr):
+            raise ValueError(
+                f"Column '{col_name}' not found in table. "
+                f"Available columns: {list(schema.keys())}"
+            )
+
+        if field_spec is None:
+            # Keep column as-is
+            exprs.append(pl.col(col_name))
+        elif isinstance(field_spec, dict):
+            raise TypeError(
+                f"Nested dict specs are not supported on flat tables. "
+                f"Column '{col_name}' has a dict value, but the normalized "
+                f"backend operates on flat tables without nested structs."
+            )
+        elif callable(field_spec) and not isinstance(field_spec, pl.Expr):
+            # Lambda/function: apply to the column expression
+            result_expr: pl.Expr = field_spec(pl.col(col_name))
+            exprs.append(result_expr.alias(col_name))
+        elif isinstance(field_spec, pl.Expr):
+            # Polars expression — translate pl.field() to pl.col()
+            translated = _translate_field_to_col(field_spec)
+            # Always alias with the dict key so the column gets the right name
+            exprs.append(translated.alias(col_name))
+        else:
+            raise TypeError(
+                f"Unsupported FieldValue type for column '{col_name}': "
+                f"{type(field_spec)}"
+            )
+
+    if struct_mode == "with_fields":
+        return table.with_columns(exprs)
+    else:
+        # "select" mode: only keep specified columns
+        return table.select(exprs)
 
 
 # ============================================================================
@@ -738,6 +841,72 @@ class NormalizedPacker:
         )
 
     # ------------------------------------------------------------------
+    # apply()
+    # ------------------------------------------------------------------
+
+    def apply(
+        self,
+        fields: dict[str, FieldValue],
+        *,
+        at_level: str,
+        struct_mode: StructMode = "with_fields",
+    ) -> pl.LazyFrame:
+        """Apply field transformations at a specific hierarchy level.
+
+        Uses the same dict-based ``FieldValue`` syntax as
+        :func:`~nexpresso.expressions.generate_nested_exprs`:
+
+        - ``None``: keep the field as-is
+        - ``Callable[[pl.Expr], pl.Expr]``: e.g. ``lambda x: x * 2``
+        - ``pl.Expr``: computed expression (use ``pl.field()`` for
+          cross-field references)
+
+        The method applies transformations to the target level's table,
+        then joins with ancestor tables to produce a flat result at
+        *at_level* granularity with fully qualified column names.
+
+        Args:
+            fields: Field specification dict.
+            at_level: The hierarchy level to operate at.
+            struct_mode: ``"with_fields"`` (default) preserves unmentioned
+                columns; ``"select"`` keeps only specified columns.
+
+        Returns:
+            ``pl.LazyFrame`` at *at_level* granularity with qualified
+            column names and transformations applied.
+
+        Raises:
+            KeyError: If *at_level* is not a valid level.
+            ValueError: If a referenced column does not exist.
+            TypeError: If a ``FieldValue`` is a nested dict.
+
+        Examples:
+            >>> result = npacker.apply(
+            ...     {"revenue": lambda x: x * 1.1},
+            ...     at_level="store",
+            ... )
+            >>> result = npacker.apply(
+            ...     {"profit": pl.field("revenue") - pl.field("cost")},
+            ...     at_level="store",
+            ... )
+        """
+        target_idx = self.spec.index_of(at_level)
+        table = self._tables[at_level]
+
+        # Apply field transformations to the flat table
+        modified_table = _apply_fields_flat(table, fields, struct_mode)
+
+        # Temporarily swap the table, join to level, then restore
+        original_table = self._tables[at_level]
+        self._tables[at_level] = modified_table
+        try:
+            result = self._join_to_level(target_idx)
+        finally:
+            self._tables[at_level] = original_table
+
+        return result
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -890,4 +1059,6 @@ class NormalizedPacker:
 __all__ = [
     "NormalizedPacker",
     "_translate_nested_to_flat",
+    "_translate_field_to_col",
+    "_apply_fields_flat",
 ]

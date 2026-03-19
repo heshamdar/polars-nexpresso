@@ -17,10 +17,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 import polars as pl
 from polars.expr.expr import Expr
+
+if TYPE_CHECKING:
+    from nexpresso.expressions import FieldValue, StructMode
 
 FrameT = TypeVar("FrameT", pl.LazyFrame, pl.DataFrame)
 
@@ -1800,6 +1803,119 @@ class HierarchicalPacker:
             exprs.append(expr.alias(col_name))
         lf = self._to_lazy(frame).with_columns(exprs)
         return self._match_frame_type(lf, frame)
+
+    def apply(
+        self,
+        frame: FrameT,
+        fields: dict[str, FieldValue],
+        *,
+        at_level: str,
+        struct_mode: StructMode = "with_fields",
+    ) -> FrameT:
+        """Apply field transformations at a specific hierarchy level.
+
+        Uses the same dict-based ``FieldValue`` syntax as
+        :func:`~nexpresso.expressions.generate_nested_exprs` to modify
+        fields within a packed hierarchy.  The hierarchy structure is
+        preserved — the result is still a packed frame that can be used
+        with other hierarchy operations.
+
+        The frame should be packed at or above *at_level* so that the
+        target level's data is accessible as a nested ``List[Struct]``
+        column (or as top-level columns if *at_level* is the root).
+
+        Args:
+            frame: Packed frame containing nested data.
+            fields: Field specification dict mapping unqualified field
+                names to operations:
+
+                - ``None``: keep field as-is
+                - ``Callable[[pl.Expr], pl.Expr]``: e.g. ``lambda x: x * 2``
+                - ``pl.Expr``: computed expression (use ``pl.field()``
+                  for cross-field references within the struct)
+            at_level: The hierarchy level to operate at.
+            struct_mode: ``"with_fields"`` (default) preserves unmentioned
+                fields; ``"select"`` keeps only specified fields.
+
+        Returns:
+            Packed frame with modifications applied at the target level,
+            preserving input type (DataFrame / LazyFrame).
+
+        Raises:
+            KeyError: If *at_level* is not a valid level.
+
+        Examples:
+            >>> packed = packer.build_from_tables(tables)
+            >>> modified = packer.apply(
+            ...     packed,
+            ...     {"revenue": lambda x: x * 1.1},
+            ...     at_level="store",
+            ... )
+            >>> # Hierarchy preserved — can still unpack, promote, etc.
+            >>> unpacked = packer.unpack(modified, "store")
+        """
+        from nexpresso.expressions import generate_nested_exprs
+
+        target_idx = self.spec.index_of(at_level)
+        lf = self._to_lazy(frame)
+        schema = lf.collect_schema()
+
+        # Build the nested field spec path from the frame's top-level columns
+        # down to the target level.  The packed frame may have:
+        #   - A single "region" struct containing everything (packed to root)
+        #   - "region.id", "region.name", "region.store" (packed to store level)
+        # We need to find which top-level column contains the target level and
+        # construct the appropriate nested dict spec.
+        wrapped_fields = self._wrap_fields_for_level(
+            fields, target_idx, schema
+        )
+
+        exprs = generate_nested_exprs(
+            wrapped_fields, schema, struct_mode=struct_mode
+        )
+        lf = lf.with_columns(exprs)
+
+        return self._match_frame_type(lf, frame)
+
+    def _wrap_fields_for_level(
+        self,
+        fields: dict[str, FieldValue],
+        target_idx: int,
+        schema: pl.Schema,
+    ) -> dict[str, FieldValue]:
+        """Wrap user field specs into the nested dict path for generate_nested_exprs.
+
+        Given user fields like ``{"revenue": lambda x: x * 1.1}`` at the
+        store level, builds the appropriate nested dict to navigate from the
+        frame's top-level columns to the target level's struct.
+        """
+        target_meta = self._levels_meta[target_idx]
+
+        # Case 1: target level's path is a direct column (e.g., "region.store")
+        if target_meta.path in schema:
+            return {target_meta.path: fields}
+
+        # Case 2: target level is nested inside a parent struct
+        # Walk up from the target to find the first level whose path is
+        # a top-level column, then nest downward.
+        result: dict[str, FieldValue] = fields
+        for idx in range(target_idx, -1, -1):
+            meta = self._levels_meta[idx]
+            if meta.path in schema:
+                # Found the top-level column; wrap with the remaining levels
+                # below it down to target
+                for inner_idx in range(idx + 1, target_idx + 1):
+                    inner_meta = self._levels_meta[inner_idx]
+                    result = {inner_meta.name: result}
+                return {meta.path: result}
+
+        # Case 3: target is the root level and columns are flat
+        # (e.g., "region.id", "region.name" when frame is unpacked)
+        qualified_fields: dict[str, FieldValue] = {}
+        for field_name, field_spec in fields.items():
+            qualified_name = f"{target_meta.prefix}{field_name}"
+            qualified_fields[qualified_name] = field_spec
+        return qualified_fields
 
     def any_child_satisfies(
         self,

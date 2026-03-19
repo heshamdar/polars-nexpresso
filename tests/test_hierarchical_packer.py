@@ -1709,3 +1709,114 @@ class TestValidateSchema:
             "missing" in e.lower() and "key" in e.lower()
             for e in result.errors
         )
+
+
+# ============================================================================
+# apply() tests
+# ============================================================================
+
+
+class TestApply:
+    """Tests for HierarchicalPacker.apply()."""
+
+    @pytest.fixture
+    def simple_spec(self) -> HierarchySpec:
+        return HierarchySpec.from_levels(
+            LevelSpec(name="region", id_fields=["id"]),
+            LevelSpec(name="store", id_fields=["id"], parent_keys=["region_id"]),
+        )
+
+    @pytest.fixture
+    def simple_packer(self, simple_spec: HierarchySpec) -> HierarchicalPacker:
+        return HierarchicalPacker(simple_spec)
+
+    @pytest.fixture
+    def packed_frame(self, simple_packer: HierarchicalPacker) -> pl.DataFrame:
+        regions = pl.DataFrame({"id": ["r1", "r2"], "name": ["North", "South"]})
+        stores = pl.DataFrame({
+            "id": ["s1", "s2", "s3"],
+            "name": ["A", "B", "C"],
+            "revenue": [100, 200, 150],
+            "cost": [30, 80, 60],
+            "region_id": ["r1", "r1", "r2"],
+        })
+        return simple_packer.build_from_tables(
+            {"region": regions, "store": stores}
+        )
+
+    def test_lambda_at_leaf(
+        self, simple_packer: HierarchicalPacker, packed_frame: pl.DataFrame
+    ) -> None:
+        """Lambda FieldValue transforms leaf-level data."""
+        modified = simple_packer.apply(
+            packed_frame,
+            {"revenue": lambda x: x * 2},
+            at_level="store",
+        )
+        unpacked = simple_packer.unpack(modified, "store")
+        result = unpacked.sort("region.store.id")
+        assert result["region.store.revenue"].to_list() == [200, 400, 300]
+
+    def test_lambda_at_root(
+        self, simple_packer: HierarchicalPacker, packed_frame: pl.DataFrame
+    ) -> None:
+        """Lambda FieldValue transforms root-level data."""
+        modified = simple_packer.apply(
+            packed_frame,
+            {"name": lambda x: x.str.to_uppercase()},
+            at_level="region",
+        )
+        unpacked = simple_packer.unpack(modified, "region")
+        result = unpacked.sort("region.id")
+        assert result["region.name"].to_list() == ["NORTH", "SOUTH"]
+
+    def test_preserves_hierarchy(
+        self, simple_packer: HierarchicalPacker, packed_frame: pl.DataFrame
+    ) -> None:
+        """apply() preserves the packed hierarchy structure."""
+        modified = simple_packer.apply(
+            packed_frame,
+            {"revenue": lambda x: x * 10},
+            at_level="store",
+        )
+        # Should still be packable/unpackable
+        unpacked = simple_packer.unpack(modified, "store")
+        assert unpacked.height == 3
+
+    def test_preserves_frame_type_dataframe(
+        self, simple_packer: HierarchicalPacker, packed_frame: pl.DataFrame
+    ) -> None:
+        """DataFrame in → DataFrame out."""
+        result = simple_packer.apply(
+            packed_frame,
+            {"revenue": lambda x: x * 2},
+            at_level="store",
+        )
+        assert isinstance(result, pl.DataFrame)
+
+    def test_preserves_frame_type_lazyframe(
+        self, simple_packer: HierarchicalPacker, packed_frame: pl.DataFrame
+    ) -> None:
+        """LazyFrame in → LazyFrame out."""
+        result = simple_packer.apply(
+            packed_frame.lazy(),
+            {"revenue": lambda x: x * 2},
+            at_level="store",
+        )
+        assert isinstance(result, pl.LazyFrame)
+
+    def test_none_field_value(
+        self, simple_packer: HierarchicalPacker, packed_frame: pl.DataFrame
+    ) -> None:
+        """None FieldValue keeps the column unchanged."""
+        modified = simple_packer.apply(
+            packed_frame,
+            {"revenue": None},
+            at_level="store",
+        )
+        unpacked = simple_packer.unpack(modified, "store").sort("region.store.id")
+        original = simple_packer.unpack(packed_frame, "store").sort("region.store.id")
+        assert (
+            unpacked["region.store.revenue"].to_list()
+            == original["region.store.revenue"].to_list()
+        )

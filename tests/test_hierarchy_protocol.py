@@ -401,3 +401,121 @@ class TestExpressionEquivalence:
         )["items"].to_list()[0]
 
         assert flat_vals == nested_vals
+
+
+# ============================================================================
+# apply() equivalence
+# ============================================================================
+
+
+class TestApplyEquivalence:
+    """Verify that apply() produces equivalent results from both backends."""
+
+    @pytest.fixture
+    def spec_with_cost(self) -> HierarchySpec:
+        return HierarchySpec.from_levels(
+            LevelSpec(name="region", id_fields=["id"]),
+            LevelSpec(name="store", id_fields=["id"], parent_keys=["region_id"]),
+        )
+
+    @pytest.fixture
+    def nested_with_cost(self, spec_with_cost: HierarchySpec) -> NestedBackend:
+        packer = HierarchicalPacker(spec_with_cost)
+        regions = pl.DataFrame({"id": ["r1", "r2"], "name": ["North", "South"]})
+        stores = pl.DataFrame({
+            "id": ["s1", "s2", "s3"],
+            "name": ["A", "B", "C"],
+            "revenue": [100, 200, 150],
+            "cost": [30, 80, 60],
+            "region_id": ["r1", "r1", "r2"],
+        })
+        packed = packer.build_from_tables(
+            {"region": regions, "store": stores}
+        )
+        return NestedBackend(packer, packed)
+
+    @pytest.fixture
+    def normalized_with_cost(self, spec_with_cost: HierarchySpec) -> NormalizedPacker:
+        regions = pl.DataFrame({"id": ["r1", "r2"], "name": ["North", "South"]})
+        stores = pl.DataFrame({
+            "id": ["s1", "s2", "s3"],
+            "name": ["A", "B", "C"],
+            "revenue": [100, 200, 150],
+            "cost": [30, 80, 60],
+            "region_id": ["r1", "r1", "r2"],
+        })
+        return NormalizedPacker(
+            spec_with_cost, tables={"region": regions, "store": stores}
+        )
+
+    def test_lambda_equivalence(
+        self,
+        nested_with_cost: NestedBackend,
+        normalized_with_cost: NormalizedPacker,
+    ) -> None:
+        """Lambda transformation produces same results on both backends."""
+        fields = {"revenue": lambda x: x * 2}
+
+        nested_result = (
+            nested_with_cost.apply(fields, at_level="store")
+            .collect()
+            .sort("region.store.id")
+        )
+        norm_result = (
+            normalized_with_cost.apply(fields, at_level="store")
+            .collect()
+            .sort("region.store.id")
+        )
+
+        assert (
+            nested_result["region.store.revenue"].to_list()
+            == norm_result["region.store.revenue"].to_list()
+        )
+
+    def test_pl_field_expr_equivalence(
+        self,
+        nested_with_cost: NestedBackend,
+        normalized_with_cost: NormalizedPacker,
+    ) -> None:
+        """pl.field() expression produces same results on both backends."""
+        fields = {"profit": pl.field("revenue") - pl.field("cost")}
+
+        nested_result = (
+            nested_with_cost.apply(fields, at_level="store")
+            .collect()
+            .sort("region.store.id")
+        )
+        norm_result = (
+            normalized_with_cost.apply(fields, at_level="store")
+            .collect()
+            .sort("region.store.id")
+        )
+
+        assert (
+            nested_result["region.store.profit"].to_list()
+            == norm_result["region.store.profit"].to_list()
+        )
+
+    def test_root_level_equivalence(
+        self,
+        nested_with_cost: NestedBackend,
+        normalized_with_cost: NormalizedPacker,
+    ) -> None:
+        """apply() at root level produces same results on both backends."""
+        fields = {"name": lambda x: x.str.to_uppercase()}
+
+        nested_result = (
+            nested_with_cost.apply(fields, at_level="region")
+            .collect()
+            .sort("region.id")
+        )
+        norm_result = (
+            normalized_with_cost.apply(fields, at_level="region")
+            .collect()
+            .sort("region.id")
+        )
+
+        assert (
+            nested_result["region.name"].to_list()
+            == norm_result["region.name"].to_list()
+        )

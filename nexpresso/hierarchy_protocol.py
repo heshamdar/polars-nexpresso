@@ -32,7 +32,7 @@ Typical usage::
 
 from __future__ import annotations
 
-from typing import Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import polars as pl
 
@@ -42,6 +42,9 @@ from nexpresso.hierarchical_packer import (
     LevelAttribute,
     PromoteAggregation,
 )
+
+if TYPE_CHECKING:
+    from nexpresso.expressions import FieldValue, StructMode
 
 # ============================================================================
 # Protocol
@@ -152,6 +155,21 @@ class HierarchyOperator(Protocol):
         at_level: str,
     ) -> pl.LazyFrame:
         """Add cross-level attribute columns at *at_level* granularity."""
+        ...
+
+    def apply(
+        self,
+        fields: dict[str, FieldValue],
+        *,
+        at_level: str,
+        struct_mode: StructMode = "with_fields",
+    ) -> pl.LazyFrame:
+        """Apply field transformations at a specific hierarchy level.
+
+        Uses the same dict-based ``FieldValue`` syntax as
+        ``generate_nested_exprs``.  Both backends accept the same spec
+        and produce equivalent results.
+        """
         ...
 
     def describe(self) -> str:
@@ -313,6 +331,21 @@ class NestedBackend:
             raise ValueError(f"No child level below '{at_level}' to enrich from.")
         frame_at_child = self._frame_at_level(child_level.name)
         result = self._packer.enrich(frame_at_child, *specs, at_level=at_level)
+        return self._packer._to_lazy(result)
+
+    def apply(
+        self,
+        fields: dict[str, FieldValue],
+        *,
+        at_level: str,
+        struct_mode: StructMode = "with_fields",
+    ) -> pl.LazyFrame:
+        # Convert to LazyFrame first to avoid FrameT variance issues
+        lf = self._packer._to_lazy(self._frame)
+        modified = self._packer.apply(
+            lf, fields, at_level=at_level, struct_mode=struct_mode
+        )
+        result = self._packer.unpack(modified, at_level)
         return self._packer._to_lazy(result)
 
     def describe(self) -> str:
