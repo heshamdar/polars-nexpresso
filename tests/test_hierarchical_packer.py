@@ -398,6 +398,33 @@ class TestFrameTypePreservation:
         result = packer.unpack(packed, "apartment")
         assert isinstance(result, pl.LazyFrame)
 
+    def test_pack_after_unpack_stays_lazy(
+        self, packer: HierarchicalPacker, apartment_level_df: pl.DataFrame
+    ) -> None:
+        """pack() chained after unpack() on a LazyFrame must not trigger eager evaluation."""
+        # Build a lazy plan: scan → unpack to apartment → re-pack to building.
+        # Neither step should execute the plan (no .collect()).
+        unpacked = packer.unpack(apartment_level_df.lazy(), "apartment")
+        repacked = packer.pack(unpacked, "building")
+        # Result must still be a LazyFrame — if validation ran eagerly this would hang/OOM.
+        assert isinstance(repacked, pl.LazyFrame)
+        # Confirm the result is correct when eventually collected.
+        collected = repacked.collect()
+        expected = packer.pack(apartment_level_df, "building")
+        # Sort by the ancestor key columns that are still flat at building level
+        sort_cols = ["country.code", "country.city.street.name"]
+        assert_frame_equal(collected.sort(sort_cols), expected.sort(sort_cols))
+
+    def test_pack_lazyframe_validate_on_pack_ignored(
+        self, apartment_level_df: pl.DataFrame
+    ) -> None:
+        """validate_on_pack=True must not force eager collection when input is LazyFrame."""
+        packer = HierarchicalPacker(TEST_HIERARCHY, validate_on_pack=True)
+        unpacked = packer.unpack(apartment_level_df.lazy(), "apartment")
+        # This should not hang even with validate_on_pack=True
+        repacked = packer.pack(unpacked, "street")
+        assert isinstance(repacked, pl.LazyFrame)
+
 
 # =============================================================================
 # New Tests: Empty DataFrames
