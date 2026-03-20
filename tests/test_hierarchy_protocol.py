@@ -519,3 +519,59 @@ class TestApplyEquivalence:
             nested_result["region.name"].to_list()
             == norm_result["region.name"].to_list()
         )
+
+    def test_nested_dict_equivalence(
+        self,
+        nested_with_cost: NestedBackend,
+        normalized_with_cost: NormalizedPacker,
+    ) -> None:
+        """Nested dict spec produces same results on both backends."""
+        fields: dict[str, object] = {
+            "store": {"revenue": lambda x: x * 2},
+        }
+
+        nested_result = (
+            nested_with_cost.apply(fields, at_level="region")
+            .collect()
+            .sort("region.store.id")
+        )
+        norm_result = (
+            normalized_with_cost.apply(fields, at_level="region")
+            .collect()
+            .sort("region.store.id")
+        )
+
+        assert (
+            nested_result["region.store.revenue"].to_list()
+            == norm_result["region.store.revenue"].to_list()
+        )
+
+    def test_mixed_levels_equivalence(
+        self,
+        nested_with_cost: NestedBackend,
+        normalized_with_cost: NormalizedPacker,
+    ) -> None:
+        """Mixed parent + child field spec matches across backends."""
+        fields: dict[str, object] = {
+            "name": lambda x: x.str.to_uppercase(),
+            "store": {"revenue": lambda x: x * 3},
+        }
+
+        nested_result = (
+            nested_with_cost.apply(fields, at_level="region")
+            .collect()
+            .sort("region.store.id")
+        )
+        norm_result = (
+            normalized_with_cost.apply(fields, at_level="region")
+            .collect()
+            .sort("region.store.id")
+        )
+
+        assert sorted(nested_result["region.name"].unique().to_list()) == sorted(
+            norm_result["region.name"].unique().to_list()
+        )
+        assert (
+            nested_result["region.store.revenue"].to_list()
+            == norm_result["region.store.revenue"].to_list()
+        )

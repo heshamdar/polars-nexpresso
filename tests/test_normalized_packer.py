@@ -827,9 +827,11 @@ class TestApply:
         assert region_cols == ["region.name"]
         assert result["region.name"].to_list() == ["NORTH", "SOUTH"]
 
-    def test_dict_field_raises(self, packer_with_cost: NormalizedPacker) -> None:
-        """Nested dict specs raise TypeError on flat tables."""
-        with pytest.raises(TypeError, match="Nested dict specs"):
+    def test_dict_field_non_level_raises(
+        self, packer_with_cost: NormalizedPacker
+    ) -> None:
+        """Nested dict for a key that isn't a level name raises TypeError."""
+        with pytest.raises(TypeError, match="not a descendant level"):
             packer_with_cost.apply(
                 {"revenue": {"sub": None}}, at_level="store"
             )
@@ -851,6 +853,97 @@ class TestApply:
         """apply() should not permanently modify the internal tables."""
         packer_with_cost.apply(
             {"revenue": lambda x: x * 100}, at_level="store"
+        )
+        result = (
+            packer_with_cost.apply(
+                {"revenue": None}, at_level="store"
+            )
+            .collect()
+            .sort("region.store.id")
+        )
+        assert result["region.store.revenue"].to_list() == [100, 200, 150]
+
+    def test_nested_dict_routes_to_child_level(
+        self, packer_with_cost: NormalizedPacker
+    ) -> None:
+        """Nested dict navigates to child level's table."""
+        result = (
+            packer_with_cost.apply(
+                {"store": {"revenue": lambda x: x * 2}},
+                at_level="region",
+            )
+            .collect()
+            .sort("region.store.id")
+        )
+        assert result["region.store.revenue"].to_list() == [200, 400, 300]
+
+    def test_nested_dict_mixed_levels(
+        self, packer_with_cost: NormalizedPacker
+    ) -> None:
+        """Mixed spec modifies both parent and child levels."""
+        result = (
+            packer_with_cost.apply(
+                {
+                    "name": lambda x: x.str.to_uppercase(),
+                    "store": {"revenue": lambda x: x * 3},
+                },
+                at_level="region",
+            )
+            .collect()
+            .sort("region.store.id")
+        )
+        assert sorted(result["region.name"].unique().to_list()) == [
+            "NORTH",
+            "SOUTH",
+        ]
+        assert result["region.store.revenue"].to_list() == [300, 600, 450]
+
+    def test_deeply_nested_dict_three_levels(
+        self, three_level_spec: HierarchySpec
+    ) -> None:
+        """Nested dicts traverse multiple levels."""
+        regions = pl.DataFrame({"id": ["r1"], "name": ["North"]})
+        stores = pl.DataFrame({
+            "id": ["s1"],
+            "name": ["A"],
+            "revenue": [100],
+            "region_id": ["r1"],
+        })
+        products = pl.DataFrame({
+            "id": ["p1", "p2"],
+            "name": ["Widget", "Gadget"],
+            "price": [10.0, 20.0],
+            "store_id": ["s1", "s1"],
+        })
+        npacker = NormalizedPacker(
+            three_level_spec,
+            tables={"region": regions, "store": stores, "product": products},
+        )
+        result = (
+            npacker.apply(
+                {"store": {"product": {"price": lambda x: x * 2}}},
+                at_level="region",
+            )
+            .collect()
+            .sort("region.store.product.id")
+        )
+        assert result["region.store.product.price"].to_list() == [20.0, 40.0]
+
+    def test_nested_dict_unknown_level_raises(
+        self, packer_with_cost: NormalizedPacker
+    ) -> None:
+        """Dict key that is not a descendant level raises TypeError."""
+        with pytest.raises(TypeError, match="not a descendant level"):
+            packer_with_cost.apply(
+                {"bogus": {"revenue": None}}, at_level="region"
+            )
+
+    def test_nested_dict_does_not_mutate_tables(
+        self, packer_with_cost: NormalizedPacker
+    ) -> None:
+        """Nested dict apply does not permanently modify internal tables."""
+        packer_with_cost.apply(
+            {"store": {"revenue": lambda x: x * 100}}, at_level="region"
         )
         result = (
             packer_with_cost.apply(

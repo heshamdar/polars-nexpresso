@@ -164,6 +164,71 @@ def _walk_field_to_col(node: Any) -> Any:
     return node
 
 
+def _resolve_fields_per_level(
+    fields: dict[str, FieldValue],
+    at_level: str,
+    spec: HierarchySpec,
+) -> dict[str, dict[str, FieldValue]]:
+    """Walk a nested ``FieldValue`` dict and split it by target level.
+
+    Dict keys that match a descendant level name are treated as level
+    navigation — the inner spec is routed to that level's table.  All other
+    keys are treated as field names belonging to *at_level*.
+
+    This is the normalized-backend counterpart of the hierarchical backend's
+    ``list.eval()`` / ``struct.field()`` navigation: nesting in the dict
+    corresponds to joins across tables rather than struct traversal.
+
+    Args:
+        fields: Nested ``FieldValue`` dict, potentially containing child
+            level names as keys.
+        at_level: The hierarchy level the outermost keys belong to.
+        spec: The hierarchy specification (used to identify level names).
+
+    Returns:
+        Mapping of ``{level_name: flat_field_specs}`` where each value is a
+        flat dict suitable for :func:`_apply_fields_flat`.
+
+    Raises:
+        TypeError: If a dict value's key is not a recognised descendant
+            level name.
+
+    Examples:
+        >>> _resolve_fields_per_level(
+        ...     {"name": lambda x: x.str.upper(), "store": {"revenue": lambda x: x * 2}},
+        ...     at_level="region",
+        ...     spec=spec,
+        ... )
+        {"region": {"name": <lambda>}, "store": {"revenue": <lambda>}}
+    """
+    result: dict[str, dict[str, FieldValue]] = {}
+    at_idx = spec.index_of(at_level)
+
+    # Descendant level names (levels below at_level in the hierarchy)
+    descendant_names = {
+        spec.levels[i].name for i in range(at_idx + 1, len(spec.levels))
+    }
+
+    for key, value in fields.items():
+        if isinstance(value, dict) and key in descendant_names:
+            # Key is a child level — recurse to split its inner spec
+            child_resolved = _resolve_fields_per_level(value, at_level=key, spec=spec)
+            for lvl_name, lvl_fields in child_resolved.items():
+                result.setdefault(lvl_name, {}).update(lvl_fields)
+        elif isinstance(value, dict):
+            raise TypeError(
+                f"Nested dict for key '{key}' at level '{at_level}': "
+                f"'{key}' is not a descendant level. "
+                f"Descendant levels: {sorted(descendant_names)}. "
+                f"Flat tables don't support nested struct operations."
+            )
+        else:
+            # Leaf spec (None, lambda, pl.Expr) — belongs to at_level
+            result.setdefault(at_level, {})[key] = value
+
+    return result
+
+
 def _apply_fields_flat(
     table: pl.LazyFrame,
     fields: dict[str, FieldValue],
@@ -202,10 +267,12 @@ def _apply_fields_flat(
             # Keep column as-is
             exprs.append(pl.col(col_name))
         elif isinstance(field_spec, dict):
+            # Nested dicts should be resolved by _resolve_fields_per_level()
+            # before reaching here.  If we get one, it's a programming error.
             raise TypeError(
-                f"Nested dict specs are not supported on flat tables. "
-                f"Column '{col_name}' has a dict value, but the normalized "
-                f"backend operates on flat tables without nested structs."
+                f"Unexpected nested dict for key '{col_name}' in flat table. "
+                f"Dict FieldValues should be resolved to per-level specs "
+                f"via _resolve_fields_per_level() before calling this function."
             )
         elif callable(field_spec) and not isinstance(field_spec, pl.Expr):
             # Lambda/function: apply to the column expression
@@ -860,49 +927,74 @@ class NormalizedPacker:
         - ``Callable[[pl.Expr], pl.Expr]``: e.g. ``lambda x: x * 2``
         - ``pl.Expr``: computed expression (use ``pl.field()`` for
           cross-field references)
+        - ``dict``: navigate into a child level — the dict key must be a
+          descendant level name, and the value is a nested ``FieldValue``
+          spec applied to that level's table.  This mirrors the
+          hierarchical backend's ``List[Struct]`` navigation via
+          ``list.eval()`` / ``struct.field()``.
 
-        The method applies transformations to the target level's table,
-        then joins with ancestor tables to produce a flat result at
-        *at_level* granularity with fully qualified column names.
+        The method applies transformations to the appropriate per-level
+        tables, then joins with ancestor tables to produce a flat result
+        with fully qualified column names.
 
         Args:
-            fields: Field specification dict.
-            at_level: The hierarchy level to operate at.
+            fields: Field specification dict.  Keys may be field names at
+                *at_level* or descendant level names for cross-level
+                navigation.
+            at_level: The hierarchy level to start from.
             struct_mode: ``"with_fields"`` (default) preserves unmentioned
                 columns; ``"select"`` keeps only specified columns.
 
         Returns:
-            ``pl.LazyFrame`` at *at_level* granularity with qualified
-            column names and transformations applied.
+            ``pl.LazyFrame`` with qualified column names and
+            transformations applied, joined down to the deepest modified
+            level.
 
         Raises:
             KeyError: If *at_level* is not a valid level.
             ValueError: If a referenced column does not exist.
-            TypeError: If a ``FieldValue`` is a nested dict.
+            TypeError: If a dict key is not a descendant level name.
 
         Examples:
+            >>> # Flat field spec at a single level
             >>> result = npacker.apply(
             ...     {"revenue": lambda x: x * 1.1},
             ...     at_level="store",
             ... )
+            >>> # Cross-field computation
             >>> result = npacker.apply(
             ...     {"profit": pl.field("revenue") - pl.field("cost")},
             ...     at_level="store",
             ... )
+            >>> # Navigate into child level (same syntax as hierarchical backend)
+            >>> result = npacker.apply(
+            ...     {"store": {"revenue": lambda x: x * 2}},
+            ...     at_level="region",
+            ... )
         """
-        target_idx = self.spec.index_of(at_level)
-        table = self._tables[at_level]
+        # Resolve nested dict into per-level flat specs
+        per_level = _resolve_fields_per_level(fields, at_level, self.spec)
 
-        # Apply field transformations to the flat table
-        modified_table = _apply_fields_flat(table, fields, struct_mode)
+        # Join target is the deepest modified level
+        deepest_idx = max(self.spec.index_of(lvl) for lvl in per_level)
 
-        # Temporarily swap the table, join to level, then restore
-        original_table = self._tables[at_level]
-        self._tables[at_level] = modified_table
+        # Apply field transformations to each level's table, temporarily
+        # swapping tables so _join_to_level picks up the modifications.
+        originals: dict[str, pl.LazyFrame] = {}
         try:
-            result = self._join_to_level(target_idx)
+            for lvl_name, lvl_fields in per_level.items():
+                originals[lvl_name] = self._tables[lvl_name]
+                # struct_mode only applies to the level the user specified
+                # (at_level); child levels always use "with_fields" to
+                # preserve FK columns needed for joins.
+                mode = struct_mode if lvl_name == at_level else "with_fields"
+                self._tables[lvl_name] = _apply_fields_flat(
+                    self._tables[lvl_name], lvl_fields, mode
+                )
+            result = self._join_to_level(deepest_idx)
         finally:
-            self._tables[at_level] = original_table
+            for lvl_name, original in originals.items():
+                self._tables[lvl_name] = original
 
         return result
 

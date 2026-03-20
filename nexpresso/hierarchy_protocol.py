@@ -32,6 +32,7 @@ Typical usage::
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import polars as pl
@@ -345,8 +346,31 @@ class NestedBackend:
         modified = self._packer.apply(
             lf, fields, at_level=at_level, struct_mode=struct_mode
         )
-        result = self._packer.unpack(modified, at_level)
+        # Unpack to the deepest level referenced in the field spec so
+        # that child-level modifications are visible as flat columns,
+        # matching the normalized backend's join behaviour.
+        unpack_level = self._deepest_level(fields, at_level)
+        result = self._packer.unpack(modified, unpack_level)
         return self._packer._to_lazy(result)
+
+    def _deepest_level(
+        self,
+        fields: Mapping[str, object],
+        at_level: str,
+    ) -> str:
+        """Return the deepest level name referenced in a nested field spec."""
+        level_names = {lvl.name for lvl in self._packer.spec.levels}
+        deepest = at_level
+
+        for key, value in fields.items():
+            if isinstance(value, dict) and key in level_names:
+                child_deepest = self._deepest_level(value, key)
+                if self._packer.spec.index_of(child_deepest) > self._packer.spec.index_of(
+                    deepest
+                ):
+                    deepest = child_deepest
+
+        return deepest
 
     def describe(self) -> str:
         return self._packer.describe()
