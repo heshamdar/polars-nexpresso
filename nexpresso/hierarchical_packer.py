@@ -970,9 +970,12 @@ class HierarchicalPacker:
                 lf = lf.drop(*extra_cols)
                 schema = lf.collect_schema()
 
+        # Validation requires eager .collect(); skip it when frame is lazy to preserve lazy semantics.
+        effective_validate = self.validate_on_pack and isinstance(frame, pl.DataFrame)
+
         target_idx = self.spec.index_of(to_level)
         for level_idx in reversed(range(target_idx, len(self._levels_meta))):
-            lf, schema = self._pack_single_level(lf, level_idx, schema)
+            lf, schema = self._pack_single_level(lf, level_idx, schema, validate=effective_validate)
 
         if added_cols:
             lf = lf.drop(*added_cols)
@@ -2146,8 +2149,8 @@ class HierarchicalPacker:
         if ROW_ID_COLUMN in schema:
             return lf, schema
         lf = lf.with_row_index(ROW_ID_COLUMN)
-        # Update schema with the new column
-        new_schema = lf.collect_schema()
+        # with_row_index always prepends a UInt32 column — no need to re-collect schema.
+        new_schema = pl.Schema({ROW_ID_COLUMN: pl.UInt32, **schema})
         return lf, new_schema
 
     def _ensure_key_columns(
@@ -2378,7 +2381,7 @@ class HierarchicalPacker:
         return exprs
 
     def _pack_single_level(
-        self, lf: pl.LazyFrame, level_idx: int, schema: pl.Schema
+        self, lf: pl.LazyFrame, level_idx: int, schema: pl.Schema, *, validate: bool = True
     ) -> tuple[pl.LazyFrame, pl.Schema]:
         """
         Pack a single level into a struct column.
@@ -2428,7 +2431,7 @@ class HierarchicalPacker:
         remaining_cols = [col for col in schema.keys() if col not in excluded]
 
         # Validate that grouped values are identical if validation is enabled
-        if self.validate_on_pack and remaining_cols:
+        if validate and remaining_cols:
             self._validate_aggregation_uniformity(lf, group_keys, remaining_cols, meta.name)
 
         agg_exprs = [pl.col(col).drop_nulls().first().alias(col) for col in remaining_cols]
@@ -2458,17 +2461,16 @@ class HierarchicalPacker:
         Raises:
             HierarchyValidationError: If values differ within a group.
         """
-        # Check each value column for uniformity within groups
-        # Use n_unique to detect non-uniform values
-        for col in value_cols:
-            check_expr = (
-                lf.group_by(group_keys)
-                .agg(pl.col(col).drop_nulls().n_unique().alias("n_unique"))
-                .filter(pl.col("n_unique") > 1)
-                .select(pl.len())
-            )
-            non_uniform_count = check_expr.collect().item()
+        # Check all value columns for uniformity within groups in a single pass.
+        # Using a unique alias per column avoids name collisions.
+        agg_exprs = [
+            pl.col(col).drop_nulls().n_unique().alias(f"__nuniq_{i}")
+            for i, col in enumerate(value_cols)
+        ]
+        result = lf.group_by(group_keys).agg(agg_exprs).collect()
 
+        for i, col in enumerate(value_cols):
+            non_uniform_count = (result[f"__nuniq_{i}"] > 1).sum()
             if non_uniform_count > 0:
                 raise HierarchyValidationError(
                     f"Column '{col}' has non-uniform values within groups. "
