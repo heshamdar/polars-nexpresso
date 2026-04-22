@@ -7,8 +7,12 @@ Easily select, modify, and create columns and nested fields in Polars DataFrames
 
 from nexpresso.expressions import (
     NestedExpressionBuilder,
+    NestedFilterBuilder,
+    apply_nested_filter,
     apply_nested_operations,
+    filter_nested_elements,
     generate_nested_exprs,
+    generate_nested_filter_expr,
 )
 from nexpresso.hierarchical_packer import (
     DiscoveredLevel,
@@ -30,6 +34,11 @@ __all__ = [
     "NestedExpressionBuilder",
     "generate_nested_exprs",
     "apply_nested_operations",
+    # Nested filter builder
+    "NestedFilterBuilder",
+    "generate_nested_filter_expr",
+    "filter_nested_elements",
+    "apply_nested_filter",
     # Hierarchical packer
     "DiscoveredLevel",
     "HierarchicalPacker",

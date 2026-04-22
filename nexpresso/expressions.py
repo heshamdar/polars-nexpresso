@@ -34,6 +34,13 @@ FieldValue = None | dict[str, "FieldValue"] | Callable[[pl.Expr], pl.Expr] | pl.
 
 StructMode = Literal["select", "with_fields"]
 
+# Filter type aliases
+# FilterValue: spec for row-level predicates (used with generate_nested_filter_expr)
+FilterValue = Callable[[pl.Expr], pl.Expr] | pl.Expr | dict[str, "FilterValue"]
+
+# ElementFilterSpec: spec for element-level predicates (used with filter_nested_elements)
+ElementFilterSpec = Callable[[pl.Expr], pl.Expr] | pl.Expr | dict[str, "ElementFilterSpec"]
+
 
 class NestedExpressionBuilder:
     """
@@ -394,6 +401,473 @@ def apply_nested_operations(
         return df.with_columns(exprs)
     else:
         return df.select(exprs)
+
+
+class NestedFilterBuilder:
+    """
+    Builder class for creating nested Polars filter expressions.
+
+    Converts a nested dictionary specification into Polars boolean expressions for
+    row-level filtering or element-level list filtering.
+
+    The callable at each dict path endpoint receives the Polars expression **at that
+    structural level**, so users can write any aggregation or predicate they need:
+
+    - Top-level column: callable receives ``pl.col("col")``
+    - Struct field via dict: callable receives ``pl.col("col").struct.field("f")``
+    - List<Struct> field via dict (row filter): callable receives
+      ``pl.col("col").list.eval(pl.element().struct.field("f"))`` — a List expression
+      the user can reduce with ``.list.max()``, ``.list.any()``, etc.
+    - List<Struct> field via dict (element filter): callable receives
+      ``pl.element().struct.field("f")`` and must return an element-level boolean.
+    """
+
+    def __init__(self, schema: pl.Schema) -> None:
+        """
+        Initialize the builder with a DataFrame schema.
+
+        Args:
+            schema: The schema of the DataFrame to filter.
+        """
+        self._schema = schema
+
+    def build_row_filter(self, filter_spec: dict[str, FilterValue]) -> pl.Expr:
+        """
+        Build a boolean row-level expression from the filter specification.
+
+        Multiple top-level keys are AND-combined into a single expression.
+
+        Args:
+            filter_spec: Dict mapping column names to predicates. Each value is:
+                - ``Callable``: receives the column/field expression, returns a boolean expr
+                - ``pl.Expr``: used directly as a boolean expression
+                - ``dict``: navigate into a nested Struct or List<Struct> field
+
+        Returns:
+            A boolean ``pl.Expr`` suitable for use with ``.filter()``.
+
+        Raises:
+            ValueError: If a column is not found or dict is used on a non-nested type.
+            TypeError: If a filter spec value has an unsupported type.
+
+        Examples:
+            >>> builder = NestedFilterBuilder(df.schema)
+            >>> pred = builder.build_row_filter({
+            ...     "population": lambda x: x > 100_000,
+            ...     "streets": {"length_km": lambda x: x.list.max() > 1},
+            ... })
+            >>> df.filter(pred)
+        """
+        if not filter_spec:
+            return pl.lit(True)
+
+        predicates = [self._process_col_predicate(col, spec) for col, spec in filter_spec.items()]
+        result = predicates[0]
+        for pred in predicates[1:]:
+            result = result & pred
+        return result
+
+    def build_element_filters(
+        self, filter_spec: dict[str, ElementFilterSpec]
+    ) -> list[pl.Expr]:
+        """
+        Build with_columns-style expressions that filter list elements in-place.
+
+        Rows are never dropped — only the elements within each list column are filtered.
+
+        Args:
+            filter_spec: Dict mapping column names (must be List type) to element
+                predicates. Each value is:
+                - ``Callable``: receives element-level expression, returns element bool
+                - ``pl.Expr``: used directly as element-level boolean
+                - ``dict``: navigate into struct fields of each list element
+
+        Returns:
+            List of aliased Polars expressions for use with ``.with_columns()``.
+
+        Raises:
+            ValueError: If a column is not a List type or is not found.
+            TypeError: If a spec value has an unsupported type.
+
+        Examples:
+            >>> builder = NestedFilterBuilder(df.schema)
+            >>> exprs = builder.build_element_filters({
+            ...     "streets": {"length_km": lambda x: x > 1},
+            ... })
+            >>> df.with_columns(exprs)
+        """
+        return [self._process_col_element_filter(col, spec) for col, spec in filter_spec.items()]
+
+    # -------------------------------------------------------------------------
+    # Row-filter private helpers
+    # -------------------------------------------------------------------------
+
+    def _process_col_predicate(self, col_name: str, spec: FilterValue) -> pl.Expr:
+        """Build a row-level boolean predicate for a single top-level column."""
+        if col_name not in self._schema:
+            available = list(self._schema.names())
+            raise ValueError(
+                f"Column '{col_name}' not found in schema. "
+                f"Available columns: {available}"
+            )
+
+        dtype = self._schema[col_name]
+        base_expr = pl.col(col_name)
+
+        if callable(spec):
+            return spec(base_expr)
+        elif isinstance(spec, pl.Expr):
+            return spec
+        elif isinstance(spec, dict):
+            if isinstance(dtype, pl.Struct):
+                return self._build_struct_row_predicate(dtype, spec, base_expr)
+            elif isinstance(dtype, pl.List):
+                return self._build_list_row_predicate(dtype.inner, spec, base_expr)
+            else:
+                raise ValueError(
+                    f"Cannot use a dict filter spec on column '{col_name}' with type "
+                    f"{dtype}. Dict specs are only supported for Struct and List types. "
+                    "Use a callable or pl.Expr for scalar columns."
+                )
+        else:
+            raise TypeError(
+                f"Invalid filter spec type for column '{col_name}': {type(spec)}. "
+                "Expected Callable, pl.Expr, or dict."
+            )
+
+    def _build_struct_row_predicate(
+        self,
+        struct_dtype: pl.Struct,
+        spec: dict[str, FilterValue],
+        base_expr: pl.Expr,
+    ) -> pl.Expr:
+        """AND-combine row-level predicates for each specified struct field."""
+        schema_map: dict[str, PolarsDataType] = {f.name: f.dtype for f in struct_dtype.fields}
+        predicates: list[pl.Expr] = []
+
+        for field_name, field_spec in spec.items():
+            if field_name not in schema_map:
+                available = list(schema_map.keys())
+                raise ValueError(
+                    f"Field '{field_name}' not found in struct. "
+                    f"Available fields: {available}"
+                )
+            field_expr = base_expr.struct.field(field_name)
+            field_dtype = schema_map[field_name]
+
+            if callable(field_spec):
+                predicates.append(field_spec(field_expr))
+            elif isinstance(field_spec, pl.Expr):
+                predicates.append(field_spec)
+            elif isinstance(field_spec, dict):
+                if isinstance(field_dtype, pl.Struct):
+                    predicates.append(
+                        self._build_struct_row_predicate(field_dtype, field_spec, field_expr)
+                    )
+                elif isinstance(field_dtype, pl.List):
+                    predicates.append(
+                        self._build_list_row_predicate(field_dtype.inner, field_spec, field_expr)
+                    )
+                else:
+                    raise ValueError(
+                        f"Cannot use a dict filter spec on field '{field_name}' with type "
+                        f"{field_dtype}. Only Struct and List fields support dict specs."
+                    )
+            else:
+                raise TypeError(
+                    f"Invalid filter spec type for field '{field_name}': {type(field_spec)}. "
+                    "Expected Callable, pl.Expr, or dict."
+                )
+
+        if not predicates:
+            return pl.lit(True)
+        result = predicates[0]
+        for pred in predicates[1:]:
+            result = result & pred
+        return result
+
+    def _build_list_row_predicate(
+        self,
+        inner_dtype: PolarsDataType,
+        spec: dict[str, FilterValue],
+        base_expr: pl.Expr,
+    ) -> pl.Expr:
+        """
+        Build row-level predicates for a List<Struct> column.
+
+        For each field key in spec, extracts ``base_expr.list.eval(element.struct.field(f))``
+        — a List<T> expression — and passes it to the user's callable so they can apply
+        any list aggregation (e.g. ``.list.max() > 1``, ``.list.any()``, etc.).
+        Multiple fields are AND-combined.
+        """
+        if not isinstance(inner_dtype, pl.Struct):
+            raise ValueError(
+                f"Dict filter spec on a List column requires the list element type to be "
+                f"a Struct, but got List<{inner_dtype}>. "
+                "Use a top-level callable to write the predicate directly."
+            )
+
+        schema_map: dict[str, PolarsDataType] = {f.name: f.dtype for f in inner_dtype.fields}
+        predicates: list[pl.Expr] = []
+
+        for field_name, field_spec in spec.items():
+            if field_name not in schema_map:
+                available = list(schema_map.keys())
+                raise ValueError(
+                    f"Field '{field_name}' not found in list element struct. "
+                    f"Available fields: {available}"
+                )
+            # Extract the field across all list elements → gives List<T>
+            extracted = base_expr.list.eval(pl.element().struct.field(field_name))
+
+            if callable(field_spec):
+                predicates.append(field_spec(extracted))
+            elif isinstance(field_spec, pl.Expr):
+                predicates.append(field_spec)
+            else:
+                raise TypeError(
+                    f"Invalid filter spec type for list element field '{field_name}': "
+                    f"{type(field_spec)}. Expected Callable or pl.Expr when navigating "
+                    "into a List<Struct> column."
+                )
+
+        if not predicates:
+            return pl.lit(True)
+        result = predicates[0]
+        for pred in predicates[1:]:
+            result = result & pred
+        return result
+
+    # -------------------------------------------------------------------------
+    # Element-filter private helpers
+    # -------------------------------------------------------------------------
+
+    def _process_col_element_filter(
+        self, col_name: str, spec: ElementFilterSpec
+    ) -> pl.Expr:
+        """Build a with_columns expression that filters elements within a list column."""
+        if col_name not in self._schema:
+            available = list(self._schema.names())
+            raise ValueError(
+                f"Column '{col_name}' not found in schema. "
+                f"Available columns: {available}"
+            )
+
+        dtype = self._schema[col_name]
+        if not isinstance(dtype, pl.List):
+            raise ValueError(
+                f"filter_nested_elements can only be applied to List columns, "
+                f"but '{col_name}' has type {dtype}."
+            )
+
+        pred_expr = self._build_element_predicate(dtype.inner, spec, pl.element())
+        return (
+            pl.col(col_name)
+            .list.eval(pl.when(pred_expr).then(pl.element()))
+            .list.drop_nulls()
+            .alias(col_name)
+        )
+
+    def _build_element_predicate(
+        self,
+        inner_dtype: PolarsDataType,
+        spec: ElementFilterSpec,
+        base_expr: pl.Expr,
+    ) -> pl.Expr:
+        """Build an element-level boolean predicate (used inside list.eval context)."""
+        if callable(spec):
+            return spec(base_expr)
+        elif isinstance(spec, pl.Expr):
+            return spec
+        elif isinstance(spec, dict):
+            if not isinstance(inner_dtype, pl.Struct):
+                raise ValueError(
+                    f"Cannot use a dict element filter spec on a List with element type "
+                    f"{inner_dtype}. Dict specs require a Struct element type."
+                )
+            return self._build_element_struct_predicate(inner_dtype, spec, base_expr)
+        else:
+            raise TypeError(
+                f"Invalid element filter spec type: {type(spec)}. "
+                "Expected Callable, pl.Expr, or dict."
+            )
+
+    def _build_element_struct_predicate(
+        self,
+        struct_dtype: pl.Struct,
+        spec: dict[str, ElementFilterSpec],
+        base_expr: pl.Expr,
+    ) -> pl.Expr:
+        """AND-combine element-level predicates for struct fields (inside list.eval context)."""
+        schema_map: dict[str, PolarsDataType] = {f.name: f.dtype for f in struct_dtype.fields}
+        predicates: list[pl.Expr] = []
+
+        for field_name, field_spec in spec.items():
+            if field_name not in schema_map:
+                available = list(schema_map.keys())
+                raise ValueError(
+                    f"Field '{field_name}' not found in struct element. "
+                    f"Available fields: {available}"
+                )
+            field_expr = base_expr.struct.field(field_name)
+            field_dtype = schema_map[field_name]
+
+            if callable(field_spec):
+                predicates.append(field_spec(field_expr))
+            elif isinstance(field_spec, pl.Expr):
+                predicates.append(field_spec)
+            elif isinstance(field_spec, dict):
+                if isinstance(field_dtype, pl.Struct):
+                    predicates.append(
+                        self._build_element_struct_predicate(field_dtype, field_spec, field_expr)
+                    )
+                else:
+                    raise ValueError(
+                        f"Cannot recurse into field '{field_name}' with type {field_dtype} "
+                        "in element filter. Dict specs require a Struct field type."
+                    )
+            else:
+                raise TypeError(
+                    f"Invalid element filter spec type for field '{field_name}': "
+                    f"{type(field_spec)}. Expected Callable, pl.Expr, or dict."
+                )
+
+        if not predicates:
+            return pl.lit(True)
+        result = predicates[0]
+        for pred in predicates[1:]:
+            result = result & pred
+        return result
+
+
+def generate_nested_filter_expr(
+    filter_spec: dict[str, FilterValue],
+    schema: pl.Schema | FrameT,
+) -> pl.Expr:
+    """
+    Generate a boolean Polars expression for row-level filtering using a nested dict spec.
+
+    The callable at each dict path endpoint receives the Polars expression **at that
+    structural level**:
+
+    - ``{"col": lambda x: x > 0}`` — x is ``pl.col("col")``
+    - ``{"col": {"f": lambda x: x > 0}}`` on a Struct — x is ``pl.col("col").struct.field("f")``
+    - ``{"col": {"f": lambda x: ...}}`` on a List<Struct> — x is
+      ``pl.col("col").list.eval(pl.element().struct.field("f"))`` (a ``List<T>`` expression).
+      Use any list aggregation: ``x.list.max() > 1``, ``x.list.eval(...).list.any()``, etc.
+
+    Multiple top-level keys are AND-combined.
+
+    Args:
+        filter_spec: Dict mapping column names to predicates. Each value is:
+            - ``Callable[[pl.Expr], pl.Expr]``: receives the expression at this level
+            - ``pl.Expr``: used directly as a boolean expression
+            - ``dict``: navigate deeper into a Struct or List<Struct> column
+        schema: The DataFrame schema, or a DataFrame/LazyFrame to extract the schema from.
+
+    Returns:
+        A boolean ``pl.Expr`` for use with ``.filter()``.
+
+    Raises:
+        ValueError: If a column is missing or a dict spec is used on a non-nested type.
+        TypeError: If a spec value has an unsupported type.
+
+    Examples:
+        >>> df = pl.DataFrame({
+        ...     "city": ["A", "B"],
+        ...     "population": [50_000, 200_000],
+        ...     "streets": [
+        ...         [{"name": "Main", "length_km": 2.0}],
+        ...         [{"name": "Oak", "length_km": 0.4}],
+        ...     ],
+        ... })
+        >>> pred = generate_nested_filter_expr(
+        ...     {"population": lambda x: x > 100_000},
+        ...     df.schema,
+        ... )
+        >>> df.filter(pred)
+        >>> pred2 = generate_nested_filter_expr(
+        ...     {"streets": {"length_km": lambda x: x.list.max() > 1}},
+        ...     df.schema,
+        ... )
+        >>> df.filter(pred2)
+    """
+    if isinstance(schema, pl.DataFrame | pl.LazyFrame):
+        schema = schema.collect_schema()
+
+    builder = NestedFilterBuilder(schema)
+    return builder.build_row_filter(filter_spec)
+
+
+def filter_nested_elements(
+    frame: FrameT,
+    filter_spec: dict[str, ElementFilterSpec],
+) -> FrameT:
+    """
+    Filter elements within list columns in-place without dropping any rows.
+
+    The callable at each dict path endpoint receives the **element-level** Polars
+    expression (inside ``list.eval`` context), and must return an element-level boolean.
+
+    Args:
+        frame: The DataFrame or LazyFrame to operate on.
+        filter_spec: Dict mapping List column names to element predicates. Each value is:
+            - ``Callable[[pl.Expr], pl.Expr]``: receives element-level expression
+            - ``pl.Expr``: used directly as element-level boolean
+            - ``dict``: navigate into struct fields of each list element
+
+    Returns:
+        DataFrame or LazyFrame with filtered list columns (same type as input).
+        Rows with all elements filtered out will have an empty list, not null.
+
+    Raises:
+        ValueError: If a column is not a List type or is not found.
+        TypeError: If a spec value has an unsupported type.
+
+    Examples:
+        >>> df = pl.DataFrame({
+        ...     "streets": [
+        ...         [{"name": "Main", "length_km": 2.0}, {"name": "Oak", "length_km": 0.4}],
+        ...         [{"name": "Pine", "length_km": 0.3}],
+        ...     ],
+        ... })
+        >>> result = filter_nested_elements(df, {
+        ...     "streets": {"length_km": lambda x: x > 1},
+        ... })
+        >>> # First row: [{"name": "Main", "length_km": 2.0}]
+        >>> # Second row: []
+    """
+    schema = frame.collect_schema()
+    builder = NestedFilterBuilder(schema)
+    exprs = builder.build_element_filters(filter_spec)
+    return frame.with_columns(exprs)
+
+
+def apply_nested_filter(
+    frame: FrameT,
+    filter_spec: dict[str, FilterValue],
+) -> FrameT:
+    """
+    Apply a nested filter spec to a DataFrame or LazyFrame, keeping only matching rows.
+
+    Convenience wrapper around ``generate_nested_filter_expr`` + ``.filter()``.
+
+    Args:
+        frame: The DataFrame or LazyFrame to filter.
+        filter_spec: Dict mapping column names to predicates (see
+            ``generate_nested_filter_expr`` for full spec).
+
+    Returns:
+        Filtered DataFrame or LazyFrame (same type as input).
+
+    Examples:
+        >>> result = apply_nested_filter(df, {
+        ...     "population": lambda x: x > 100_000,
+        ...     "streets": {"length_km": lambda x: x.list.max() > 1},
+        ... })
+    """
+    pred = generate_nested_filter_expr(filter_spec, frame)
+    return frame.filter(pred)
 
 
 if __name__ == "__main__":
