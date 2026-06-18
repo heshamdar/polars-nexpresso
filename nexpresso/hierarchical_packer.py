@@ -15,8 +15,10 @@ Example
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, TypeVar
 
 import polars as pl
@@ -32,6 +34,7 @@ PromoteAggregation = Literal[
 SchemaInput = pl.Schema | pl.DataFrame | pl.LazyFrame
 
 ROW_ID_COLUMN = "__hier_row_id"
+ORDER_TEMP_COLUMN_PREFIX = "__hier_order_"
 DEFAULT_SEPARATOR = "."
 DEFAULT_ESCAPE_CHAR = "\\"
 
@@ -75,6 +78,7 @@ def _split_path_static(
 
     components.append("".join(current))
     return components
+
 
 __all__ = [
     "LevelSpec",
@@ -619,7 +623,10 @@ class HierarchicalPacker:
                 continue
             remainder = col[len(meta.prefix) :]
             # Exclude columns that belong to child levels
-            if any(remainder == n or remainder.startswith(n + self.separator) for n in child_level_names):
+            if any(
+                remainder == n or remainder.startswith(n + self.separator)
+                for n in child_level_names
+            ):
                 continue
             if form == "long":
                 result.append(col)
@@ -732,7 +739,10 @@ class HierarchicalPacker:
             if not col.startswith(meta.prefix):
                 continue
             remainder = col[len(meta.prefix) :]
-            if any(remainder == n or remainder.startswith(n + self.separator) for n in child_level_names):
+            if any(
+                remainder == n or remainder.startswith(n + self.separator)
+                for n in child_level_names
+            ):
                 continue
             result[remainder] = dtype
         return result
@@ -773,7 +783,11 @@ class HierarchicalPacker:
             tag_str = f"  ({', '.join(tags)})" if tags else ""
             lines.append(f"    {meta.index}. {meta.name}{tag_str}")
             lines.append(f'       Path: "{meta.path}"')
-            keys_str = ", ".join(col[len(meta.prefix) :] for col in meta.id_columns) if meta.id_columns else "(none)"
+            keys_str = (
+                ", ".join(col[len(meta.prefix) :] for col in meta.id_columns)
+                if meta.id_columns
+                else "(none)"
+            )
             lines.append(f"       Keys: {keys_str}")
             if meta.ancestor_keys:
                 lines.append(f"       Ancestor keys: {', '.join(meta.ancestor_keys)}")
@@ -877,9 +891,7 @@ class HierarchicalPacker:
                 if level_path not in levels:
                     levels[level_path] = set()
                 packed_paths.add(level_path)
-                HierarchicalPacker._discover_from_struct(
-                    inner, level_path, levels, packed_paths
-                )
+                HierarchicalPacker._discover_from_struct(inner, level_path, levels, packed_paths)
             elif len(parts) >= 2:
                 # Flat scalar column: components except last form the level path
                 level_path = tuple(parts[:-1])
@@ -1011,6 +1023,155 @@ class HierarchicalPacker:
 
         lf = self._drop_internal_columns(lf)
         return self._match_frame_type(lf, frame)
+
+    def pack_streaming(
+        self,
+        source: pl.LazyFrame | pl.DataFrame | str | Path,
+        to_level: str,
+        *,
+        partitions: int = 16,
+        tmp_dir: str | Path | None = None,
+        defer: bool = True,
+        extra_columns: ExtraColumnsMode = "preserve",
+    ) -> pl.LazyFrame:
+        """
+        Memory-bounded :meth:`pack` for datasets too large to pack in one shot.
+
+        ``pack`` relies on a ``group_by`` whose state holds every group in memory,
+        so peak memory scales with the full dataset even under the streaming
+        engine. ``pack_streaming`` instead buckets the input by the **root-level
+        key** (so every entity's rows stay together), packs each bucket
+        independently while sinking the result to Parquet, and returns a single
+        :class:`polars.LazyFrame` over the packed output. Peak memory is therefore
+        bounded by one bucket rather than the whole dataset.
+
+        Args:
+            source: Input at the finest granularity. May be a DataFrame, a
+                LazyFrame, or a path/glob to Parquet file(s) (scanned lazily).
+            to_level: The target level name to pack down to.
+            partitions: Number of root-key buckets. More buckets means lower peak
+                memory and more temporary files. Must be >= 1.
+            tmp_dir: Directory for the intermediate per-bucket Parquet files.
+                Defaults to a fresh :func:`tempfile.mkdtemp` directory; the caller
+                owns cleanup. Reusing a directory across calls with a different
+                ``partitions`` count may leave stale files — prefer a fresh dir.
+            defer: When ``True`` (default), the bucketing/sinking is wrapped in
+                :func:`polars.defer` so nothing executes until the returned
+                LazyFrame is collected, keeping the call chain lazy. Note that the
+                packed result is materialized at the defer boundary. When
+                ``False``, the buckets are packed and sunk eagerly and a
+                :func:`polars.scan_parquet` handle is returned, so downstream
+                operations stream straight from disk (safest when the packed
+                result itself does not fit in memory).
+            extra_columns: How to handle columns outside the hierarchy. See
+                :meth:`pack`.
+
+        Returns:
+            A LazyFrame over the packed result. Top-level row order is not
+            guaranteed; child-list order follows the same rules as :meth:`pack`.
+
+        Raises:
+            ValueError: If ``partitions`` < 1.
+            HierarchyValidationError: If the root level defines no id fields to
+                partition on.
+        """
+        if partitions < 1:
+            raise ValueError(f"partitions must be >= 1, got {partitions}.")
+
+        if defer and not hasattr(pl, "defer"):
+            raise RuntimeError(
+                "pack_streaming(defer=True) requires a Polars version that provides "
+                "pl.defer. Upgrade Polars, or call with defer=False to sink eagerly "
+                "and return a scan_parquet handle."
+            )
+
+        source_lf = (
+            pl.scan_parquet(source) if isinstance(source, (str, Path)) else self._to_lazy(source)
+        )
+
+        root_keys = list(self._levels_meta[0].id_columns)
+        if not root_keys:
+            raise HierarchyValidationError(
+                "pack_streaming requires the root level to define id_fields to " "partition on.",
+                level=self._levels_meta[0].name,
+            )
+
+        # Materialize computed key columns so the root key exists for bucketing.
+        prepared, _added, _schema = self._prepare_frame(source_lf)
+
+        # Expected output schema is needed up-front for pl.defer; collecting a
+        # LazyFrame schema is cheap (metadata only, no data movement).
+        expected_schema = self.pack(
+            source_lf, to_level, extra_columns=extra_columns
+        ).collect_schema()
+
+        out_dir = (
+            Path(tmp_dir)
+            if tmp_dir is not None
+            else Path(tempfile.mkdtemp(prefix="nexpresso_pack_"))
+        )
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pattern = str(out_dir / "part_*.parquet")
+
+        def _run_partitions() -> None:
+            bucket = pl.struct(root_keys).hash() % partitions
+            for i in range(partitions):
+                part = self.pack(
+                    prepared.filter(bucket == i),
+                    to_level,
+                    extra_columns=extra_columns,
+                )
+                part.sink_parquet(out_dir / f"part_{i:05d}.parquet")
+
+        if defer:
+
+            def _materialize() -> pl.DataFrame:
+                _run_partitions()
+                return pl.scan_parquet(pattern).collect(engine="streaming")
+
+            return pl.defer(_materialize, schema=expected_schema)
+
+        _run_partitions()
+        return pl.scan_parquet(pattern)
+
+    def unpack_streaming(
+        self,
+        source: pl.LazyFrame | pl.DataFrame | str | Path,
+        to_level: str,
+        *,
+        sink_path: str | Path | None = None,
+    ) -> pl.LazyFrame:
+        """
+        Streaming-friendly :meth:`unpack` returning a :class:`polars.LazyFrame`.
+
+        ``unpack`` is ``explode`` + ``unnest``, which the streaming engine already
+        runs with bounded memory; the only issue is that callers usually pass
+        eager frames and get a materialized result. This helper accepts a Parquet
+        path (scanned lazily) or a frame and keeps the pipeline lazy so it can be
+        composed with downstream operations or sunk straight to disk.
+
+        Args:
+            source: Packed input. A DataFrame, LazyFrame, or path/glob to Parquet
+                file(s) (scanned lazily).
+            to_level: The target level name to unpack to.
+            sink_path: Optional Parquet path. When given, the unpacked result is
+                streamed to it via ``sink_parquet`` and a fresh scan over that
+                file is returned (true disk-to-disk, nothing materialized).
+
+        Returns:
+            A LazyFrame over the unpacked result.
+        """
+        source_lf = (
+            pl.scan_parquet(source) if isinstance(source, (str, Path)) else self._to_lazy(source)
+        )
+
+        unpacked = self.unpack(source_lf, to_level)
+
+        if sink_path is not None:
+            unpacked.sink_parquet(sink_path)
+            return pl.scan_parquet(sink_path)
+
+        return unpacked
 
     def split_levels(self, frame: FrameT) -> dict[str, FrameT]:
         """
@@ -1568,12 +1729,8 @@ class HierarchicalPacker:
                     level_found = True
                     # Check struct contains expected id fields (short names)
                     struct_field_names = {f.name for f in inner.fields}
-                    short_ids = [
-                        col[len(meta.prefix) :] for col in meta.id_columns
-                    ]
-                    missing_ids = [
-                        sid for sid in short_ids if sid not in struct_field_names
-                    ]
+                    short_ids = [col[len(meta.prefix) :] for col in meta.id_columns]
+                    missing_ids = [sid for sid in short_ids if sid not in struct_field_names]
                     if missing_ids:
                         errors.append(
                             f"[Level: {meta.name}] Packed column '{meta.path}' "
@@ -1746,7 +1903,7 @@ class HierarchicalPacker:
         for hop in range(n_hops - 1, 0, -1):
             parent_meta = self._levels_meta[traverse[hop - 1]]
             child_meta = self._levels_meta[traverse[hop]]
-            field_in_parent = child_meta.path[len(parent_meta.prefix):]
+            field_in_parent = child_meta.path[len(parent_meta.prefix) :]
 
             # The innermost hop uses final_agg; all others use intermediate_agg.
             agg_fn = final_agg if (hop == n_hops - 1) else intermediate_agg
@@ -2017,9 +2174,7 @@ class HierarchicalPacker:
         dtype = schema[list_col]
         inner = dtype.inner if isinstance(dtype, pl.List) else dtype
         if not isinstance(inner, pl.Struct):
-            raise ValueError(
-                f"Expected struct inside list column '{list_col}', got {inner}."
-            )
+            raise ValueError(f"Expected struct inside list column '{list_col}', got {inner}.")
         field_names = [f.name for f in inner.fields]
         if attribute not in field_names:
             raise ValueError(
@@ -2407,13 +2562,22 @@ class HierarchicalPacker:
 
         group_keys = list(meta.ancestor_keys)
 
-        sort_keys: list[pl.Expr | str] = []
-        if meta.order_by:
-            sort_keys.extend(meta.order_by)
-        if self.preserve_child_order:
-            sort_keys.append(pl.col(ROW_ID_COLUMN))
-        if sort_keys:
-            lf = lf.sort(sort_keys)
+        # Child-list ordering is purely cosmetic: de-duplication and null recovery
+        # of parent attributes are handled by ``drop_nulls().first()`` below and do
+        # not depend on row order. We therefore avoid a global ``sort`` (a pipeline
+        # breaker that prevents streaming) and instead sort the child list *inside*
+        # the aggregation only when ordering is explicitly requested.
+        order_exprs = list(meta.order_by) if meta.order_by else []
+
+        # ``order_by`` expressions reference this level's (child) columns, which are
+        # about to be folded into the struct. Materialize them into temporary
+        # top-level columns so they remain available to ``sort_by`` in the agg.
+        order_temp_cols: list[str] = []
+        if order_exprs and group_keys:
+            order_temp_cols = [f"{ORDER_TEMP_COLUMN_PREFIX}{i}" for i in range(len(order_exprs))]
+            lf = lf.with_columns(
+                [expr.alias(alias) for expr, alias in zip(order_exprs, order_temp_cols)]
+            )
 
         struct_expr = pl.struct(
             [pl.col(col).alias(col[len(meta.prefix) :]) for col in level_cols]
@@ -2425,8 +2589,9 @@ class HierarchicalPacker:
         if not group_keys:
             return lf, schema
 
-        excluded = set(group_keys) | {meta.path}
-        if self.preserve_child_order:
+        has_row_id = ROW_ID_COLUMN in schema
+        excluded = set(group_keys) | {meta.path} | set(order_temp_cols)
+        if has_row_id:
             excluded.add(ROW_ID_COLUMN)
         remaining_cols = [col for col in schema.keys() if col not in excluded]
 
@@ -2435,9 +2600,23 @@ class HierarchicalPacker:
             self._validate_aggregation_uniformity(lf, group_keys, remaining_cols, meta.name)
 
         agg_exprs = [pl.col(col).drop_nulls().first().alias(col) for col in remaining_cols]
-        agg_exprs.append(pl.col(meta.path))
 
-        lf = lf.group_by(group_keys, maintain_order=True).agg(agg_exprs)
+        # Aggregate child structs into a list, sorting within each group when child
+        # order is requested. ``group_by`` without ``maintain_order`` lets the
+        # streaming engine run the aggregation; top-level row order becomes
+        # nondeterministic, which does not affect packed contents.
+        sort_by_cols: list[str] = [*order_temp_cols]
+        if self.preserve_child_order and has_row_id:
+            sort_by_cols.append(ROW_ID_COLUMN)
+        child_list = pl.col(meta.path).sort_by(sort_by_cols) if sort_by_cols else pl.col(meta.path)
+        agg_exprs.append(child_list)
+
+        # Carry the original row order upward (as the minimum child row id) so that
+        # coarser levels can preserve child order without a global sort.
+        if self.preserve_child_order and has_row_id:
+            agg_exprs.append(pl.col(ROW_ID_COLUMN).min().alias(ROW_ID_COLUMN))
+
+        lf = lf.group_by(group_keys).agg(agg_exprs)
         schema = lf.collect_schema()
 
         return lf, schema

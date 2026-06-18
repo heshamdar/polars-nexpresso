@@ -98,6 +98,7 @@ packed = packer.pack(flat, "region")        # Aggregate back to region level
 |---------|-------------|
 | **Build from Tables** | Join normalized tables into nested hierarchy |
 | **Pack/Unpack** | Navigate between granularity levels |
+| **Streaming Pack/Unpack** | Memory-bounded `pack_streaming` / `unpack_streaming` for large data |
 | **Normalize/Denormalize** | Split into per-level tables and reconstruct |
 | **Validation** | Check for null keys and data integrity |
 | **Custom Separators** | Use any separator (default: `.`) |
@@ -195,6 +196,44 @@ tables = packer.normalize(nested_df)
 # Reconstruct from separate tables
 rebuilt = packer.denormalize(tables)
 ```
+
+### Memory-bounded packing for large data
+
+`pack` builds the nested result with a `group_by` whose state holds every group
+in memory, so peak memory scales with the whole dataset even under the streaming
+engine. For datasets that don't fit comfortably in RAM, `pack_streaming` buckets
+the input by the **root-level key** (keeping each entity's rows together), packs
+each bucket independently while sinking to Parquet, and returns a chainable
+`LazyFrame` — bounding peak memory to a single bucket.
+
+```python
+# Bound peak memory by processing the data in root-key buckets.
+# Accepts a DataFrame, LazyFrame, or a Parquet path/glob (scanned lazily).
+packed = packer.pack_streaming(flat_df, "region", partitions=32)
+
+# It returns a LazyFrame, so you can keep composing lazily:
+top = (
+    packer.pack_streaming("s3_dump/*.parquet", "region", partitions=64)
+    .filter(pl.col("region.id").is_in(active_regions))
+    .collect(engine="streaming")
+)
+
+# defer=False sinks eagerly and returns a scan handle so downstream work streams
+# straight from disk — safest when even the packed result is too big for RAM.
+handle = packer.pack_streaming(flat_df, "region", partitions=64, defer=False)
+
+# unpack already streams; unpack_streaming keeps it lazy / disk-to-disk.
+leaves = packer.unpack_streaming("packed.parquet", "store", sink_path="leaves.parquet")
+```
+
+More buckets means lower peak memory (and more temporary files). See
+[`benchmarks/`](benchmarks/) for a peak-RSS comparison of `pack` vs
+`pack_streaming`.
+
+> **Note on ordering:** packing no longer performs a global sort, so **top-level
+> row order is not guaranteed**. Child-list order is still preserved when
+> `preserve_child_order=True` (the default) or via a level's `order_by`.
+> De-duplication and null handling of parent attributes are unaffected.
 
 ## API Reference
 

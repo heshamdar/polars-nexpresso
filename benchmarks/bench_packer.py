@@ -39,9 +39,11 @@ def _parse_operations(raw: str | None) -> list[OperationName]:
 
     aliases = {
         "pack": "pack_to_image",
+        "pack_streaming": "pack_streaming_to_image",
         "unpack": "unpack_to_patch",
         "roundtrip": "roundtrip",
         "pack_to_image": "pack_to_image",
+        "pack_streaming_to_image": "pack_streaming_to_image",
         "unpack_to_patch": "unpack_to_patch",
     }
     operations: list[OperationName] = []
@@ -51,7 +53,8 @@ def _parse_operations(raw: str | None) -> list[OperationName]:
             continue
         if name not in aliases:
             raise argparse.ArgumentTypeError(
-                f"Unknown operation {name!r}. Choose from: pack, unpack, roundtrip"
+                f"Unknown operation {name!r}. Choose from: pack, pack_streaming, "
+                "unpack, roundtrip"
             )
         operations.append(aliases[name])  # type: ignore[arg-type]
     if not operations:
@@ -85,6 +88,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Scalar dtype for pixel values.",
     )
     parser.add_argument("--seed", type=int, help="Random seed for reproducible payloads.")
+    parser.add_argument(
+        "--stream-partitions",
+        type=int,
+        help="Root-key buckets for pack_streaming (more = lower peak memory).",
+    )
     parser.add_argument(
         "--operations",
         type=_parse_operations,
@@ -140,6 +148,9 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         payload_type=args.payload_type or base.payload_type,
         pixel_dtype=args.pixel_dtype or base.pixel_dtype,
         seed=args.seed if args.seed is not None else base.seed,
+        stream_partitions=(
+            args.stream_partitions if args.stream_partitions is not None else base.stream_partitions
+        ),
     )
 
 

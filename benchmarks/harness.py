@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import multiprocessing as mp
 import statistics
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -18,7 +19,7 @@ from benchmarks.config import BenchmarkConfig
 from benchmarks.data_generator import IMAGE_SPEC, generate_leaf_dataframe
 from nexpresso import HierarchicalPacker
 
-OperationName = Literal["pack_to_image", "unpack_to_patch", "roundtrip"]
+OperationName = Literal["pack_to_image", "pack_streaming_to_image", "unpack_to_patch", "roundtrip"]
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,45 @@ def _worker_entry(
                     _WorkerResult(
                         elapsed_s=elapsed,
                         peak_rss_mb=peak_mb,
+                    )
+                )
+            )
+            return
+
+        if operation == "pack_streaming_to_image":
+            # Memory-bounded pack: partition by root key, sink each bucket, and
+            # consume the result via a streaming count so the full nested result
+            # is never materialized. Peak RSS reflects one bucket, not the dataset.
+            gc.collect()
+            baseline_rss = psutil.Process().memory_info().rss
+            peak_holder = [baseline_rss]
+            stop_event = threading.Event()
+            monitor = threading.Thread(
+                target=_monitor_peak_rss,
+                args=(peak_holder, stop_event),
+                daemon=True,
+            )
+            monitor.start()
+            start = time.perf_counter()
+            try:
+                tmp_dir = tempfile.mkdtemp(prefix="nexpresso_bench_")
+                packed_lf = packer.pack_streaming(
+                    leaf_lf,
+                    "image",
+                    partitions=config.stream_partitions,
+                    tmp_dir=tmp_dir,
+                    defer=False,
+                )
+                packed_lf.select(pl.len()).collect(engine="streaming")
+            finally:
+                stop_event.set()
+                monitor.join(timeout=1.0)
+            elapsed = time.perf_counter() - start
+            result_queue.put(
+                asdict(
+                    _WorkerResult(
+                        elapsed_s=elapsed,
+                        peak_rss_mb=_bytes_to_mb(peak_holder[0]),
                     )
                 )
             )

@@ -9,6 +9,17 @@ Standalone performance harness for `HierarchicalPacker` pack/unpack operations. 
 
 Default hierarchy: **image → tile → patch** (3 levels), with image-like pixel payloads at the patch level (`pl.Array` or `pl.List(pl.List(...))`).
 
+Operations: `pack` (whole-dataset `group_by`), `pack_streaming` (root-key
+partitioned, memory-bounded), `unpack`, and `roundtrip`. Compare `pack` vs
+`pack_streaming` to see the peak-RSS reduction; tune the bucket count with
+`--stream-partitions` (more buckets = lower peak memory).
+
+```bash
+# Peak-RSS comparison of pack vs the memory-bounded pack_streaming
+uv run python -m benchmarks.bench_packer --preset large \
+  --operations pack,pack_streaming --stream-partitions 64
+```
+
 ## Setup
 
 ```bash

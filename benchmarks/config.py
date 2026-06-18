@@ -22,6 +22,7 @@ class BenchmarkConfig:
     payload_type: PayloadType = "array"
     pixel_dtype: PixelDtype = "f32"
     seed: int = 0
+    stream_partitions: int = 16
 
     @property
     def n_leaf_rows(self) -> int:

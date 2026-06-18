@@ -9,7 +9,6 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from nexpresso.hierarchical_packer import (
-    DiscoveredLevel,
     HierarchicalPacker,
     HierarchySpec,
     HierarchyValidationError,
@@ -76,7 +75,10 @@ def _canonical_rows(df: FrameLike) -> list[str]:
 
 
 def _assert_same_rows(left: FrameLike, right: FrameLike):
-    assert_frame_equal(left, right)
+    # Top-level row order is not guaranteed after packing (the streaming-friendly
+    # group-by does not maintain order), so compare rows order-independently.
+    # Child-list order is preserved and still verified, since JSON keeps list order.
+    assert _canonical_rows(left) == _canonical_rows(right)
 
 
 def test_pack_unpack_roundtrip(packer, apartment_level_df):

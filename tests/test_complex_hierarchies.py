@@ -477,7 +477,9 @@ class TestMixedNestedStructures:
         # Unpack to verify
         unpacked = packer.unpack(result, "product")
         assert "store.product.profit" in unpacked.columns
-        assert unpacked["store.product.profit"][0] == 5.0  # 10 - 5
+        # Row order is not guaranteed after packing; check per-SKU profits.
+        profits = dict(zip(unpacked["store.product.sku"], unpacked["store.product.profit"]))
+        assert profits == {"A": 5.0, "B": 10.0, "C": 7.0}  # price - cost
 
 
 # =============================================================================

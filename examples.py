@@ -669,8 +669,11 @@ def demonstrate_cross_level_operations():
     # Arithmetic: combine two exprs natively with Polars operators
     avg_revenue = total_revenue / store_count
     print("\nAverage revenue per store by region:")
-    print(packed.with_columns(avg_revenue.alias("region.avg_revenue_per_store"))
-          .select("region.id", "region.avg_revenue_per_store"))
+    print(
+        packed.with_columns(avg_revenue.alias("region.avg_revenue_per_store")).select(
+            "region.id", "region.avg_revenue_per_store"
+        )
+    )
 
     # ------------------------------------------------------------------
     # 9b. enrich — batch-annotate with multiple LevelAttribute specs
@@ -734,6 +737,42 @@ def demonstrate_cross_level_operations():
     print(packed.select(region_name.alias("name")))
 
 
+def demonstrate_streaming_pack():
+    """Part 10: Memory-bounded packing for large datasets."""
+    print("\n" + "=" * 80)
+    print("Part 10: Memory-Bounded Streaming Pack/Unpack")
+    print("=" * 80)
+
+    spec = HierarchySpec.from_levels(
+        LevelSpec(name="region", id_fields=["id"]),
+        LevelSpec(name="store", id_fields=["id"], parent_keys=["region_id"]),
+    )
+    packer = HierarchicalPacker(spec, validate_on_pack=False)
+
+    flat = pl.DataFrame(
+        {
+            "region.id": ["west", "west", "east", "east"],
+            "region.store.id": ["s1", "s2", "s3", "s4"],
+            "region.store.region_id": ["west", "west", "east", "east"],
+            "region.store.revenue": [100, 200, 150, 250],
+        }
+    )
+
+    # pack_streaming buckets the input by the root key (region), packs each bucket
+    # while sinking to Parquet, and returns a chainable LazyFrame. Peak memory is
+    # bounded by one bucket rather than the whole dataset.
+    packed_lazy = packer.pack_streaming(flat, "region", partitions=4)
+    print("\npack_streaming returns a LazyFrame:", type(packed_lazy).__name__)
+
+    # Keep composing lazily, then collect with the streaming engine.
+    result = packed_lazy.collect(engine="streaming")
+    print(f"Packed to {result.height} region rows (top-level order is not guaranteed)")
+
+    # unpack_streaming keeps unpacking lazy / disk-to-disk.
+    leaves = packer.unpack_streaming(result, "store").collect()
+    print(f"Unpacked back to {leaves.height} store rows")
+
+
 def main():
     """Run all examples."""
     print("\n" + "=" * 80)
@@ -763,6 +802,9 @@ def main():
 
     # Part 9: Cross-level operations
     demonstrate_cross_level_operations()
+
+    # Part 10: Memory-bounded streaming pack/unpack
+    demonstrate_streaming_pack()
 
     print("\n" + "=" * 80)
     print("  ALL EXAMPLES COMPLETED SUCCESSFULLY!")

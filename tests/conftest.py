@@ -85,6 +85,12 @@ requires_group_by_maintain_order = pytest.mark.skipif(
     reason="group_by(maintain_order=True) requires Polars >= 0.19.0",
 )
 
+# pack_streaming(defer=True) needs pl.defer + collect(engine="streaming")
+requires_streaming_pack = pytest.mark.skipif(
+    not hasattr(pl, "defer") or polars_version_below("1.30.0"),
+    reason="pack_streaming requires pl.defer and collect(engine='streaming')",
+)
+
 
 # =============================================================================
 # Helper function for custom version requirements
