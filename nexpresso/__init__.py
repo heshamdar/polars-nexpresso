@@ -17,6 +17,7 @@ from nexpresso.hierarchical_packer import (
     HierarchyValidationError,
     LevelAttribute,
     LevelSpec,
+    ParentStrategy,
     PromoteAggregation,
     SchemaValidationResult,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "HierarchyValidationError",
     "LevelAttribute",
     "LevelSpec",
+    "ParentStrategy",
     "PromoteAggregation",
     "SchemaValidationResult",
     # Structuring utilities

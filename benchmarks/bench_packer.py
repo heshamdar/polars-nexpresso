@@ -14,7 +14,8 @@ from typing import Any
 
 import polars as pl
 
-from benchmarks.collect_utils import streaming_collect, streaming_collect_mode
+from benchmarks import strategies
+from benchmarks.collect_utils import streaming_collect
 from benchmarks.config import PRESETS, BenchmarkConfig
 from benchmarks.data_generator import IMAGE_SPEC, check_invariants, generate_leaf_dataframe
 from benchmarks.harness import (
@@ -40,6 +41,12 @@ def _parse_operations(raw: str | None) -> list[OperationName]:
     aliases = {
         "pack": "pack_to_image",
         "pack_streaming": "pack_streaming_to_image",
+        "pack_streaming_singlepass": "pack_streaming_singlepass",
+        "pack_singlepass": "pack_streaming_singlepass",
+        "pack_no_order": "pack_no_child_order",
+        "pack_no_child_order": "pack_no_child_order",
+        "pack_split_join": "pack_split_join",
+        "pack_splitjoin": "pack_split_join",
         "unpack": "unpack_to_patch",
         "roundtrip": "roundtrip",
         "pack_to_image": "pack_to_image",
@@ -54,7 +61,7 @@ def _parse_operations(raw: str | None) -> list[OperationName]:
         if name not in aliases:
             raise argparse.ArgumentTypeError(
                 f"Unknown operation {name!r}. Choose from: pack, pack_streaming, "
-                "unpack, roundtrip"
+                "pack_singlepass, pack_no_order, pack_split_join, unpack, roundtrip"
             )
         operations.append(aliases[name])  # type: ignore[arg-type]
     if not operations:
@@ -94,6 +101,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Root-key buckets for pack_streaming (more = lower peak memory).",
     )
     parser.add_argument(
+        "--parent-payload-pixels",
+        type=int,
+        help="Heavy per-image thumbnail payload (Float32 pixels) carried on every "
+        "leaf row. Makes split-and-join vs dedup meaningful.",
+    )
+    parser.add_argument(
+        "--parent-attr-count",
+        type=int,
+        help="Number of extra redundant scalar attributes at the image (root) level.",
+    )
+    parser.add_argument(
         "--operations",
         type=_parse_operations,
         help="Comma-separated operations: pack, unpack, roundtrip.",
@@ -126,6 +144,8 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
             args.payload_type,
             args.pixel_dtype,
             args.seed,
+            args.parent_payload_pixels,
+            args.parent_attr_count,
         )
     )
     if args.preset is not None:
@@ -151,6 +171,14 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         stream_partitions=(
             args.stream_partitions if args.stream_partitions is not None else base.stream_partitions
         ),
+        parent_payload_pixels=(
+            args.parent_payload_pixels
+            if args.parent_payload_pixels is not None
+            else base.parent_payload_pixels
+        ),
+        parent_attr_count=(
+            args.parent_attr_count if args.parent_attr_count is not None else base.parent_attr_count
+        ),
     )
 
 
@@ -170,6 +198,10 @@ def _run_invariant_checks(config: BenchmarkConfig, quiet: bool) -> float:
     packed_df = streaming_collect(packer.pack(leaf_df.lazy(), "image"))
     unpacked_df = streaming_collect(packer.unpack(packed_df.lazy(), "patch"))
     check_invariants(leaf_df, packed_df, unpacked_df, config)
+
+    # The experimental strategies must reproduce pack()'s contents exactly.
+    strategies.assert_strategies_match_pack(packer, leaf_df.lazy(), "image")
+
     _log(f"Invariant checks passed (data generation: {gen_elapsed:.3f}s)", quiet=quiet)
     return gen_elapsed
 
@@ -192,16 +224,39 @@ def _log_generation_memory_note(config: BenchmarkConfig, quiet: bool) -> None:
         )
 
 
-def _format_table(rows: list[dict[str, Any]]) -> str:
+def _add_baseline_ratios(rows: list[dict[str, Any]], baseline: str = "pack_to_image") -> bool:
+    """
+    Annotate rows with time/memory ratios relative to the baseline operation.
+
+    Returns:
+        True if the baseline was present and ratio columns were added.
+    """
+    base = next((r for r in rows if r["operation"] == baseline), None)
+    if base is None or len(rows) < 2:
+        return False
+
+    base_t = base["_median_s"]
+    base_m = base["_peak_rss_mb"]
+    for row in rows:
+        row["t_vs_pack"] = f"{row['_median_s'] / base_t:.2f}x" if base_t else "-"
+        row["mem_vs_pack"] = f"{row['_peak_rss_mb'] / base_m:.2f}x" if base_m else "-"
+    return True
+
+
+def _format_table(rows: list[dict[str, Any]], *, with_ratios: bool = False) -> str:
     """Format benchmark summary rows as a fixed-width table."""
-    headers = ["operation", "rows", "median_s", "min_s", "peak_rss_mb", "polars"]
+    headers = ["operation", "rows", "median_s", "min_s", "peak_rss_mb"]
+    if with_ratios:
+        headers += ["t_vs_pack", "mem_vs_pack"]
+    headers += ["polars"]
+
     col_widths = {header: len(header) for header in headers}
     for row in rows:
         for header in headers:
             col_widths[header] = max(col_widths[header], len(str(row.get(header, ""))))
 
     def fmt_row(values: dict[str, Any]) -> str:
-        return "  ".join(str(values[h]).ljust(col_widths[h]) for h in headers)
+        return "  ".join(str(values.get(h, "")).ljust(col_widths[h]) for h in headers)
 
     lines = [fmt_row({h: h for h in headers}), fmt_row({h: "-" * col_widths[h] for h in headers})]
     lines.extend(fmt_row(row) for row in rows)
@@ -215,7 +270,7 @@ def main(argv: list[str] | None = None) -> int:
     config = _config_from_args(args)
     operations = args.operations or list(DEFAULT_OPERATIONS)
 
-    _log(f"Polars {pl.__version__} (streaming via {streaming_collect_mode()})", quiet=args.quiet)
+    _log(f"Polars {pl.__version__} (streaming engine)", quiet=args.quiet)
     _log(f"Config: {config.label()}", quiet=args.quiet)
     _log(
         f"Leaf rows: {config.n_leaf_rows:,} | est. payload: {config.estimated_payload_mb:.1f} MB",
@@ -251,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
                 "min_s": f"{stats['min_elapsed_s']:.3f}",
                 "peak_rss_mb": f"{stats['max_peak_rss_mb']:.1f}",
                 "polars": pl.__version__,
+                "_median_s": stats["median_elapsed_s"],
+                "_peak_rss_mb": stats["max_peak_rss_mb"],
             }
         )
         if operation == "roundtrip" and repeats:
@@ -263,17 +320,22 @@ def main(argv: list[str] | None = None) -> int:
                     quiet=args.quiet,
                 )
 
-    _log("\n" + _format_table(summary_rows), quiet=args.quiet)
+    with_ratios = _add_baseline_ratios(summary_rows)
+    _log("\n" + _format_table(summary_rows, with_ratios=with_ratios), quiet=args.quiet)
+    if with_ratios:
+        _log("\n(t_vs_pack / mem_vs_pack are relative to pack_to_image)", quiet=args.quiet)
     if gen_elapsed:
         _log(f"\nParent invariant data generation: {gen_elapsed:.3f}s", quiet=args.quiet)
 
     if args.output is not None:
+        public_summary = [
+            {k: v for k, v in row.items() if not k.startswith("_")} for row in summary_rows
+        ]
         payload = {
             "config": asdict(config),
-            "streaming_collect_mode": streaming_collect_mode(),
             "data_generation_s": gen_elapsed,
             "results": [result.to_dict() for result in all_results],
-            "summary": summary_rows,
+            "summary": public_summary,
         }
         args.output.write_text(json.dumps(payload, indent=2))
         _log(f"\nWrote results to {args.output}", quiet=args.quiet)

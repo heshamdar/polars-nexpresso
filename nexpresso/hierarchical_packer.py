@@ -28,6 +28,7 @@ FrameT = TypeVar("FrameT", pl.LazyFrame, pl.DataFrame)
 
 ColumnSelector = str | pl.Expr
 ExtraColumnsMode = Literal["preserve", "drop", "error"]
+ParentStrategy = Literal["aggregate", "split_join"]
 PromoteAggregation = Literal[
     "list", "set", "sum", "mean", "min", "max", "first", "last", "count", "single"
 ]
@@ -943,6 +944,7 @@ class HierarchicalPacker:
         to_level: str,
         *,
         extra_columns: ExtraColumnsMode = "preserve",
+        parent_strategy: ParentStrategy = "aggregate",
     ) -> FrameT:
         """
         Pack flattened columns down to ``to_level`` so that rows represent the
@@ -956,6 +958,16 @@ class HierarchicalPacker:
                   within each group (default). Raises error if values differ.
                 - ``"drop"``: Silently drop extra columns.
                 - ``"error"``: Raise an error if any extra columns are present.
+            parent_strategy: How to carry the root level's own attribute columns:
+                - ``"aggregate"`` (default): collapse them through the pack
+                  ``group_by`` along with everything else. Best in the common case.
+                - ``"split_join"``: pull the root attributes into a small dimension
+                  table (unique per root key) and reattach them after packing only
+                  the structural and child columns. Equivalent in contents, and far
+                  cheaper *when the root attributes are heavy relative to the child
+                  data* (e.g. large per-entity blobs/embeddings replicated across
+                  every leaf row); for child-dominated data it adds join overhead
+                  for no gain. See ``benchmarks/README.md`` for measured trade-offs.
 
         Returns:
             Packed frame with nested structures, same type as input.
@@ -966,6 +978,9 @@ class HierarchicalPacker:
                 issues are detected, or if extra_columns="error" and extra columns
                 are present.
         """
+        if parent_strategy == "split_join":
+            return self._pack_split_join(frame, to_level, extra_columns=extra_columns)
+
         lf, added_cols, schema = self._prepare_frame(frame)
 
         # Identify and handle extra columns
@@ -994,6 +1009,67 @@ class HierarchicalPacker:
 
         lf = self._drop_internal_columns(lf)
         return self._match_frame_type(lf, frame)
+
+    def _root_attribute_columns(self, schema: pl.Schema) -> list[str]:
+        """
+        Columns owned by the root level itself: under the root prefix but not a
+        root id column and not part of any descendant level (or an internal column).
+        """
+        root = self._levels_meta[0]
+        child = self._levels_meta[1] if len(self._levels_meta) > 1 else None
+        id_columns = set(root.id_columns)
+
+        attrs: list[str] = []
+        for col in schema.keys():
+            if not col.startswith(root.prefix) or col in id_columns:
+                continue
+            if child is not None and col.startswith(child.prefix):
+                continue
+            if col == ROW_ID_COLUMN:
+                continue
+            attrs.append(col)
+        return attrs
+
+    def _pack_split_join(
+        self, frame: FrameT, to_level: str, *, extra_columns: ExtraColumnsMode
+    ) -> FrameT:
+        """
+        Pack while reattaching root-level attributes via a join instead of carrying
+        them through the aggregation. See :meth:`pack` (``parent_strategy``).
+        """
+        lf, _added, schema = self._prepare_frame(frame)
+        root = self._levels_meta[0]
+        root_keys: list[str] = list(root.id_columns)
+        attr_cols: list[str] = self._root_attribute_columns(schema)
+
+        # Nothing to split off → fall back to the standard aggregation pack.
+        if not root_keys or not attr_cols:
+            return self.pack(frame, to_level, extra_columns=extra_columns)
+
+        dim = lf.select([*root_keys, *attr_cols]).unique(subset=root_keys)
+        structural = lf.drop(*attr_cols)
+        packed = self._to_lazy(self.pack(structural, to_level, extra_columns=extra_columns))
+
+        if to_level != root.name:
+            # The root stays flat at the top, so a plain row join reattaches it.
+            result = packed.join(dim, on=root_keys, how="left")
+        else:
+            # Packing to the root collapses each entity into a single struct column;
+            # reattach the attributes as struct fields.
+            struct_col = root.path
+            prefix = root.prefix
+            key_exprs = [
+                pl.col(struct_col).struct.field(col[len(prefix) :]).alias(col) for col in root_keys
+            ]
+            field_exprs = [pl.col(col).alias(col[len(prefix) :]) for col in attr_cols]
+            result = (
+                packed.with_columns(key_exprs)
+                .join(dim, on=root_keys, how="left")
+                .with_columns(pl.col(struct_col).struct.with_fields(field_exprs))
+                .drop([*root_keys, *attr_cols])
+            )
+
+        return self._match_frame_type(result, frame)
 
     def unpack(self, frame: FrameT, to_level: str) -> FrameT:
         """

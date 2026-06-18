@@ -44,6 +44,7 @@ def pack(
     to_level: str,
     *,
     extra_columns: Literal["preserve", "drop", "error"] = "preserve",
+    parent_strategy: Literal["aggregate", "split_join"] = "aggregate",
 ) -> FrameT:
 ```
 
@@ -56,6 +57,7 @@ Pack flattened columns down to the specified level.
 | `frame` | `DataFrame \| LazyFrame` | The frame to pack |
 | `to_level` | `str` | Target level name |
 | `extra_columns` | `Literal["preserve", "drop", "error"]` | How to handle non-hierarchy columns |
+| `parent_strategy` | `Literal["aggregate", "split_join"]` | `"aggregate"` (default) carries root attributes through the `group_by`; `"split_join"` reattaches them via a join, far cheaper when root attributes are heavy relative to child data |
 
 **Returns:** Same type as input with nested structures
 
@@ -78,6 +80,9 @@ packed = packer.pack(flat_df, "country")
 
 # Drop extra columns
 packed = packer.pack(flat_df, "country", extra_columns="drop")
+
+# Reattach heavy root attributes via a join instead of the aggregation
+packed = packer.pack(flat_df, "country", parent_strategy="split_join")
 ```
 
 ---

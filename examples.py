@@ -772,6 +772,15 @@ def demonstrate_streaming_pack():
     leaves = packer.unpack_streaming(result, "store").collect()
     print(f"Unpacked back to {leaves.height} store rows")
 
+    # When the root level carries heavy attributes repeated across every leaf row,
+    # parent_strategy="split_join" reattaches them via a join instead of carrying
+    # them through the aggregation — identical results, cheaper for heavy roots.
+    flat_with_blob = flat.with_columns(
+        pl.col("region.id").alias("region.label"),
+    )
+    split_joined = packer.pack(flat_with_blob, "region", parent_strategy="split_join")
+    print(f"\nsplit_join pack produced {split_joined.height} region rows (same contents)")
+
 
 def main():
     """Run all examples."""

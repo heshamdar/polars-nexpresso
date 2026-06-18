@@ -230,6 +230,24 @@ More buckets means lower peak memory (and more temporary files). See
 [`benchmarks/`](benchmarks/) for a peak-RSS comparison of `pack` vs
 `pack_streaming`.
 
+### Heavy root attributes: `parent_strategy="split_join"`
+
+When the **root** level carries heavy attributes that repeat across every leaf row
+(e.g. a per-entity blob, thumbnail, or embedding), carrying them through the pack
+aggregation is wasteful. `pack(..., parent_strategy="split_join")` instead pulls
+those attributes into a small dimension table (unique per root key) and reattaches
+them after packing — identical results, but the heavy column is touched once per
+entity instead of once per leaf row.
+
+```python
+# Equivalent to the default pack, but far cheaper when root attributes dominate.
+packed = packer.pack(flat_df, "region", parent_strategy="split_join")
+```
+
+This wins big when root attributes are heavy relative to the child data (measured
+up to ~9x faster, half the memory); for child-dominated data it adds join overhead
+for no gain, so it is opt-in. See [`benchmarks/`](benchmarks/) for the trade-offs.
+
 > **Note on ordering:** packing no longer performs a global sort, so **top-level
 > row order is not guaranteed**. Child-list order is still preserved when
 > `preserve_child_order=True` (the default) or via a level's `order_by`.
@@ -261,7 +279,8 @@ Apply nested operations directly to a DataFrame.
 Main class for hierarchical operations.
 
 **Key Methods:**
-- `pack(frame, to_level)` - Pack to coarser granularity
+- `pack(frame, to_level, *, extra_columns="preserve", parent_strategy="aggregate")` - Pack to coarser granularity (`parent_strategy="split_join"` reattaches heavy root attributes via a join)
+- `pack_streaming(source, to_level, *, partitions=16, ...)` - Memory-bounded pack for large data
 - `unpack(frame, to_level)` - Unpack to finer granularity
 - `normalize(frame)` - Split into per-level tables
 - `denormalize(tables)` - Reconstruct from per-level tables

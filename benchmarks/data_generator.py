@@ -62,6 +62,49 @@ def _make_pixel_series(
     )
 
 
+def _make_parent_attribute_columns(
+    config: BenchmarkConfig,
+    rng: np.random.Generator,
+    image_idx: np.ndarray[Any, Any],
+) -> dict[str, pl.Series]:
+    """
+    Build heavy image-level (root) attribute columns.
+
+    Each value is generated once per image and broadcast across that image's leaf
+    rows, so it is highly redundant — exactly the case where carrying parent
+    attributes through the pack ``group_by`` is wasteful and a split-and-join may
+    pay off. Columns live under the ``image.`` prefix (but not ``image.tile.``) so
+    the packer treats them as image-level attributes with no spec change.
+
+    Args:
+        config: Benchmark configuration.
+        rng: Seeded NumPy random generator.
+        image_idx: Per-leaf-row image index used to broadcast per-image values.
+
+    Returns:
+        Mapping of qualified column name to its broadcast Series.
+    """
+    columns: dict[str, pl.Series] = {}
+
+    if config.parent_payload_pixels > 0:
+        per_image = rng.random((config.n_images, config.parent_payload_pixels), dtype=np.float32)
+        broadcast = per_image[image_idx]
+        columns["image.thumbnail"] = pl.Series(
+            "image.thumbnail",
+            broadcast,
+            dtype=pl.Array(pl.Float32(), config.parent_payload_pixels),
+        )
+
+    for attr in range(config.parent_attr_count):
+        per_image_attr = rng.integers(0, 1_000_000, size=config.n_images, dtype=np.int64)
+        columns[f"image.attr_{attr}"] = pl.Series(
+            f"image.attr_{attr}",
+            per_image_attr[image_idx],
+        )
+
+    return columns
+
+
 def generate_leaf_dataframe(config: BenchmarkConfig) -> pl.DataFrame:
     """
     Generate a flat leaf-level DataFrame for the image → tile → patch hierarchy.
@@ -94,17 +137,22 @@ def generate_leaf_dataframe(config: BenchmarkConfig) -> pl.DataFrame:
 
     pixel_series = _make_pixel_series(config, rng, n_leaf_rows)
 
-    return pl.DataFrame(
+    columns: dict[str, Any] = {
+        "image.id": [f"img-{i}" for i in image_idx],
+        "image.width": pl.Series(
+            "image.width",
+            np.full(n_leaf_rows, image_width, dtype=np.int32),
+        ),
+        "image.height": pl.Series(
+            "image.height",
+            np.full(n_leaf_rows, image_height, dtype=np.int32),
+        ),
+    }
+
+    columns.update(_make_parent_attribute_columns(config, rng, image_idx))
+
+    columns.update(
         {
-            "image.id": [f"img-{i}" for i in image_idx],
-            "image.width": pl.Series(
-                "image.width",
-                np.full(n_leaf_rows, image_width, dtype=np.int32),
-            ),
-            "image.height": pl.Series(
-                "image.height",
-                np.full(n_leaf_rows, image_height, dtype=np.int32),
-            ),
             "image.tile.id": [f"tile-{i}-{t}" for i, t in zip(image_idx, tile_idx, strict=True)],
             "image.tile.row": (tile_idx // tile_cols).astype(np.int32),
             "image.tile.col": (tile_idx % tile_cols).astype(np.int32),
@@ -116,6 +164,8 @@ def generate_leaf_dataframe(config: BenchmarkConfig) -> pl.DataFrame:
             PIXELS_COLUMN: pixel_series,
         }
     )
+
+    return pl.DataFrame(columns)
 
 
 def check_invariants(

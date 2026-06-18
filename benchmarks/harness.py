@@ -8,18 +8,29 @@ import statistics
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 import polars as pl
 import psutil  # type: ignore[import-untyped]
 
+from benchmarks import strategies
 from benchmarks.collect_utils import streaming_collect
 from benchmarks.config import BenchmarkConfig
 from benchmarks.data_generator import IMAGE_SPEC, generate_leaf_dataframe
 from nexpresso import HierarchicalPacker
 
-OperationName = Literal["pack_to_image", "pack_streaming_to_image", "unpack_to_patch", "roundtrip"]
+OperationName = Literal[
+    "pack_to_image",
+    "pack_streaming_to_image",
+    "pack_streaming_singlepass",
+    "pack_no_child_order",
+    "pack_split_join",
+    "unpack_to_patch",
+    "roundtrip",
+]
 
 
 @dataclass(frozen=True)
@@ -52,6 +63,15 @@ class _WorkerResult:
     error: str | None = None
 
 
+@dataclass
+class _Measurement:
+    """Mutable holder filled in by :func:`measure_peak_rss` on exit."""
+
+    elapsed_s: float = 0.0
+    peak_rss_mb: float = 0.0
+    sub_timings: dict[str, float] = field(default_factory=dict)
+
+
 def _bytes_to_mb(value: int) -> float:
     return value / (1024 * 1024)
 
@@ -68,14 +88,13 @@ def _monitor_peak_rss(
         stop_event.wait(interval_s)
 
 
-def _run_timed_collect(
-    lazy_frame: pl.LazyFrame,
-) -> tuple[pl.DataFrame, float, float]:
+@contextmanager
+def measure_peak_rss() -> Iterator[_Measurement]:
     """
-    Collect a LazyFrame with the streaming engine while tracking peak RSS.
+    Time a block while sampling peak process RSS in a background thread.
 
-    Returns:
-        Tuple of (result DataFrame, elapsed seconds, peak RSS in MB).
+    Yields a :class:`_Measurement` whose ``elapsed_s`` and ``peak_rss_mb`` are
+    populated when the ``with`` block exits.
     """
     gc.collect()
     baseline_rss = psutil.Process().memory_info().rss
@@ -88,16 +107,32 @@ def _run_timed_collect(
     )
     monitor.start()
 
+    measurement = _Measurement()
     start = time.perf_counter()
     try:
-        result = streaming_collect(lazy_frame)
+        yield measurement
     finally:
+        measurement.elapsed_s = time.perf_counter() - start
         stop_event.set()
         monitor.join(timeout=1.0)
+        measurement.peak_rss_mb = _bytes_to_mb(peak_holder[0])
 
-    elapsed = time.perf_counter() - start
-    peak_mb = _bytes_to_mb(peak_holder[0])
-    return result, elapsed, peak_mb
+
+def _run_timed_collect(lazy_frame: pl.LazyFrame) -> tuple[pl.DataFrame, float, float]:
+    """
+    Collect a LazyFrame with the streaming engine while tracking peak RSS.
+
+    Returns:
+        Tuple of (result DataFrame, elapsed seconds, peak RSS in MB).
+    """
+    with measure_peak_rss() as measurement:
+        result = streaming_collect(lazy_frame)
+    return result, measurement.elapsed_s, measurement.peak_rss_mb
+
+
+def _streaming_len(lazy_frame: pl.LazyFrame) -> None:
+    """Consume a LazyFrame via a streaming row count (never materializes rows)."""
+    lazy_frame.select(pl.len()).collect(engine="streaming")
 
 
 def _worker_entry(
@@ -114,50 +149,52 @@ def _worker_entry(
 
         if operation == "pack_to_image":
             _, elapsed, peak_mb = _run_timed_collect(packer.pack(leaf_lf, "image"))
-            result_queue.put(
-                asdict(
-                    _WorkerResult(
-                        elapsed_s=elapsed,
-                        peak_rss_mb=peak_mb,
-                    )
-                )
-            )
+            result_queue.put(asdict(_WorkerResult(elapsed_s=elapsed, peak_rss_mb=peak_mb)))
             return
 
-        if operation == "pack_streaming_to_image":
-            # Memory-bounded pack: partition by root key, sink each bucket, and
-            # consume the result via a streaming count so the full nested result
-            # is never materialized. Peak RSS reflects one bucket, not the dataset.
-            gc.collect()
-            baseline_rss = psutil.Process().memory_info().rss
-            peak_holder = [baseline_rss]
-            stop_event = threading.Event()
-            monitor = threading.Thread(
-                target=_monitor_peak_rss,
-                args=(peak_holder, stop_event),
-                daemon=True,
+        if operation == "pack_no_child_order":
+            unordered = HierarchicalPacker(
+                IMAGE_SPEC, validate_on_pack=False, preserve_child_order=False
             )
-            monitor.start()
-            start = time.perf_counter()
-            try:
-                tmp_dir = tempfile.mkdtemp(prefix="nexpresso_bench_")
-                packed_lf = packer.pack_streaming(
-                    leaf_lf,
-                    "image",
-                    partitions=config.stream_partitions,
-                    tmp_dir=tmp_dir,
-                    defer=False,
-                )
-                packed_lf.select(pl.len()).collect(engine="streaming")
-            finally:
-                stop_event.set()
-                monitor.join(timeout=1.0)
-            elapsed = time.perf_counter() - start
+            _, elapsed, peak_mb = _run_timed_collect(unordered.pack(leaf_lf, "image"))
+            result_queue.put(asdict(_WorkerResult(elapsed_s=elapsed, peak_rss_mb=peak_mb)))
+            return
+
+        if operation == "pack_split_join":
+            _, elapsed, peak_mb = _run_timed_collect(
+                strategies.pack_split_join(packer, leaf_lf, "image")
+            )
+            result_queue.put(asdict(_WorkerResult(elapsed_s=elapsed, peak_rss_mb=peak_mb)))
+            return
+
+        if operation in ("pack_streaming_to_image", "pack_streaming_singlepass"):
+            # Memory-bounded pack: partition by the root key, sink each bucket, and
+            # consume the result via a streaming count so the full nested result is
+            # never materialized. Peak RSS reflects one bucket, not the dataset.
+            tmp_dir = tempfile.mkdtemp(prefix="nexpresso_bench_")
+            with measure_peak_rss() as measurement:
+                if operation == "pack_streaming_to_image":
+                    packed_lf = packer.pack_streaming(
+                        leaf_lf,
+                        "image",
+                        partitions=config.stream_partitions,
+                        tmp_dir=tmp_dir,
+                        defer=False,
+                    )
+                else:
+                    packed_lf = strategies.pack_single_pass(
+                        packer,
+                        leaf_lf,
+                        "image",
+                        partitions=config.stream_partitions,
+                        tmp_dir=tmp_dir,
+                    )
+                _streaming_len(packed_lf)
             result_queue.put(
                 asdict(
                     _WorkerResult(
-                        elapsed_s=elapsed,
-                        peak_rss_mb=_bytes_to_mb(peak_holder[0]),
+                        elapsed_s=measurement.elapsed_s,
+                        peak_rss_mb=measurement.peak_rss_mb,
                     )
                 )
             )
@@ -166,48 +203,19 @@ def _worker_entry(
         if operation == "unpack_to_patch":
             packed_df, _, _ = _run_timed_collect(packer.pack(leaf_lf, "image"))
             gc.collect()
-            _, elapsed, peak_mb = _run_timed_collect(
-                packer.unpack(packed_df.lazy(), "patch"),
-            )
-            result_queue.put(
-                asdict(
-                    _WorkerResult(
-                        elapsed_s=elapsed,
-                        peak_rss_mb=peak_mb,
-                    )
-                )
-            )
+            _, elapsed, peak_mb = _run_timed_collect(packer.unpack(packed_df.lazy(), "patch"))
+            result_queue.put(asdict(_WorkerResult(elapsed_s=elapsed, peak_rss_mb=peak_mb)))
             return
 
         if operation == "roundtrip":
-            gc.collect()
-            baseline_rss = psutil.Process().memory_info().rss
-            peak_holder = [baseline_rss]
-            stop_event = threading.Event()
-            monitor = threading.Thread(
-                target=_monitor_peak_rss,
-                args=(peak_holder, stop_event),
-                daemon=True,
-            )
-            monitor.start()
-
-            total_start = time.perf_counter()
-            try:
+            with measure_peak_rss() as measurement:
                 packed_df, pack_elapsed, _ = _run_timed_collect(packer.pack(leaf_lf, "image"))
-                unpacked_df, unpack_elapsed, _ = _run_timed_collect(
-                    packer.unpack(packed_df.lazy(), "patch"),
-                )
-            finally:
-                stop_event.set()
-                monitor.join(timeout=1.0)
-
-            total_elapsed = time.perf_counter() - total_start
-            _ = unpacked_df
+                _, unpack_elapsed, _ = _run_timed_collect(packer.unpack(packed_df.lazy(), "patch"))
             result_queue.put(
                 asdict(
                     _WorkerResult(
-                        elapsed_s=total_elapsed,
-                        peak_rss_mb=_bytes_to_mb(peak_holder[0]),
+                        elapsed_s=measurement.elapsed_s,
+                        peak_rss_mb=measurement.peak_rss_mb,
                         pack_elapsed_s=pack_elapsed,
                         unpack_elapsed_s=unpack_elapsed,
                     )
