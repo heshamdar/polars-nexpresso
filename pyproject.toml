@@ -72,3 +72,7 @@ docs = [
     "mkdocstrings[python]>=0.26.0",
     "pymdown-extensions>=10.0.0",
 ]
+benchmark = [
+    "psutil>=6.0",
+    "numpy>=1.26",
+]
