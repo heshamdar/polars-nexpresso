@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        polars-version: ["1.20.0", "1.30.0", "1.35.1", "latest"]
+        polars-version: ["1.30.0", "1.35.1", "latest"]
 
     steps:
       - name: Checkout code
