@@ -44,6 +44,7 @@ def pack(
     to_level: str,
     *,
     extra_columns: Literal["preserve", "drop", "error"] = "preserve",
+    parent_strategy: Literal["aggregate", "split_join"] = "aggregate",
 ) -> FrameT:
 ```
 
@@ -56,12 +57,20 @@ Pack flattened columns down to the specified level.
 | `frame` | `DataFrame \| LazyFrame` | The frame to pack |
 | `to_level` | `str` | Target level name |
 | `extra_columns` | `Literal["preserve", "drop", "error"]` | How to handle non-hierarchy columns |
+| `parent_strategy` | `Literal["aggregate", "split_join"]` | `"aggregate"` (default) carries root attributes through the `group_by`; `"split_join"` reattaches them via a join, far cheaper when root attributes are heavy relative to child data |
 
 **Returns:** Same type as input with nested structures
 
 **Raises:**
 - `KeyError` - If level not found
 - `HierarchyValidationError` - If validation fails
+
+!!! note "Row order"
+    Packing does not perform a global sort, so **top-level row order is not
+    guaranteed**. Child-list order is preserved when `preserve_child_order=True`
+    (the default) or via a level's `order_by`. De-duplication and null handling
+    of parent attributes are independent of order. For very large inputs, see
+    [`pack_streaming`](#pack_streaming).
 
 **Example:**
 
@@ -71,6 +80,9 @@ packed = packer.pack(flat_df, "country")
 
 # Drop extra columns
 packed = packer.pack(flat_df, "country", extra_columns="drop")
+
+# Reattach heavy root attributes via a join instead of the aggregation
+packed = packer.pack(flat_df, "country", parent_strategy="split_join")
 ```
 
 ---
@@ -97,6 +109,94 @@ Unpack nested structures to the specified level.
 ```python
 # Unpack to street level
 flat = packer.unpack(packed_df, "street")
+```
+
+---
+
+### pack_streaming
+
+```python
+def pack_streaming(
+    self,
+    source: LazyFrame | DataFrame | str | Path,
+    to_level: str,
+    *,
+    partitions: int = 16,
+    tmp_dir: str | Path | None = None,
+    defer: bool = True,
+    extra_columns: Literal["preserve", "drop", "error"] = "preserve",
+) -> LazyFrame:
+```
+
+Memory-bounded version of [`pack`](#pack). `pack` aggregates with a `group_by`
+whose state holds every group in memory, so peak memory scales with the whole
+dataset even under the streaming engine. `pack_streaming` buckets the input by
+the **root-level key** (keeping each entity's rows together), packs each bucket
+independently while sinking it to Parquet, and returns a single `LazyFrame` over
+the packed output — bounding peak memory to one bucket.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `source` | `DataFrame \| LazyFrame \| str \| Path` | Input at the finest granularity. A path/glob is scanned lazily with `scan_parquet`. |
+| `to_level` | `str` | Target level name |
+| `partitions` | `int` | Number of root-key buckets. More buckets = lower peak memory and more temporary files. Must be ≥ 1. |
+| `tmp_dir` | `str \| Path \| None` | Directory for intermediate Parquet files. Defaults to a fresh temp directory the caller owns. |
+| `defer` | `bool` | When `True` (default), wraps the work in `pl.defer` so nothing runs until the result is collected. When `False`, sinks eagerly and returns a `scan_parquet` handle (downstream streams straight from disk). |
+| `extra_columns` | `Literal["preserve", "drop", "error"]` | How to handle non-hierarchy columns |
+
+**Returns:** A `LazyFrame` over the packed result. Top-level row order is not
+guaranteed; child-list order follows the same rules as [`pack`](#pack).
+
+**Example:**
+
+```python
+# Bound peak memory by processing the data in 32 root-key buckets.
+packed = packer.pack_streaming(flat_df, "region", partitions=32)
+
+# Returns a LazyFrame, so keep composing lazily:
+top = (
+    packer.pack_streaming("dump/*.parquet", "region", partitions=64)
+    .filter(pl.col("region.id").is_in(active_regions))
+    .collect(engine="streaming")
+)
+```
+
+---
+
+### unpack_streaming
+
+```python
+def unpack_streaming(
+    self,
+    source: LazyFrame | DataFrame | str | Path,
+    to_level: str,
+    *,
+    sink_path: str | Path | None = None,
+) -> LazyFrame:
+```
+
+Streaming-friendly version of [`unpack`](#unpack) that returns a `LazyFrame`.
+`unpack` (explode + unnest) already runs with bounded memory under the streaming
+engine; this helper accepts a Parquet path (scanned lazily) or a frame and keeps
+the pipeline lazy so it composes with downstream work or sinks straight to disk.
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `source` | `DataFrame \| LazyFrame \| str \| Path` | Packed input. A path/glob is scanned lazily. |
+| `to_level` | `str` | Target level name |
+| `sink_path` | `str \| Path \| None` | When given, the result is streamed to this Parquet path via `sink_parquet` and a fresh scan over it is returned. |
+
+**Returns:** A `LazyFrame` over the unpacked result.
+
+**Example:**
+
+```python
+# Disk-to-disk: scan a packed Parquet file, unpack, and sink the leaves.
+leaves = packer.unpack_streaming("packed.parquet", "store", sink_path="leaves.parquet")
 ```
 
 ---

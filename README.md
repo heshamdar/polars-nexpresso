@@ -98,6 +98,7 @@ packed = packer.pack(flat, "region")        # Aggregate back to region level
 |---------|-------------|
 | **Build from Tables** | Join normalized tables into nested hierarchy |
 | **Pack/Unpack** | Navigate between granularity levels |
+| **Streaming Pack/Unpack** | Memory-bounded `pack_streaming` / `unpack_streaming` for large data |
 | **Normalize/Denormalize** | Split into per-level tables and reconstruct |
 | **Validation** | Check for null keys and data integrity |
 | **Custom Separators** | Use any separator (default: `.`) |
@@ -196,6 +197,62 @@ tables = packer.normalize(nested_df)
 rebuilt = packer.denormalize(tables)
 ```
 
+### Memory-bounded packing for large data
+
+`pack` builds the nested result with a `group_by` whose state holds every group
+in memory, so peak memory scales with the whole dataset even under the streaming
+engine. For datasets that don't fit comfortably in RAM, `pack_streaming` buckets
+the input by the **root-level key** (keeping each entity's rows together), packs
+each bucket independently while sinking to Parquet, and returns a chainable
+`LazyFrame` — bounding peak memory to a single bucket.
+
+```python
+# Bound peak memory by processing the data in root-key buckets.
+# Accepts a DataFrame, LazyFrame, or a Parquet path/glob (scanned lazily).
+packed = packer.pack_streaming(flat_df, "region", partitions=32)
+
+# It returns a LazyFrame, so you can keep composing lazily:
+top = (
+    packer.pack_streaming("s3_dump/*.parquet", "region", partitions=64)
+    .filter(pl.col("region.id").is_in(active_regions))
+    .collect(engine="streaming")
+)
+
+# defer=False sinks eagerly and returns a scan handle so downstream work streams
+# straight from disk — safest when even the packed result is too big for RAM.
+handle = packer.pack_streaming(flat_df, "region", partitions=64, defer=False)
+
+# unpack already streams; unpack_streaming keeps it lazy / disk-to-disk.
+leaves = packer.unpack_streaming("packed.parquet", "store", sink_path="leaves.parquet")
+```
+
+More buckets means lower peak memory (and more temporary files). See
+[`benchmarks/`](benchmarks/) for a peak-RSS comparison of `pack` vs
+`pack_streaming`.
+
+### Heavy root attributes: `parent_strategy="split_join"`
+
+When the **root** level carries heavy attributes that repeat across every leaf row
+(e.g. a per-entity blob, thumbnail, or embedding), carrying them through the pack
+aggregation is wasteful. `pack(..., parent_strategy="split_join")` instead pulls
+those attributes into a small dimension table (unique per root key) and reattaches
+them after packing — identical results, but the heavy column is touched once per
+entity instead of once per leaf row.
+
+```python
+# Equivalent to the default pack, but far cheaper when root attributes dominate.
+packed = packer.pack(flat_df, "region", parent_strategy="split_join")
+```
+
+This wins big when root attributes are heavy relative to the child data (measured
+up to ~9x faster, half the memory); for child-dominated data it adds join overhead
+for no gain, so it is opt-in. See [`benchmarks/`](benchmarks/) for the trade-offs.
+
+> **Note on ordering:** packing no longer performs a global sort, so **top-level
+> row order is not guaranteed**. Child-list order is still preserved when
+> `preserve_child_order=True` (the default) or via a level's `order_by`.
+> De-duplication and null handling of parent attributes are unaffected.
+
 ## API Reference
 
 ### Nested Expressions
@@ -222,7 +279,8 @@ Apply nested operations directly to a DataFrame.
 Main class for hierarchical operations.
 
 **Key Methods:**
-- `pack(frame, to_level)` - Pack to coarser granularity
+- `pack(frame, to_level, *, extra_columns="preserve", parent_strategy="aggregate")` - Pack to coarser granularity (`parent_strategy="split_join"` reattaches heavy root attributes via a join)
+- `pack_streaming(source, to_level, *, partitions=16, ...)` - Memory-bounded pack for large data
 - `unpack(frame, to_level)` - Unpack to finer granularity
 - `normalize(frame)` - Split into per-level tables
 - `denormalize(tables)` - Reconstruct from per-level tables

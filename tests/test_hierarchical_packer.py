@@ -9,7 +9,6 @@ import pytest
 from polars.testing import assert_frame_equal
 
 from nexpresso.hierarchical_packer import (
-    DiscoveredLevel,
     HierarchicalPacker,
     HierarchySpec,
     HierarchyValidationError,
@@ -76,7 +75,10 @@ def _canonical_rows(df: FrameLike) -> list[str]:
 
 
 def _assert_same_rows(left: FrameLike, right: FrameLike):
-    assert_frame_equal(left, right)
+    # Top-level row order is not guaranteed after packing (the streaming-friendly
+    # group-by does not maintain order), so compare rows order-independently.
+    # Child-list order is preserved and still verified, since JSON keeps list order.
+    assert _canonical_rows(left) == _canonical_rows(right)
 
 
 def test_pack_unpack_roundtrip(packer, apartment_level_df):
@@ -86,6 +88,42 @@ def test_pack_unpack_roundtrip(packer, apartment_level_df):
     unpacked_df = packer.unpack(street_level_df, "apartment")
 
     _assert_same_rows(unpacked_df, apartment_level_df)
+
+
+@pytest.fixture()
+def apartment_level_df_with_root_attrs(apartment_level_df):
+    """Apartment-level data carrying redundant root-level (country) attributes."""
+    is_us = pl.col("country.code") == "US"
+    return apartment_level_df.with_columns(
+        pl.when(is_us)
+        .then(pl.lit("United States"))
+        .otherwise(pl.lit("Canada"))
+        .alias("country.name"),
+        pl.when(is_us).then(pl.lit(331)).otherwise(pl.lit(38)).alias("country.population"),
+    )
+
+
+@pytest.mark.parametrize("to_level", ["country", "street"])
+@pytest.mark.parametrize("lazy", [False, True])
+def test_pack_split_join_matches_aggregate(
+    packer, apartment_level_df_with_root_attrs, to_level, lazy
+):
+    frame = apartment_level_df_with_root_attrs
+    frame = frame.lazy() if lazy else frame
+
+    aggregated = packer.pack(frame, to_level)
+    split_joined = packer.pack(frame, to_level, parent_strategy="split_join")
+
+    assert isinstance(split_joined, pl.LazyFrame if lazy else pl.DataFrame)
+    _assert_same_rows(aggregated, split_joined)
+
+
+def test_pack_split_join_without_root_attrs_falls_back(packer, apartment_level_df):
+    # No root-level attributes → split_join is equivalent to the aggregate path.
+    aggregated = packer.pack(apartment_level_df, "street")
+    split_joined = packer.pack(apartment_level_df, "street", parent_strategy="split_join")
+
+    _assert_same_rows(aggregated, split_joined)
 
 
 def test_pack_handles_missing_country_code_alias(packer, apartment_level_df):
@@ -757,10 +795,22 @@ class TestPromoteAttribute:
         return pl.DataFrame(
             {
                 "country.code": ["US", "US", "US", "CA", "CA"],
-                "country.name": ["United States", "United States", "United States", "Canada", "Canada"],
+                "country.name": [
+                    "United States",
+                    "United States",
+                    "United States",
+                    "Canada",
+                    "Canada",
+                ],
                 "country.city.id": ["NYC", "NYC", "LA", "TOR", "TOR"],
                 "country.city.population": [8_000_000, 8_000_000, 4_000_000, 3_000_000, 3_000_000],
-                "country.city.street.name": ["Broadway", "5th Ave", "Sunset Blvd", "Queen St", "King St"],
+                "country.city.street.name": [
+                    "Broadway",
+                    "5th Ave",
+                    "Sunset Blvd",
+                    "Queen St",
+                    "King St",
+                ],
                 "country.city.street.length_km": [21.0, 10.0, 35.0, 5.0, 3.0],
             }
         )
@@ -801,7 +851,11 @@ class TestPromoteAttribute:
     def test_set_aggregation(self, promote_packer, promote_df):
         """Collect unique values."""
         result = promote_packer.promote_attribute(
-            promote_df, "id", from_level="city", to_level="country", agg="set",
+            promote_df,
+            "id",
+            from_level="city",
+            to_level="country",
+            agg="set",
             alias="city_ids",
         )
         assert "country.city_ids" in result.columns
@@ -823,8 +877,12 @@ class TestPromoteAttribute:
         r_max = promote_packer.promote_attribute(
             promote_df, "length_km", from_level="street", to_level="city", agg="max"
         )
-        nyc_min = r_min.filter(pl.col("country.city.id") == "NYC").select("country.city.length_km").item()
-        nyc_max = r_max.filter(pl.col("country.city.id") == "NYC").select("country.city.length_km").item()
+        nyc_min = (
+            r_min.filter(pl.col("country.city.id") == "NYC").select("country.city.length_km").item()
+        )
+        nyc_max = (
+            r_max.filter(pl.col("country.city.id") == "NYC").select("country.city.length_km").item()
+        )
         assert nyc_min == 10.0
         assert nyc_max == 21.0
 
@@ -832,20 +890,40 @@ class TestPromoteAttribute:
         result = promote_packer.promote_attribute(
             promote_df, "length_km", from_level="street", to_level="city", agg="count"
         )
-        nyc_count = result.filter(pl.col("country.city.id") == "NYC").select("country.city.length_km").item()
+        nyc_count = (
+            result.filter(pl.col("country.city.id") == "NYC")
+            .select("country.city.length_km")
+            .item()
+        )
         assert nyc_count == 2
 
     def test_first_last(self, promote_packer, promote_df):
         r_first = promote_packer.promote_attribute(
-            promote_df, "name", from_level="street", to_level="city", agg="first",
+            promote_df,
+            "name",
+            from_level="street",
+            to_level="city",
+            agg="first",
             alias="first_street",
         )
         r_last = promote_packer.promote_attribute(
-            promote_df, "name", from_level="street", to_level="city", agg="last",
+            promote_df,
+            "name",
+            from_level="street",
+            to_level="city",
+            agg="last",
             alias="last_street",
         )
-        nyc_first = r_first.filter(pl.col("country.city.id") == "NYC").select("country.city.first_street").item()
-        nyc_last = r_last.filter(pl.col("country.city.id") == "NYC").select("country.city.last_street").item()
+        nyc_first = (
+            r_first.filter(pl.col("country.city.id") == "NYC")
+            .select("country.city.first_street")
+            .item()
+        )
+        nyc_last = (
+            r_last.filter(pl.col("country.city.id") == "NYC")
+            .select("country.city.last_street")
+            .item()
+        )
         assert nyc_first == "Broadway"
         assert nyc_last == "5th Ave"
 
@@ -877,8 +955,12 @@ class TestPromoteAttribute:
     def test_alias_parameter(self, promote_packer, promote_df):
         """Custom alias for the output column."""
         result = promote_packer.promote_attribute(
-            promote_df, "length_km", from_level="street", to_level="city",
-            agg="sum", alias="total_street_length",
+            promote_df,
+            "length_km",
+            from_level="street",
+            to_level="city",
+            agg="sum",
+            alias="total_street_length",
         )
         assert "country.city.total_street_length" in result.columns
 
@@ -1220,6 +1302,7 @@ class TestAnyAllChildSatisfies:
         )
         assert isinstance(result, pl.LazyFrame)
 
+
 # =============================================================================
 # Usability Helper Tests
 # =============================================================================
@@ -1543,10 +1626,12 @@ class TestDiscoverLevels:
 
     def test_discover_custom_separator(self):
         """Discovery with non-default separator."""
-        schema = pl.Schema({
-            "region/code": pl.String,
-            "region/city/id": pl.String,
-        })
+        schema = pl.Schema(
+            {
+                "region/code": pl.String,
+                "region/city/id": pl.String,
+            }
+        )
         levels = HierarchicalPacker.discover_levels(schema, separator="/")
         names = [lvl.name for lvl in levels]
         assert names == ["region", "city"]
@@ -1554,16 +1639,20 @@ class TestDiscoverLevels:
     def test_discover_sibling_branches(self):
         """Struct with multiple List[Struct] fields (sibling branches)."""
         # A city with both "street" and "park" as List[Struct] children
-        schema = pl.Schema({
-            "city.name": pl.String,
-            "city": pl.List(
-                pl.Struct({
-                    "id": pl.String,
-                    "street": pl.List(pl.Struct({"name": pl.String})),
-                    "park": pl.List(pl.Struct({"name": pl.String, "area": pl.Float64})),
-                })
-            ),
-        })
+        schema = pl.Schema(
+            {
+                "city.name": pl.String,
+                "city": pl.List(
+                    pl.Struct(
+                        {
+                            "id": pl.String,
+                            "street": pl.List(pl.Struct({"name": pl.String})),
+                            "park": pl.List(pl.Struct({"name": pl.String, "area": pl.Float64})),
+                        }
+                    )
+                ),
+            }
+        )
         levels = HierarchicalPacker.discover_levels(schema)
         names = [lvl.name for lvl in levels]
         assert "city" in names
@@ -1607,9 +1696,11 @@ class TestDiscoverLevels:
     def test_discover_intermediate_levels_created(self):
         """Levels with no direct fields are still discovered as intermediates."""
         # Only leaf columns exist, but intermediate levels should be inferred
-        schema = pl.Schema({
-            "a.b.c.value": pl.Int64,
-        })
+        schema = pl.Schema(
+            {
+                "a.b.c.value": pl.Int64,
+            }
+        )
         levels = HierarchicalPacker.discover_levels(schema)
         names = [lvl.name for lvl in levels]
         assert "a" in names
@@ -1671,16 +1762,18 @@ class TestValidateSchema:
 
     def test_wrong_column_types(self, packer):
         """Columns with wrong types produce errors."""
-        schema = pl.Schema({
-            "country.code": pl.List(pl.String),  # Should be scalar
-            "country.city.id": pl.String,
-            "country.city.name": pl.String,
-            "country.city.street.name": pl.String,
-            "country.city.street.building.number": pl.Int64,
-            "country.city.street.building.id": pl.String,
-            "country.city.street.building.apartment.id": pl.String,
-            "country.city.street.building.apartment.area": pl.Float64,
-        })
+        schema = pl.Schema(
+            {
+                "country.code": pl.List(pl.String),  # Should be scalar
+                "country.city.id": pl.String,
+                "country.city.name": pl.String,
+                "country.city.street.name": pl.String,
+                "country.city.street.building.number": pl.Int64,
+                "country.city.street.building.id": pl.String,
+                "country.city.street.building.apartment.id": pl.String,
+                "country.city.street.building.apartment.area": pl.Float64,
+            }
+        )
         result = packer.validate_schema(schema)
         assert any("type" in e.lower() for e in result.errors)
 
@@ -1722,18 +1815,19 @@ class TestValidateSchema:
         """Packed struct missing expected key field produces error."""
         # Create a packed schema where we manually drop a key field from the struct
         # by constructing a schema with a malformed packed column
-        schema = pl.Schema({
-            "country.code": pl.String,
-            "country.city": pl.List(
-                pl.Struct({
-                    # "id" is missing — it's a key for city level
-                    "name": pl.String,
-                    "street": pl.List(pl.Struct({"name": pl.String})),
-                })
-            ),
-        })
-        result = packer.validate_schema(schema)
-        assert any(
-            "missing" in e.lower() and "key" in e.lower()
-            for e in result.errors
+        schema = pl.Schema(
+            {
+                "country.code": pl.String,
+                "country.city": pl.List(
+                    pl.Struct(
+                        {
+                            # "id" is missing — it's a key for city level
+                            "name": pl.String,
+                            "street": pl.List(pl.Struct({"name": pl.String})),
+                        }
+                    )
+                ),
+            }
         )
+        result = packer.validate_schema(schema)
+        assert any("missing" in e.lower() and "key" in e.lower() for e in result.errors)

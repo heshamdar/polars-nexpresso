@@ -21,8 +21,7 @@ import pytest
 
 # Polars versions to test against
 DEFAULT_VERSIONS = [
-    "1.20.0",  # Minimum supported version
-    "1.30.0",  # Intermediate version
+    "1.30.0",  # Supported version
     "1.35.1",  # Current minimum in pyproject.toml
     "latest",  # Latest available version
 ]

@@ -54,6 +54,23 @@ The script uses `uv` to dynamically create isolated environments for each Polars
 uv run python examples.py
 ```
 
+## Benchmarks
+
+Performance benchmarks for hierarchical pack/unpack live under `benchmarks/` and are separate from pytest.
+
+```bash
+# Install benchmark dependencies
+uv sync --group benchmark
+
+# Quick smoke run
+uv run python -m benchmarks.bench_packer --preset smoke
+
+# Compare performance across Polars versions
+uv run python -m benchmarks.benchmark_matrix --preset smoke
+```
+
+See [benchmarks/README.md](benchmarks/README.md) for presets, configuration options, and how to interpret timing/RSS results.
+
 ## Building for PyPI
 
 To build the package (without publishing):
