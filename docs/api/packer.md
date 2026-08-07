@@ -402,10 +402,39 @@ def split_levels(self, frame: FrameT) -> dict[str, FrameT]:
 
 Split a packed frame into standalone tables per level.
 
+Each table is **level-local**: it holds the level's own columns (id fields and
+attributes) plus the *key* columns of its ancestors, which serve as foreign keys
+back to the coarser tables. Coarser attributes are not copied into finer tables,
+and descendant columns are never included.
+
 **Parameters:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `frame` | `DataFrame \| LazyFrame` | Packed frame to split |
 
-**Returns:** Dictionary mapping level names to tables
+**Returns:** Dictionary mapping level names to tables, ordered root → leaf
+
+**Example:**
+
+For a `country → city → street` hierarchy:
+
+```python
+tables = packer.split_levels(packer.pack(flat_df, "country"))
+
+tables["country"].columns
+# ['country.code', 'country.name']
+
+tables["city"].columns
+# ['country.code', 'country.city.id', 'country.city.population']
+#   ^ foreign key   ^ own columns
+
+tables["street"].columns
+# ['country.code', 'country.city.id',
+#  'country.city.street.name', 'country.city.street.length']
+```
+
+Levels that are still flat in `frame` (e.g. `country` in a frame packed only to
+`city`) get their own deduplicated table too, so no attribute is dropped.
+`denormalize` accepts this shape and reattaches ancestor attributes when the
+target level is finer than the root.

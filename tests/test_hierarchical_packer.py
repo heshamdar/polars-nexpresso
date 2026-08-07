@@ -142,23 +142,75 @@ def test_split_levels_outputs_expected_tables(packer, apartment_level_df):
 
     split_tables = packer.split_levels(city_level_df)
 
-    assert set(split_tables.keys()) == {"city", "street", "building", "apartment"}
+    # ``country`` is still flat in a city-packed frame, but it is a hierarchy
+    # level and gets its own (deduplicated) table rather than riding along
+    # inside the finer tables.
+    assert set(split_tables.keys()) == {"country", "city", "street", "building", "apartment"}
 
-    apartment_table = split_tables["apartment"]
-    _assert_same_rows(apartment_table, apartment_level_df)
+    # Each table carries only its ancestors' *keys* plus its own columns.
+    assert split_tables["country"].columns == ["country.code"]
+    assert split_tables["city"].columns == [
+        "country.code",
+        "country.city.id",
+        "country.city.name",
+    ]
+    assert split_tables["street"].columns == [
+        "country.code",
+        "country.city.id",
+        "country.city.name",
+        "country.city.street.name",
+    ]
+    assert split_tables["building"].columns == [
+        "country.code",
+        "country.city.id",
+        "country.city.name",
+        "country.city.street.name",
+        "country.city.street.building.number",
+        "country.city.street.building.id",
+    ]
+    assert split_tables["apartment"].columns == [
+        "country.code",
+        "country.city.id",
+        "country.city.name",
+        "country.city.street.name",
+        "country.city.street.building.number",
+        "country.city.street.building.apartment.id",
+        "country.city.street.building.apartment.area",
+    ]
 
-    street_table = split_tables["street"]
-    assert all(not col.startswith("country.city.street.building") for col in street_table.columns)
-    expected_street_rows = apartment_level_df.select(
-        ["country.city.id", "country.city.street.name"]
-    ).unique()
-    assert street_table.height == expected_street_rows.height
-
-    city_table = split_tables["city"]
-    assert all(
-        col.startswith("country.") and not col.startswith("country.city.street")
-        for col in city_table.columns
+    # Row counts match the distinct entities at each level.
+    assert split_tables["country"].height == 2
+    assert split_tables["city"].height == 2
+    assert (
+        split_tables["street"].height
+        == apartment_level_df.select(["country.city.id", "country.city.street.name"]).n_unique()
     )
+    assert split_tables["apartment"].height == apartment_level_df.height
+
+
+def test_split_levels_excludes_coarser_attributes(packer, apartment_level_df_with_root_attrs):
+    """Coarser-level attributes stay in their own table, not in finer ones."""
+    packed = packer.pack(apartment_level_df_with_root_attrs, "country")
+    tables = packer.split_levels(packed)
+
+    country_table = tables["country"]
+    assert set(country_table.columns) == {"country.code", "country.name", "country.population"}
+    assert country_table.height == 2
+
+    for level in ("city", "street", "building", "apartment"):
+        assert "country.name" not in tables[level].columns
+        assert "country.population" not in tables[level].columns
+        # The foreign key back to the parent survives.
+        assert "country.code" in tables[level].columns
+
+
+def test_split_levels_lazy_stays_lazy(packer, apartment_level_df):
+    tables = packer.split_levels(packer.pack(apartment_level_df.lazy(), "country"))
+
+    assert all(isinstance(tbl, pl.LazyFrame) for tbl in tables.values())
+    eager = packer.split_levels(packer.pack(apartment_level_df, "country"))
+    for name, tbl in tables.items():
+        _assert_same_rows(tbl, eager[name])
 
 
 def test_normalize_matches_manual_split(packer, apartment_level_df):

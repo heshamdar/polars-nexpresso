@@ -23,7 +23,7 @@ from nexpresso.hierarchical_packer import (
 )
 from nexpresso.structuring_utils import convert_polars_schema, unnest_all, unnest_rename
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",

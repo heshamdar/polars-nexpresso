@@ -17,6 +17,9 @@ from polars.expr.expr import Expr
 
 from nexpresso.hierarchical_packer import FrameT
 
+#: Minimum Polars version that provides ``Expr.arr.eval()``.
+ARR_EVAL_MIN_VERSION = "1.35.1"
+
 
 @lru_cache(maxsize=1)
 def _polars_version() -> version.Version:
@@ -26,7 +29,7 @@ def _polars_version() -> version.Version:
 
 def _supports_arr_eval() -> bool:
     """Check if the current Polars version supports arr.eval()."""
-    return _polars_version() >= version.parse("1.35.1")
+    return _polars_version() >= version.parse(ARR_EVAL_MIN_VERSION)
 
 
 # Type aliases for better readability
@@ -145,8 +148,8 @@ class NestedExpressionBuilder:
         if isinstance(dtype, pl.Array):
             if not _supports_arr_eval():
                 raise ValueError(
-                    f"Array types require Polars >= 1.0.0 for arr.eval() support. "
-                    f"Current version: {pl.__version__}. "
+                    f"Array types require Polars >= {ARR_EVAL_MIN_VERSION} for "
+                    f"arr.eval() support. Current version: {pl.__version__}. "
                     "Workaround: Convert the Array to a List first using "
                     ".cast(pl.List(inner_type))."
                 )

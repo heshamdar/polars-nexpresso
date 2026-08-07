@@ -8,7 +8,7 @@ import json
 import polars as pl
 import pytest
 
-from nexpresso import HierarchicalPacker, HierarchySpec, LevelSpec
+from nexpresso import HierarchicalPacker, HierarchySpec, LevelSpec, hierarchical_packer
 from tests.conftest import requires_streaming_pack
 
 SPEC = HierarchySpec.from_levels(
@@ -191,6 +191,68 @@ def test_pack_streaming_to_intermediate_level(packer, flat_df):
 def test_pack_streaming_rejects_bad_partitions(packer, flat_df):
     with pytest.raises(ValueError, match="partitions must be >= 1"):
         packer.pack_streaming(flat_df, "country", partitions=0)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(lambda p, lf: p.pack(lf, "country"), id="pack"),
+        pytest.param(lambda p, lf: p.unpack(p.pack(lf, "country"), "street"), id="unpack"),
+        pytest.param(lambda p, lf: p.normalize(lf), id="normalize"),
+        pytest.param(lambda p, lf: p.split_levels(p.pack(lf, "country")), id="split_levels"),
+        pytest.param(lambda p, lf: p.denormalize(p.normalize(lf)), id="denormalize"),
+        pytest.param(
+            lambda p, lf: p.promote_attribute(
+                lf, "id", from_level="street", to_level="city", agg="count"
+            ),
+            id="promote_attribute",
+        ),
+    ],
+)
+def test_lazy_operations_do_not_execute(packer, flat_df, monkeypatch, operation):
+    """Lazy input must produce a lazy plan without any hidden ``collect()``.
+
+    ``collect_schema()`` is fine (metadata only); an actual ``collect()`` would
+    materialize data behind the caller's back and break streaming pipelines.
+    """
+    executed: list[int] = []
+    original = pl.LazyFrame.collect
+
+    def spy(self, *args, **kwargs):
+        executed.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pl.LazyFrame, "collect", spy)
+    operation(packer, flat_df.lazy())
+
+    assert not executed, "operation executed the query instead of staying lazy"
+
+
+@requires_streaming_pack
+def test_pack_streaming_bucketing_paths_agree(packer, flat_df, tmp_path, monkeypatch):
+    """The single-pass partitioned sink and the per-bucket filter fallback agree."""
+    ref = packer.pack(flat_df, "country")
+
+    fast_dir = tmp_path / "fast"
+    fast = packer.pack_streaming(flat_df, "country", partitions=4, tmp_dir=fast_dir, defer=False)
+
+    monkeypatch.setattr(hierarchical_packer, "_supports_partitioned_sink", lambda: False)
+    slow_dir = tmp_path / "slow"
+    slow = packer.pack_streaming(flat_df, "country", partitions=4, tmp_dir=slow_dir, defer=False)
+
+    assert _same(fast, ref)
+    assert _same(slow, ref)
+    # The staging area used by the partitioned sink is cleaned up.
+    assert not (fast_dir / "_stage").exists()
+
+
+@requires_streaming_pack
+def test_pack_streaming_keeps_entities_whole(packer, flat_df):
+    """Every root entity ends up in exactly one output row, never split across buckets."""
+    out = packer.pack_streaming(flat_df, "country", partitions=32).collect()
+    codes = out["country"].struct.field("id").to_list()
+    assert sorted(codes) == sorted(set(codes))
+    assert len(codes) == packer.pack(flat_df, "country").height
 
 
 # =============================================================================
