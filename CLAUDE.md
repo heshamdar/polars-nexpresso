@@ -2,8 +2,8 @@
 
 This document provides comprehensive guidance for AI assistants working with the polars-nexpresso codebase. It covers architecture, conventions, workflows, and best practices.
 
-**Last Updated:** 2026-03-18
-**Version:** 0.2.0
+**Last Updated:** 2026-08-07
+**Version:** 0.4.0
 
 ---
 
@@ -52,7 +52,7 @@ polars-nexpresso/
 │   ├── __init__.py                   # Public API exports
 │   ├── expressions.py                # Nested expression builder
 │   ├── hierarchical_packer.py        # Hierarchical data operations
-│   ├── nexpresso.py                  # Legacy module (expressions alias)
+│   ├── nexpresso.py                  # Deprecated re-export shim for expressions.py
 │   ├── structuring_utils.py          # Utility functions
 │   └── py.typed                      # PEP 561 marker for type checking
 ├── tests/                            # Test suite
@@ -63,22 +63,30 @@ polars-nexpresso/
 │   ├── test_integration.py           # Integration tests
 │   ├── test_matrix.py                # Multi-version test runner
 │   ├── test_nested_helper.py         # Nested expression tests
+│   ├── test_streaming.py             # Lazy-purity & streaming/pack_streaming tests
 │   └── test_structuring_utils.py     # Utility tests
+├── benchmarks/                       # Performance benchmarks
+│   ├── README.md                     # Measured trade-offs (e.g. parent_strategy)
+│   ├── bench_packer.py               # HierarchicalPacker benchmarks
+│   ├── benchmark_matrix.py           # Multi-version benchmark runner
+│   └── ...                           # Harness, config, data generation
 ├── docs/                             # MkDocs documentation
 │   ├── api/                          # API reference
-│   ├── concepts/                     # Conceptual guides
+│   ├── concepts/                     # Conceptual guides (incl. lazy-and-streaming.md)
 │   ├── guides/                       # How-to guides
 │   ├── index.md                      # Documentation home
 │   ├── getting-started.md
 │   └── examples.md
 ├── .github/workflows/
-│   ├── test.yml                      # CI test workflow
+│   ├── test.yml                      # CI: lint/type job + Polars test matrix
 │   └── publish.yml                   # PyPI publish workflow
 ├── examples.py                       # Comprehensive examples
 ├── pyproject.toml                    # Project metadata & config
 ├── pytest.ini                        # Pytest configuration
 ├── mkdocs.yml                        # MkDocs configuration
 ├── uv.lock                           # Locked dependencies
+├── MANIFEST.in                       # sdist packaging rules
+├── .python-version                   # Default Python for uv
 ├── README.md                         # User-facing documentation
 ├── SETUP.md                          # Development setup guide
 └── LICENSE                           # MIT License
@@ -90,9 +98,12 @@ polars-nexpresso/
 |------|---------|
 | `nexpresso/expressions.py` | Core nested expression building logic |
 | `nexpresso/hierarchical_packer.py` | Hierarchical data pack/unpack operations |
+| `nexpresso/structuring_utils.py` | Schema conversion and recursive unnesting helpers |
 | `nexpresso/__init__.py` | Public API surface (what users import) |
 | `tests/conftest.py` | Shared test fixtures and version utilities |
 | `tests/test_matrix.py` | Multi-version compatibility testing |
+| `tests/test_streaming.py` | Lazy-contract and streaming/`pack_streaming` tests |
+| `docs/concepts/lazy-and-streaming.md` | Which ops stream natively vs. fall back |
 | `pyproject.toml` | Package metadata, dependencies, tool config |
 | `examples.py` | Runnable examples demonstrating features |
 

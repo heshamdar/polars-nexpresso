@@ -212,7 +212,9 @@ def normalize(
 ) -> dict[str, FrameT]:
 ```
 
-Split a frame into separate tables per hierarchy level.
+Split a frame into separate tables per hierarchy level. Thin wrapper: packs to
+`root_level` and hands the result to [`split_levels`](#split_levels), so the
+emitted tables have exactly that method's level-local shape.
 
 **Parameters:**
 
@@ -221,14 +223,24 @@ Split a frame into separate tables per hierarchy level.
 | `frame` | `DataFrame \| LazyFrame` | The frame to normalize |
 | `root_level` | `str \| None` | Pack to this level first (default: first level) |
 
-**Returns:** Dictionary mapping level names to tables
+**Returns:** Dictionary mapping level names to tables, ordered root → leaf
 
 **Example:**
 
 ```python
 tables = packer.normalize(nested_df)
-# {"country": country_df, "city": city_df, "street": street_df}
+
+tables["country"].columns
+# ['country.code', 'country.name']
+
+tables["city"].columns
+# ['country.code', 'country.city.id', 'country.city.population']
+#   ^ foreign key   ^ own columns only — no country.name
 ```
+
+Each table holds its own columns plus its ancestors' **key** columns. Coarser
+attributes are not duplicated into finer tables; join them back from the coarser
+table when you need them.
 
 ---
 
@@ -243,7 +255,15 @@ def denormalize(
 ) -> DataFrame | LazyFrame:
 ```
 
-Reconstruct nested structure from per-level tables.
+Reconstruct nested structure from per-level tables — the inverse of
+[`normalize`](#normalize), and it accepts exactly the level-local shape that
+`normalize` / [`split_levels`](#split_levels) emit.
+
+Child levels are attached to their parents as nested list-of-struct columns,
+walking leaf → root. When `target_level` is finer than the root, the ancestors'
+attribute columns are joined back on afterwards (the upward pass only ever
+attaches descendants), so the result matches `pack(flat_df, target_level)`
+exactly.
 
 **Parameters:**
 
@@ -257,8 +277,23 @@ Reconstruct nested structure from per-level tables.
 **Example:**
 
 ```python
-nested = packer.denormalize({"country": ..., "city": ..., "street": ...})
+tables = packer.normalize(nested_df)
+
+# Any level below the root reproduces pack() exactly
+streets = packer.denormalize(tables, target_level="street")
+assert streets.equals(packer.pack(flat_df, "street"))
+
+nested = packer.denormalize(tables)   # default: back to the root level
 ```
+
+!!! note "The root level stays flat"
+    At the **root**, `denormalize` leaves the root's own columns as top-level
+    columns alongside the nested child list — `country.code`, `country.name`,
+    `country.city` — whereas `pack(flat_df, "country")` folds them into a single
+    `country` struct column. The contents are the same and `unpack` accepts
+    either, but the two are not column-for-column identical. Pass an explicit
+    `target_level` below the root, or re-`pack` the result, if you need the
+    struct form.
 
 ---
 

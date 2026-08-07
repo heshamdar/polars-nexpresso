@@ -20,10 +20,13 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 import polars as pl
 from polars.expr.expr import Expr
+
+if TYPE_CHECKING:
+    from polars._typing import PolarsDataType
 
 FrameT = TypeVar("FrameT", pl.LazyFrame, pl.DataFrame)
 
@@ -1360,6 +1363,16 @@ class HierarchicalPacker:
         Returns:
             Dictionary mapping level names to their respective tables, ordered
             root → leaf. Each table has the same type as ``frame``.
+
+        Note:
+            The returned plans all branch off the same upstream pipeline. With a
+            LazyFrame input, collect them together rather than one at a time so
+            the shared work runs once::
+
+                tables = packer.split_levels(lazy_packed)
+                frames = dict(zip(tables, pl.collect_all(list(tables.values()))))
+
+            Eager input already does this internally.
         """
         lf, added_cols, schema = self._prepare_frame(frame)
 
@@ -1409,7 +1422,12 @@ class HierarchicalPacker:
             outputs[level.name] = output_table
 
         if isinstance(frame, pl.DataFrame):
-            return {name: tbl.collect() for name, tbl in outputs.items()}  # type: ignore[misc]
+            # Every level's plan branches off the same progressive-unpack chain, so
+            # collecting them one by one re-executes that shared work per level.
+            # ``collect_all`` runs them as a single graph instead.
+            names = list(outputs)
+            collected = pl.collect_all([outputs[name] for name in names])
+            return dict(zip(names, collected))  # type: ignore[return-value]
         return outputs  # type: ignore[return-value]
 
     def normalize(self, frame: FrameT, *, root_level: str | None = None) -> dict[str, FrameT]:
@@ -1417,12 +1435,17 @@ class HierarchicalPacker:
         Convenience wrapper that packs to the root level and splits into
         normalized per-level tables.
 
+        The emitted tables have :meth:`split_levels`' level-local shape: each
+        level's own columns plus its ancestors' key columns as foreign keys, with
+        no coarser attributes duplicated into the finer tables.
+
         Args:
             frame: The DataFrame or LazyFrame to normalize.
             root_level: Optional root level to pack to (defaults to first level).
 
         Returns:
-            Dictionary mapping level names to their respective normalized tables.
+            Dictionary mapping level names to their respective normalized tables,
+            ordered root → leaf.
         """
         target = root_level or self._levels_meta[0].name
         packed = self.pack(frame, target)
@@ -2225,6 +2248,10 @@ class HierarchicalPacker:
         Filter a packed frame to rows where **at least one** child satisfies a
         condition.
 
+        Entities with no children are filtered out — nothing can satisfy the
+        condition. This holds for both an empty and a null child list, and is
+        the mirror image of :meth:`all_children_satisfy`, where both cases pass.
+
         The frame must be packed at ``to_level`` granularity so that
         ``from_level`` data is accessible as a nested list-of-struct column.
         ``from_level`` must be the immediate child of ``to_level``.
@@ -2288,7 +2315,14 @@ class HierarchicalPacker:
         Filter a packed frame to rows where **every** child satisfies a
         condition.
 
-        Entities with no children pass the filter (vacuous truth).
+        Entities with no children pass the filter (vacuous truth). That covers
+        both an empty child list and a **null** child list — the latter is what
+        a ``left`` join produces for a parent with no matching children.
+
+        A child whose ``condition`` evaluates to *null* (typically a null
+        attribute) counts as **not** satisfying it, so the entity is filtered
+        out. Unknown is not treated as true; guard the condition explicitly
+        (e.g. ``.fill_null(True)``) if you want the opposite.
 
         The frame must be packed at ``to_level`` granularity so that
         ``from_level`` data is accessible as a nested list-of-struct column.
@@ -2339,7 +2373,11 @@ class HierarchicalPacker:
         from_meta = self._levels_meta[from_idx]
         child_col = pl.col(from_meta.path)
         evaluated = child_col.list.eval(condition.cast(pl.UInt8))
-        mask = evaluated.list.sum() == child_col.list.len()
+        # A null child list yields null on both sides, and `filter` drops null
+        # masks — so vacuous truth needs an explicit branch. An *empty* list
+        # already passes (0 == 0). `sum()` skips nulls, so a null condition
+        # result makes the count fall short and the entity is filtered out.
+        mask = child_col.is_null() | (evaluated.list.sum() == child_col.list.len())
         lf = self._to_lazy(frame).filter(mask)
         return self._match_frame_type(lf, frame)
 
@@ -2557,8 +2595,9 @@ class HierarchicalPacker:
             return lf, schema
         lf = lf.with_row_index(ROW_ID_COLUMN)
         # with_row_index always prepends a UInt32 column — no need to re-collect schema.
-        new_schema = pl.Schema({ROW_ID_COLUMN: pl.UInt32, **schema})
-        return lf, new_schema
+        fields: dict[str, PolarsDataType] = {ROW_ID_COLUMN: pl.UInt32}
+        fields.update(schema)
+        return lf, pl.Schema(fields)
 
     def _ensure_key_columns(
         self, lf: pl.LazyFrame, schema: pl.Schema
@@ -2943,7 +2982,9 @@ class HierarchicalPacker:
             Tuple of (processed LazyFrame, updated schema).
         """
         dtype = schema[meta.path]
-        if getattr(dtype, "base_type", lambda: None)() == pl.List:
+        # ``pack`` always produces List, but a caller may hand us data whose level
+        # column was cast to a fixed-size Array; ``explode`` handles both.
+        if isinstance(dtype, (pl.List, pl.Array)):
             lf = lf.explode(meta.path)
 
         lf = lf.with_columns(
@@ -3104,7 +3145,9 @@ if __name__ == "__main__":
     print("\nBuilt nested hierarchy:")
     print(nested)
 
-    # Unpack to see the joined data
+    # Unpack to see the joined data. build_from_tables returns the union type
+    # LazyFrame | DataFrame; the inputs here are eager, so narrow it.
+    assert isinstance(nested, pl.DataFrame)
     all_employees = relational_packer.unpack(nested, "employee")
     print("\nUnpacked to employee level (all data joined):")
     print(all_employees)

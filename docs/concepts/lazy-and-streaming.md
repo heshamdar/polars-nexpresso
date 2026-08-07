@@ -25,6 +25,20 @@ moves no data.
 | `validate` | — | **Yes** — one `collect()`, by definition |
 | `pack_streaming` | ✅ (returns `LazyFrame`) | Sinks to Parquet when `defer=False` |
 
+!!! tip "Collect a dict of frames in one call"
+    `split_levels` / `normalize` return one `LazyFrame` per level, and every one
+    of them branches off the same upstream pipeline. Collecting them one at a
+    time re-executes that shared work per level; `pl.collect_all` runs them as a
+    single graph:
+
+    ```python
+    tables = packer.normalize(lazy_df)
+    frames = dict(zip(tables, pl.collect_all(list(tables.values()))))
+    ```
+
+    Measured 1.3–1.7× faster on a 300k-row three-level frame. Eager input
+    already does this internally.
+
 !!! warning "`validate_on_pack` is eager-only"
     The uniformity check inside `pack` has to execute the query to see the data,
     so running it on a `LazyFrame` would break the lazy contract. It is therefore

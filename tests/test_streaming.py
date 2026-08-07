@@ -210,22 +210,32 @@ def test_pack_streaming_rejects_bad_partitions(packer, flat_df):
     ],
 )
 def test_lazy_operations_do_not_execute(packer, flat_df, monkeypatch, operation):
-    """Lazy input must produce a lazy plan without any hidden ``collect()``.
+    """Lazy input must produce a lazy plan without any hidden execution.
 
-    ``collect_schema()`` is fine (metadata only); an actual ``collect()`` would
-    materialize data behind the caller's back and break streaming pipelines.
+    ``collect_schema()`` is fine (metadata only); actually executing the plan
+    would materialize data behind the caller's back and break streaming
+    pipelines. Both entry points are watched: ``LazyFrame.collect`` and the
+    module-level ``pl.collect_all`` (which ``split_levels`` uses for eager input
+    and which a method-level spy would not catch).
     """
-    executed: list[int] = []
-    original = pl.LazyFrame.collect
+    executed: list[str] = []
 
-    def spy(self, *args, **kwargs):
-        executed.append(1)
-        return original(self, *args, **kwargs)
+    original_collect = pl.LazyFrame.collect
+    original_collect_all = pl.collect_all
 
-    monkeypatch.setattr(pl.LazyFrame, "collect", spy)
+    def spy_collect(self, *args, **kwargs):
+        executed.append("LazyFrame.collect")
+        return original_collect(self, *args, **kwargs)
+
+    def spy_collect_all(*args, **kwargs):
+        executed.append("collect_all")
+        return original_collect_all(*args, **kwargs)
+
+    monkeypatch.setattr(pl.LazyFrame, "collect", spy_collect)
+    monkeypatch.setattr(pl, "collect_all", spy_collect_all)
     operation(packer, flat_df.lazy())
 
-    assert not executed, "operation executed the query instead of staying lazy"
+    assert not executed, f"operation executed the query instead of staying lazy: {executed}"
 
 
 @requires_streaming_pack

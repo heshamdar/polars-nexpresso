@@ -103,7 +103,8 @@ result = packer.pack(active_stores, "region")
 ### Split, Transform, Rejoin
 
 ```python
-# Split into separate tables
+# Split into separate tables. Each table holds its own columns plus the *key*
+# columns of its ancestors — coarser attributes stay in their own table.
 tables = packer.normalize(nested)
 
 # Transform individual tables
@@ -113,6 +114,18 @@ tables["product"] = tables["product"].with_columns([
 
 # Reconstruct
 rebuilt = packer.denormalize(tables)
+```
+
+If a transform needs an attribute from a coarser level, join it in from that
+level's table using the ancestor key that is already present:
+
+```python
+# tables["product"] carries store.id as a foreign key, but not store.tier
+tables["product"] = tables["product"].join(
+    tables["store"].select(["store.id", "store.tier"]),
+    on="store.id",
+    how="left",
+)
 ```
 
 ### Handling Missing Children

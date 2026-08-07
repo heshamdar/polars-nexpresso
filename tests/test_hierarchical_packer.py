@@ -90,6 +90,29 @@ def test_pack_unpack_roundtrip(packer, apartment_level_df):
     _assert_same_rows(unpacked_df, apartment_level_df)
 
 
+def test_unpack_handles_fixed_size_array_level(packer, apartment_level_df):
+    """A level column cast to a fixed-size Array still explodes.
+
+    ``pack`` only ever produces ``List``, but a caller may narrow a level column
+    to ``Array`` (e.g. after a round-trip through a format with fixed-size
+    lists). The dtype check must not silently skip the explode.
+    """
+    packed = packer.pack(apartment_level_df, "apartment")
+    col = "country.city.street.building.apartment"
+    inner = packed.schema[col].inner
+    # Every building in the fixture has exactly one apartment here except 100,
+    # so pick a building with a stable child count to cast against.
+    single = packed.filter(pl.col(col).list.len() == 1)
+    as_array = single.with_columns(pl.col(col).cast(pl.Array(inner, 1)))
+    assert isinstance(as_array.schema[col], pl.Array)
+
+    unpacked = packer.unpack(as_array, "apartment")
+
+    assert unpacked.height == single.height
+    assert "country.city.street.building.apartment.id" in unpacked.columns
+    _assert_same_rows(unpacked, packer.unpack(single, "apartment"))
+
+
 @pytest.fixture()
 def apartment_level_df_with_root_attrs(apartment_level_df):
     """Apartment-level data carrying redundant root-level (country) attributes."""
@@ -1353,6 +1376,70 @@ class TestAnyAllChildSatisfies:
             condition=pl.element().struct.field("population") > 5_000_000,
         )
         assert isinstance(result, pl.LazyFrame)
+
+    # ------------------------------------------------------------------
+    # Childless entities: empty vs null child lists
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _childless_frame() -> pl.DataFrame:
+        """Packed country frame covering every childless / null-attribute shape.
+
+        Built directly rather than via ``pack`` so the empty-list and null-list
+        cases can both be represented — ``pack`` only ever produces non-empty
+        lists.
+        """
+        child = pl.List(pl.Struct({"id": pl.String, "population": pl.Int64}))
+        return pl.DataFrame(
+            {
+                "country.code": ["PASS", "FAIL", "EMPTY", "NULL", "NULLATTR"],
+                "country.city": [
+                    [{"id": "a", "population": 20_000}],  # all children pass
+                    [{"id": "b", "population": 20_000}, {"id": "c", "population": 1}],
+                    [],  # no children (empty list)
+                    None,  # no children (null list, e.g. from a left join)
+                    [{"id": "d", "population": None}],  # condition evaluates to null
+                ],
+            },
+            schema={"country.code": pl.String, "country.city": child},
+        )
+
+    def _codes(self, frame: pl.DataFrame) -> list[str]:
+        return sorted(frame.select("country.code").to_series().to_list())
+
+    def test_all_children_satisfy_childless_entities_pass(self, cl_packer):
+        """Empty *and* null child lists both pass (vacuous truth)."""
+        result = cl_packer.all_children_satisfy(
+            self._childless_frame(),
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 10_000,
+        )
+        assert self._codes(result) == ["EMPTY", "NULL", "PASS"]
+
+    def test_any_child_satisfies_childless_entities_dropped(self, cl_packer):
+        """Empty and null child lists are dropped — nothing can satisfy."""
+        result = cl_packer.any_child_satisfies(
+            self._childless_frame(),
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 10_000,
+        )
+        assert self._codes(result) == ["FAIL", "PASS"]
+
+    def test_null_condition_result_counts_as_unsatisfied(self, cl_packer):
+        """A child whose condition evaluates to null does not satisfy it."""
+        frame = self._childless_frame()
+        condition = pl.element().struct.field("population") > 10_000
+
+        all_result = cl_packer.all_children_satisfy(
+            frame, from_level="city", to_level="country", condition=condition
+        )
+        any_result = cl_packer.any_child_satisfies(
+            frame, from_level="city", to_level="country", condition=condition
+        )
+        assert "NULLATTR" not in self._codes(all_result)
+        assert "NULLATTR" not in self._codes(any_result)
 
 
 # =============================================================================
