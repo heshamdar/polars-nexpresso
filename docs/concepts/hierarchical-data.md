@@ -200,6 +200,59 @@ tables = packer.normalize(nested_df)
 rebuilt = packer.denormalize(tables)
 ```
 
+`denormalize` is a true inverse of `normalize` — for any level `L`:
+
+```python
+packer.denormalize(packer.normalize(df, root_level=L), target_level=L) == packer.pack(df, L)
+```
+
+### The shape of the per-level tables
+
+Each table is **level-local**. It holds that level's own columns — its id fields
+and its attributes — plus the **key** columns of its ancestors, which act as
+foreign keys back to the coarser tables. Attributes belonging to a coarser level
+are not duplicated into the finer tables, and descendant columns are never
+included:
+
+```text
+country : country.code, country.name
+city    : country.code, country.city.id, country.city.population
+          ^ foreign key  ^ own columns
+street  : country.code, country.city.id,
+          country.city.street.name, country.city.street.length
+```
+
+This is the classic normalized layout: each fact is stored once, at the level it
+belongs to, and the ancestor keys are what let you join back. `denormalize` and
+`build_from_tables` both expect this shape.
+
+A level that is still flat in the input — `country` in a frame packed only to
+`city`, say — gets its own deduplicated table too, so no attribute is dropped on
+the way out.
+
+To get a coarser attribute alongside finer rows, join it back explicitly, or
+reach for [`enrich` / `attribute_expr`](../api/packer.md) which navigate the
+nested structure directly:
+
+```python
+cities_with_country_name = tables["city"].join(
+    tables["country"].select(["country.code", "country.name"]),
+    on="country.code",
+    how="left",
+)
+```
+
+!!! tip "Collect the tables together"
+    With a LazyFrame input, every returned plan branches off the same upstream
+    pipeline. Collect them in one call so the shared work runs once:
+
+    ```python
+    tables = packer.normalize(lazy_df)
+    frames = dict(zip(tables, pl.collect_all(list(tables.values()))))
+    ```
+
+    Eager input already does this internally.
+
 ## Validation
 
 Check data integrity:

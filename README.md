@@ -188,20 +188,32 @@ nested = packer.build_from_tables({"region": regions, "store": stores})
 
 ### Normalize and Denormalize
 
+`normalize` / `split_levels` emit one **level-local** table per level: the
+level's own id fields and attributes, plus the *key* columns of its ancestors as
+foreign keys. Coarser attributes are not duplicated into the finer tables, and
+descendant columns are never included.
+
 ```python
 # Split nested data into separate tables
 tables = packer.normalize(nested_df)
-# {"region": region_df, "store": store_df, ...}
+# region: region.id, region.name
+# store : region.id, region.store.id, region.store.revenue
+#         ^ foreign key   ^ own columns only
 
-# Reconstruct from separate tables
+# Reconstruct from separate tables (round-trips back to the nested frame)
 rebuilt = packer.denormalize(tables)
 ```
 
 ### Memory-bounded packing for large data
 
-`pack` builds the nested result with a `group_by` whose state holds every group
-in memory, so peak memory scales with the whole dataset even under the streaming
-engine. For datasets that don't fit comfortably in RAM, `pack_streaming` buckets
+`pack` builds the nested result with a `group_by` that collects children into
+list columns. Polars' streaming engine has no native list-collecting
+aggregation, so that node falls back to the in-memory engine and peak memory
+scales with the whole dataset. (`unpack` — `explode` + `unnest` — *does* stream
+natively; see [Lazy Evaluation & Streaming](docs/concepts/lazy-and-streaming.md)
+for the full breakdown.)
+
+For datasets that don't fit comfortably in RAM, `pack_streaming` buckets
 the input by the **root-level key** (keeping each entity's rows together), packs
 each bucket independently while sinking to Parquet, and returns a chainable
 `LazyFrame` — bounding peak memory to a single bucket.
@@ -280,16 +292,24 @@ Main class for hierarchical operations.
 
 **Key Methods:**
 - `pack(frame, to_level, *, extra_columns="preserve", parent_strategy="aggregate")` - Pack to coarser granularity (`parent_strategy="split_join"` reattaches heavy root attributes via a join)
-- `pack_streaming(source, to_level, *, partitions=16, ...)` - Memory-bounded pack for large data
+- `pack_streaming(source, to_level, *, partitions=16, partition_strategy="balanced", ...)` -
+  Memory-bounded pack for large data (`"balanced"` buckets by row count and returns
+  root-key-sorted output; `"hash"` is one pass cheaper but balances entities, not rows)
 - `unpack(frame, to_level)` - Unpack to finer granularity
 - `normalize(frame)` - Split into per-level tables
-- `denormalize(tables)` - Reconstruct from per-level tables
+- `denormalize(tables)` - Reconstruct from per-level tables; a true inverse of
+  `normalize`, so `denormalize(normalize(df, root_level=L), target_level=L) == pack(df, L)`
 - `build_from_tables(tables)` - Build hierarchy from normalized tables
 - `validate(frame)` - Check data integrity
 
 #### `HierarchySpec.from_levels(*levels, key_aliases=None)`
 
 Create a hierarchy specification from level definitions.
+
+`key_aliases` is **deprecated** — rename the column on the frame instead
+(`df.with_columns(pl.col("country.city.id").alias("country.code"))`). Synthesised
+keys are stripped from the per-level tables, so a hierarchy relying on them cannot
+round-trip through `normalize` / `denormalize`.
 
 #### `LevelSpec(name, id_fields, required_fields=None, order_by=None, parent_keys=None)`
 

@@ -2,7 +2,7 @@
 
 import polars as pl
 
-from nexpresso.structuring_utils import unnest_all, unnest_rename
+from nexpresso.structuring_utils import convert_polars_schema, unnest_all, unnest_rename
 
 
 class TestUnnestRename:
@@ -446,3 +446,103 @@ class TestUnnestAll:
         assert result.height == 1
         assert result["person.name"].to_list() == ["Alice"]
         assert result["person.age"].to_list() == [30]
+
+
+class TestConvertPolarsSchema:
+    """Tests for the convert_polars_schema function."""
+
+    def test_scalar_types_pass_through(self) -> None:
+        """Non-nested dtypes are returned unchanged, as dtype objects."""
+        result = convert_polars_schema({"a": pl.Int64, "b": pl.String, "c": pl.Boolean})
+
+        assert result == {"a": pl.Int64, "b": pl.String, "c": pl.Boolean}
+
+    def test_list_becomes_single_element_list(self) -> None:
+        """List(inner) is rendered as [inner]."""
+        assert convert_polars_schema({"a": pl.List(pl.Int64)}) == {"a": [pl.Int64]}
+
+    def test_nested_list(self) -> None:
+        """Nesting is applied recursively."""
+        assert convert_polars_schema({"a": pl.List(pl.List(pl.Int64))}) == {"a": [[pl.Int64]]}
+
+    def test_list_of_struct(self) -> None:
+        """A struct inside a list is expanded into a dict."""
+        schema = {"items": pl.List(pl.Struct({"name": pl.String, "qty": pl.Int64}))}
+
+        assert convert_polars_schema(schema) == {"items": [{"name": pl.String, "qty": pl.Int64}]}
+
+    def test_struct_with_mixed_fields(self) -> None:
+        """Struct fields are converted recursively."""
+        schema = {
+            "data": pl.Struct(
+                {
+                    "id": pl.Int64,
+                    "tags": pl.List(pl.String),
+                    "meta": pl.Struct({"score": pl.Float64}),
+                }
+            )
+        }
+
+        assert convert_polars_schema(schema) == {
+            "data": {
+                "id": pl.Int64,
+                "tags": [pl.String],
+                "meta": {"score": pl.Float64},
+            }
+        }
+
+    def test_array_preserves_size(self) -> None:
+        """Array(inner, size) is a (inner, size) tuple, not a list."""
+        result = convert_polars_schema({"a": pl.Array(pl.Int64, 3)})
+
+        assert result == {"a": (pl.Int64, 3)}
+
+    def test_array_is_distinguishable_from_list(self) -> None:
+        """The list/tuple split is what separates List from Array."""
+        result = convert_polars_schema({"lst": pl.List(pl.Int64), "arr": pl.Array(pl.Int64, 3)})
+
+        assert isinstance(result["lst"], list)
+        assert isinstance(result["arr"], tuple)
+        assert result["lst"] != result["arr"]
+
+    def test_nested_array(self) -> None:
+        """Array nesting keeps each level's size."""
+        schema = {"a": pl.Array(pl.Array(pl.Int64, 2), 3)}
+
+        assert convert_polars_schema(schema) == {"a": ((pl.Int64, 2), 3)}
+
+    def test_array_of_struct(self) -> None:
+        """A struct inside an array is expanded, size retained."""
+        schema = {"a": pl.Array(pl.Struct({"x": pl.Int64}), 2)}
+
+        assert convert_polars_schema(schema) == {"a": ({"x": pl.Int64}, 2)}
+
+    def test_enum_and_categorical_pass_through(self) -> None:
+        """Parameterised leaf types are returned as-is, not unwrapped."""
+        enum_dtype = pl.Enum(["x", "y"])
+        result = convert_polars_schema({"e": enum_dtype, "c": pl.Categorical()})
+
+        assert result["e"] == enum_dtype
+        assert result["c"] == pl.Categorical()
+
+    def test_accepts_dataframe(self) -> None:
+        """A DataFrame's schema is collected automatically."""
+        df = pl.DataFrame({"id": [1], "items": [[{"name": "a"}]]})
+
+        assert convert_polars_schema(df) == {"id": pl.Int64, "items": [{"name": pl.String}]}
+
+    def test_accepts_lazyframe(self) -> None:
+        """A LazyFrame's schema is collected automatically."""
+        lf = pl.LazyFrame({"id": [1], "items": [[{"name": "a"}]]})
+
+        assert convert_polars_schema(lf) == {"id": pl.Int64, "items": [{"name": pl.String}]}
+
+    def test_accepts_polars_schema_object(self) -> None:
+        """A pl.Schema instance works the same as a plain dict."""
+        schema = pl.Schema({"a": pl.List(pl.Int64), "b": pl.Int64})
+
+        assert convert_polars_schema(schema) == {"a": [pl.Int64], "b": pl.Int64}
+
+    def test_empty_schema(self) -> None:
+        """An empty schema converts to an empty dict."""
+        assert convert_polars_schema({}) == {}

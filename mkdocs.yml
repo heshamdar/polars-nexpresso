@@ -69,6 +69,7 @@ nav:
     - Nested Expressions: concepts/nested-expressions.md
     - Hierarchical Data: concepts/hierarchical-data.md
     - Struct Modes: concepts/struct-modes.md
+    - Lazy Evaluation & Streaming: concepts/lazy-and-streaming.md
   - Guides:
     - Building from Database Tables: guides/database-to-nested.md
     - Analytics Workflow: guides/analytics-workflow.md

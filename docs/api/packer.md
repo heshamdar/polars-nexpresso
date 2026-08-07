@@ -125,6 +125,7 @@ def pack_streaming(
     tmp_dir: str | Path | None = None,
     defer: bool = True,
     extra_columns: Literal["preserve", "drop", "error"] = "preserve",
+    partition_strategy: Literal["balanced", "hash"] = "balanced",
 ) -> LazyFrame:
 ```
 
@@ -141,13 +142,33 @@ the packed output — bounding peak memory to one bucket.
 |-----------|------|-------------|
 | `source` | `DataFrame \| LazyFrame \| str \| Path` | Input at the finest granularity. A path/glob is scanned lazily with `scan_parquet`. |
 | `to_level` | `str` | Target level name |
-| `partitions` | `int` | Number of root-key buckets. More buckets = lower peak memory and more temporary files. Must be ≥ 1. |
+| `partitions` | `int` | Target number of root-key buckets. More buckets = lower peak memory and more temporary files. Must be ≥ 1. |
 | `tmp_dir` | `str \| Path \| None` | Directory for intermediate Parquet files. Defaults to a fresh temp directory the caller owns. |
 | `defer` | `bool` | When `True` (default), wraps the work in `pl.defer` so nothing runs until the result is collected. When `False`, sinks eagerly and returns a `scan_parquet` handle (downstream streams straight from disk). |
 | `extra_columns` | `Literal["preserve", "drop", "error"]` | How to handle non-hierarchy columns |
+| `partition_strategy` | `Literal["balanced", "hash"]` | How root keys map to buckets. See below. |
 
-**Returns:** A `LazyFrame` over the packed result. Top-level row order is not
-guaranteed; child-list order follows the same rules as [`pack`](#pack).
+**Returns:** A `LazyFrame` over the packed result. Under `"balanced"` the rows are
+ordered by root key; under `"hash"` top-level row order is not guaranteed.
+Child-list order follows the same rules as [`pack`](#pack) in both cases.
+
+**`partition_strategy`:**
+
+- `"balanced"` (default) — counts rows per entity in one extra streaming pass,
+  then cuts the key-ordered entities into contiguous buckets of roughly
+  `total_rows / partitions` rows. Balances *rows*, which is what bounds peak
+  memory, and leaves the output sorted by root key. The realised bucket count
+  floats around `partitions`: an entity is never split, so a bucket closes early
+  rather than overflow.
+- `"hash"` — assigns by `hash(root_key) % partitions`. One pass cheaper and gives
+  exactly `partitions` buckets, but it balances entities rather than rows, so
+  uneven entity sizes give an uneven peak.
+
+A global `sort` is deliberately *not* used to group entities: sort is itself an
+in-memory fallback under the streaming engine, so it would cost the very memory
+this method bounds. See
+[Lazy Evaluation & Streaming](../concepts/lazy-and-streaming.md) for the measured
+comparison.
 
 **Example:**
 
@@ -212,7 +233,9 @@ def normalize(
 ) -> dict[str, FrameT]:
 ```
 
-Split a frame into separate tables per hierarchy level.
+Split a frame into separate tables per hierarchy level. Thin wrapper: packs to
+`root_level` and hands the result to [`split_levels`](#split_levels), so the
+emitted tables have exactly that method's level-local shape.
 
 **Parameters:**
 
@@ -221,14 +244,24 @@ Split a frame into separate tables per hierarchy level.
 | `frame` | `DataFrame \| LazyFrame` | The frame to normalize |
 | `root_level` | `str \| None` | Pack to this level first (default: first level) |
 
-**Returns:** Dictionary mapping level names to tables
+**Returns:** Dictionary mapping level names to tables, ordered root → leaf
 
 **Example:**
 
 ```python
 tables = packer.normalize(nested_df)
-# {"country": country_df, "city": city_df, "street": street_df}
+
+tables["country"].columns
+# ['country.code', 'country.name']
+
+tables["city"].columns
+# ['country.code', 'country.city.id', 'country.city.population']
+#   ^ foreign key   ^ own columns only — no country.name
 ```
+
+Each table holds its own columns plus its ancestors' **key** columns. Coarser
+attributes are not duplicated into finer tables; join them back from the coarser
+table when you need them.
 
 ---
 
@@ -243,7 +276,22 @@ def denormalize(
 ) -> DataFrame | LazyFrame:
 ```
 
-Reconstruct nested structure from per-level tables.
+Reconstruct nested structure from per-level tables — the inverse of
+[`normalize`](#normalize), and it accepts exactly the level-local shape that
+`normalize` / [`split_levels`](#split_levels) emit.
+
+Child levels are attached to their parents as nested list-of-struct columns,
+walking leaf → root, and the root's own columns are then folded into the root
+struct. When `target_level` is finer than the root, the ancestors' attribute
+columns are joined back on afterwards (the upward pass only ever attaches
+descendants).
+
+**Round-trip guarantee** — for every level `L`:
+
+```python
+packer.denormalize(packer.normalize(df, root_level=L), target_level=L)
+    == packer.pack(df, L)
+```
 
 **Parameters:**
 
@@ -254,10 +302,20 @@ Reconstruct nested structure from per-level tables.
 
 **Returns:** Reconstructed frame with nested structures
 
+**Raises:** `HierarchyValidationError` if the root table is absent, a table
+required to reach `target_level` is missing, or a supplied table lacks its own
+key columns (those keys are what child tables join on).
+
 **Example:**
 
 ```python
-nested = packer.denormalize({"country": ..., "city": ..., "street": ...})
+tables = packer.normalize(nested_df)
+
+nested = packer.denormalize(tables)   # default: back to the root level
+assert nested.equals(packer.pack(flat_df, "country"))   # single `country` struct
+
+streets = packer.denormalize(tables, target_level="street")
+assert streets.equals(packer.pack(flat_df, "street"))
 ```
 
 ---
@@ -402,10 +460,39 @@ def split_levels(self, frame: FrameT) -> dict[str, FrameT]:
 
 Split a packed frame into standalone tables per level.
 
+Each table is **level-local**: it holds the level's own columns (id fields and
+attributes) plus the *key* columns of its ancestors, which serve as foreign keys
+back to the coarser tables. Coarser attributes are not copied into finer tables,
+and descendant columns are never included.
+
 **Parameters:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `frame` | `DataFrame \| LazyFrame` | Packed frame to split |
 
-**Returns:** Dictionary mapping level names to tables
+**Returns:** Dictionary mapping level names to tables, ordered root → leaf
+
+**Example:**
+
+For a `country → city → street` hierarchy:
+
+```python
+tables = packer.split_levels(packer.pack(flat_df, "country"))
+
+tables["country"].columns
+# ['country.code', 'country.name']
+
+tables["city"].columns
+# ['country.code', 'country.city.id', 'country.city.population']
+#   ^ foreign key   ^ own columns
+
+tables["street"].columns
+# ['country.code', 'country.city.id',
+#  'country.city.street.name', 'country.city.street.length']
+```
+
+Levels that are still flat in `frame` (e.g. `country` in a frame packed only to
+`city`) get their own deduplicated table too, so no attribute is dropped.
+`denormalize` accepts this shape and reattaches ancestor attributes when the
+target level is finer than the root.

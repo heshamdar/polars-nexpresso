@@ -10,6 +10,37 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Formatting, linting and type checking are Polars-version independent, so they
+  # run once against the locked dependencies rather than across the test matrix.
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Check formatting (black)
+        run: uv run black --check nexpresso tests
+
+      - name: Lint (ruff)
+        run: uv run ruff check nexpresso tests
+
+      - name: Type check (mypy)
+        run: uv run mypy nexpresso
+
   test:
     runs-on: ubuntu-latest
     strategy:

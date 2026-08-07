@@ -226,17 +226,18 @@ print(nested)
 ### Normalize and Denormalize
 
 ```python
-# Split into separate tables
+# Split into separate tables. Each one carries its own columns plus the key
+# columns of its ancestors as foreign keys — nothing coarser, nothing finer.
 tables = packer.normalize(nested)
 
-print("Regions table:")
+print("Regions table:")   # region.id, region.name
 print(tables["region"])
 
-print("Stores table:")
+print("Stores table:")    # region.id, region.store.id, region.store.name
 print(tables["store"])
 
-print("Products table:")
-print(tables["product"])
+print("Products table:")  # region.id, region.store.id, region.store.product.id,
+print(tables["product"])  # region.store.product.name, region.store.product.price
 
 # Reconstruct
 rebuilt = packer.denormalize(tables)

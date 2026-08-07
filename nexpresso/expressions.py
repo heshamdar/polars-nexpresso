@@ -17,6 +17,9 @@ from polars.expr.expr import Expr
 
 from nexpresso.hierarchical_packer import FrameT
 
+#: Minimum Polars version that provides ``Expr.arr.eval()``.
+ARR_EVAL_MIN_VERSION = "1.35.1"
+
 
 @lru_cache(maxsize=1)
 def _polars_version() -> version.Version:
@@ -26,7 +29,7 @@ def _polars_version() -> version.Version:
 
 def _supports_arr_eval() -> bool:
     """Check if the current Polars version supports arr.eval()."""
-    return _polars_version() >= version.parse("1.35.1")
+    return _polars_version() >= version.parse(ARR_EVAL_MIN_VERSION)
 
 
 # Type aliases for better readability
@@ -145,8 +148,8 @@ class NestedExpressionBuilder:
         if isinstance(dtype, pl.Array):
             if not _supports_arr_eval():
                 raise ValueError(
-                    f"Array types require Polars >= 1.0.0 for arr.eval() support. "
-                    f"Current version: {pl.__version__}. "
+                    f"Array types require Polars >= {ARR_EVAL_MIN_VERSION} for "
+                    f"arr.eval() support. Current version: {pl.__version__}. "
                     "Workaround: Convert the Array to a List first using "
                     ".cast(pl.List(inner_type))."
                 )
@@ -194,30 +197,19 @@ class NestedExpressionBuilder:
         schema_map: dict[str, PolarsDataType] = {
             field.name: field.dtype for field in struct_dtype.fields
         }
-        # Track transformed expressions so new fields can reference them
-        transformed_fields: dict[str, pl.Expr] = {}
         field_exprs_to_use: dict[str, pl.Expr] = {}
 
         # First pass: build all field expressions (without aliasing yet)
         for field_name, sub_spec in field_spec.items():
             if sub_spec is None:
-                # In 'select' mode, None means include the field as-is
-                # In 'with_fields' mode, None means keep existing field unchanged
-                if self._struct_mode == "select":
-                    # Will be handled in final selection
-                    field_exprs_to_use[field_name] = base_expr.struct.field(field_name)
-                else:
-                    # with_fields mode: keep existing field
-                    field_exprs_to_use[field_name] = base_expr.struct.field(field_name)
+                # None keeps the field unchanged in both modes: 'select' carries it
+                # into the final selection, 'with_fields' writes it back as-is.
+                field_exprs_to_use[field_name] = base_expr.struct.field(field_name)
                 continue
 
-            field_expr = self._build_field_expression(
-                field_name, sub_spec, schema_map, base_expr, transformed_fields
-            )
+            field_expr = self._build_field_expression(field_name, sub_spec, schema_map, base_expr)
 
             if field_expr is not None:
-                # Store the expression (we'll alias later)
-                transformed_fields[field_name] = field_expr
                 field_exprs_to_use[field_name] = field_expr
 
         # Second pass: build final field expressions with aliases
@@ -251,7 +243,6 @@ class NestedExpressionBuilder:
         field_spec: dict[str, FieldValue] | Callable[[pl.Expr], pl.Expr] | pl.Expr,
         schema_map: dict[str, PolarsDataType],
         base_expr: pl.Expr,
-        transformed_fields: dict[str, pl.Expr] | None = None,
     ) -> pl.Expr | None:
         """
         Build an expression for a single struct field.
@@ -259,12 +250,11 @@ class NestedExpressionBuilder:
         Returns None if the field should be kept as-is (for with_fields mode).
 
         Args:
-            transformed_fields: Dictionary of already-transformed field expressions
-                that can be referenced by pl.field() calls in new field expressions.
+            field_name: Name of the struct field being built.
+            field_spec: The operation to apply (dict, Callable, or pl.Expr).
+            schema_map: Field name to dtype mapping for the enclosing struct.
+            base_expr: Expression yielding the enclosing struct.
         """
-        if transformed_fields is None:
-            transformed_fields = {}
-
         field_base_expr = base_expr.struct.field(field_name)
 
         if isinstance(field_spec, pl.Expr):
@@ -417,7 +407,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 80 + "\n")
 
     # Example 1: Using the convenience function
-    query = {
+    query: dict[str, FieldValue] = {
         "a": lambda x: x.max(),
         "c": {
             "x": lambda x: x.max(),

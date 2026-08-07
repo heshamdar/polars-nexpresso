@@ -25,7 +25,6 @@ TEST_HIERARCHY = HierarchySpec(
         LevelSpec(name="building", id_fields=["number"]),
         LevelSpec(name="apartment", id_fields=["id"], required_fields=["id"]),
     ],
-    key_aliases={"country.code": "country.city.id"},
 )
 
 
@@ -90,6 +89,29 @@ def test_pack_unpack_roundtrip(packer, apartment_level_df):
     _assert_same_rows(unpacked_df, apartment_level_df)
 
 
+def test_unpack_handles_fixed_size_array_level(packer, apartment_level_df):
+    """A level column cast to a fixed-size Array still explodes.
+
+    ``pack`` only ever produces ``List``, but a caller may narrow a level column
+    to ``Array`` (e.g. after a round-trip through a format with fixed-size
+    lists). The dtype check must not silently skip the explode.
+    """
+    packed = packer.pack(apartment_level_df, "apartment")
+    col = "country.city.street.building.apartment"
+    inner = packed.schema[col].inner
+    # Every building in the fixture has exactly one apartment here except 100,
+    # so pick a building with a stable child count to cast against.
+    single = packed.filter(pl.col(col).list.len() == 1)
+    as_array = single.with_columns(pl.col(col).cast(pl.Array(inner, 1)))
+    assert isinstance(as_array.schema[col], pl.Array)
+
+    unpacked = packer.unpack(as_array, "apartment")
+
+    assert unpacked.height == single.height
+    assert "country.city.street.building.apartment.id" in unpacked.columns
+    _assert_same_rows(unpacked, packer.unpack(single, "apartment"))
+
+
 @pytest.fixture()
 def apartment_level_df_with_root_attrs(apartment_level_df):
     """Apartment-level data carrying redundant root-level (country) attributes."""
@@ -126,15 +148,64 @@ def test_pack_split_join_without_root_attrs_falls_back(packer, apartment_level_d
     _assert_same_rows(aggregated, split_joined)
 
 
-def test_pack_handles_missing_country_code_alias(packer, apartment_level_df):
+def _aliased_hierarchy() -> HierarchySpec:
+    """TEST_HIERARCHY plus the deprecated key_aliases option."""
+    with pytest.warns(DeprecationWarning, match="key_aliases is deprecated"):
+        return HierarchySpec(
+            levels=list(TEST_HIERARCHY.levels),
+            key_aliases={"country.code": "country.city.id"},
+        )
+
+
+def test_key_aliases_emits_deprecation_warning():
+    """key_aliases is deprecated in favour of renaming the column on the frame."""
+    with pytest.warns(DeprecationWarning, match="Rename the column on the frame"):
+        HierarchySpec(
+            levels=[LevelSpec(name="country", id_fields=["code"])],
+            key_aliases={"country.code": "country.city.id"},
+        )
+
+    # The replacement it suggests is named in the message.
+    with pytest.warns(DeprecationWarning, match=r'alias\("country\.code"\)'):
+        HierarchySpec.from_levels(
+            LevelSpec(name="country", id_fields=["code"]),
+            key_aliases={"country.code": "country.city.id"},
+        )
+
+
+def test_no_warning_without_key_aliases(recwarn):
+    """The common path stays warning-free."""
+    HierarchySpec.from_levels(LevelSpec(name="country", id_fields=["code"]))
+
+    assert [w for w in recwarn if issubclass(w.category, DeprecationWarning)] == []
+
+
+def test_pack_handles_missing_country_code_alias(apartment_level_df):
+    aliased = HierarchicalPacker(_aliased_hierarchy())
     df_no_country_code = apartment_level_df.drop("country.code")
 
-    packed_df = packer.pack(df_no_country_code, "street")
+    packed_df = aliased.pack(df_no_country_code, "street")
     assert "country.code" not in packed_df.columns
 
-    roundtrip_df = packer.unpack(packed_df, "apartment")
+    roundtrip_df = aliased.unpack(packed_df, "apartment")
 
     _assert_same_rows(roundtrip_df, df_no_country_code)
+
+
+def test_pack_to_root_with_synthesized_alias(apartment_level_df):
+    """Packing all the way to the root used to raise ColumnNotFoundError.
+
+    The alias column is a group key for the child levels, so it must survive the
+    packing loop, but it has to be dropped before the root fold or it ends up
+    inside the root struct and the post-loop drop cannot find it.
+    """
+    aliased = HierarchicalPacker(_aliased_hierarchy())
+    df_no_country_code = apartment_level_df.drop("country.code")
+
+    packed = aliased.pack(df_no_country_code, "country")
+
+    assert packed.columns == ["country"]
+    assert "code" not in packed.schema["country"].to_schema()
 
 
 def test_split_levels_outputs_expected_tables(packer, apartment_level_df):
@@ -142,23 +213,75 @@ def test_split_levels_outputs_expected_tables(packer, apartment_level_df):
 
     split_tables = packer.split_levels(city_level_df)
 
-    assert set(split_tables.keys()) == {"city", "street", "building", "apartment"}
+    # ``country`` is still flat in a city-packed frame, but it is a hierarchy
+    # level and gets its own (deduplicated) table rather than riding along
+    # inside the finer tables.
+    assert set(split_tables.keys()) == {"country", "city", "street", "building", "apartment"}
 
-    apartment_table = split_tables["apartment"]
-    _assert_same_rows(apartment_table, apartment_level_df)
+    # Each table carries only its ancestors' *keys* plus its own columns.
+    assert split_tables["country"].columns == ["country.code"]
+    assert split_tables["city"].columns == [
+        "country.code",
+        "country.city.id",
+        "country.city.name",
+    ]
+    assert split_tables["street"].columns == [
+        "country.code",
+        "country.city.id",
+        "country.city.name",
+        "country.city.street.name",
+    ]
+    assert split_tables["building"].columns == [
+        "country.code",
+        "country.city.id",
+        "country.city.name",
+        "country.city.street.name",
+        "country.city.street.building.number",
+        "country.city.street.building.id",
+    ]
+    assert split_tables["apartment"].columns == [
+        "country.code",
+        "country.city.id",
+        "country.city.name",
+        "country.city.street.name",
+        "country.city.street.building.number",
+        "country.city.street.building.apartment.id",
+        "country.city.street.building.apartment.area",
+    ]
 
-    street_table = split_tables["street"]
-    assert all(not col.startswith("country.city.street.building") for col in street_table.columns)
-    expected_street_rows = apartment_level_df.select(
-        ["country.city.id", "country.city.street.name"]
-    ).unique()
-    assert street_table.height == expected_street_rows.height
-
-    city_table = split_tables["city"]
-    assert all(
-        col.startswith("country.") and not col.startswith("country.city.street")
-        for col in city_table.columns
+    # Row counts match the distinct entities at each level.
+    assert split_tables["country"].height == 2
+    assert split_tables["city"].height == 2
+    assert (
+        split_tables["street"].height
+        == apartment_level_df.select(["country.city.id", "country.city.street.name"]).n_unique()
     )
+    assert split_tables["apartment"].height == apartment_level_df.height
+
+
+def test_split_levels_excludes_coarser_attributes(packer, apartment_level_df_with_root_attrs):
+    """Coarser-level attributes stay in their own table, not in finer ones."""
+    packed = packer.pack(apartment_level_df_with_root_attrs, "country")
+    tables = packer.split_levels(packed)
+
+    country_table = tables["country"]
+    assert set(country_table.columns) == {"country.code", "country.name", "country.population"}
+    assert country_table.height == 2
+
+    for level in ("city", "street", "building", "apartment"):
+        assert "country.name" not in tables[level].columns
+        assert "country.population" not in tables[level].columns
+        # The foreign key back to the parent survives.
+        assert "country.code" in tables[level].columns
+
+
+def test_split_levels_lazy_stays_lazy(packer, apartment_level_df):
+    tables = packer.split_levels(packer.pack(apartment_level_df.lazy(), "country"))
+
+    assert all(isinstance(tbl, pl.LazyFrame) for tbl in tables.values())
+    eager = packer.split_levels(packer.pack(apartment_level_df, "country"))
+    for name, tbl in tables.items():
+        _assert_same_rows(tbl, eager[name])
 
 
 def test_normalize_matches_manual_split(packer, apartment_level_df):
@@ -176,6 +299,96 @@ def test_denormalize_reconstructs_nested(packer, apartment_level_df):
     expected = packer.pack(apartment_level_df, "apartment")
 
     _assert_same_rows(rebuilt, expected)
+
+
+# ---------------------------------------------------------------------------
+# normalize / denormalize round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("level", ["country", "city", "street", "building", "apartment"])
+def test_denormalize_inverts_normalize_at_every_level(packer, apartment_level_df, level):
+    """``denormalize(normalize(df, root_level=L), target_level=L) == pack(df, L)``.
+
+    The root used to be the exception: the upward pass starts at level 1, so the
+    root's own columns were left flat instead of folded into a struct column.
+    Column order is asserted too — the ancestor-attribute joins append at the end,
+    so without a reorder the frames are merely equivalent, not equal.
+    """
+    tables = packer.normalize(apartment_level_df, root_level=level)
+    rebuilt = packer.denormalize(tables, target_level=level)
+    expected = packer.pack(apartment_level_df, level)
+
+    assert list(rebuilt.schema.items()) == list(expected.schema.items())
+    _assert_same_rows(rebuilt, expected)
+
+
+def test_denormalize_defaults_invert_normalize_defaults(packer, apartment_level_df):
+    """The no-argument round trip lands back on ``pack(df, root)``."""
+    rebuilt = packer.denormalize(packer.normalize(apartment_level_df))
+    expected = packer.pack(apartment_level_df, "country")
+
+    assert rebuilt.columns == ["country"] == expected.columns
+    assert rebuilt.schema == expected.schema
+    _assert_same_rows(rebuilt, expected)
+
+
+def test_denormalize_round_trip_preserves_lazyframe(packer, apartment_level_df):
+    rebuilt = packer.denormalize(packer.normalize(apartment_level_df.lazy()))
+
+    assert isinstance(rebuilt, pl.LazyFrame)
+    _assert_same_rows(rebuilt, packer.pack(apartment_level_df, "country"))
+
+
+def test_denormalize_round_trip_with_childless_parent():
+    """A parent with no children survives the round trip (null child list)."""
+    spec = HierarchySpec(
+        levels=[
+            LevelSpec(name="region", id_fields=["id"]),
+            LevelSpec(name="store", id_fields=["id"]),
+        ]
+    )
+    p = HierarchicalPacker(spec)
+    flat = pl.DataFrame(
+        {
+            "region.id": ["north", "south"],
+            "region.name": ["North", "South"],
+            "region.store.id": ["s1", None],  # south has no store
+            "region.store.revenue": [100, None],
+        }
+    )
+
+    rebuilt = p.denormalize(p.normalize(flat))
+
+    _assert_same_rows(rebuilt, p.pack(flat, "region"))
+
+
+def test_denormalize_round_trip_four_levels():
+    spec = HierarchySpec(levels=[LevelSpec(name=n, id_fields=["id"]) for n in "abcd"])
+    p = HierarchicalPacker(spec)
+    flat = pl.DataFrame(
+        {
+            "a.id": ["A1", "A2"],
+            "a.attr": [1, 2],
+            "a.b.id": ["B1", "B2"],
+            "a.b.c.id": ["C1", "C2"],
+            "a.b.c.d.id": ["D1", "D2"],
+        }
+    )
+
+    rebuilt = p.denormalize(p.normalize(flat))
+
+    assert rebuilt.columns == ["a"]
+    _assert_same_rows(rebuilt, p.pack(flat, "a"))
+
+
+def test_denormalize_reports_missing_key_columns(packer, apartment_level_df):
+    """A table missing its own key fails by name, not deep inside a join plan."""
+    tables = packer.normalize(apartment_level_df)
+    tables["city"] = tables["city"].drop("country.city.id")
+
+    with pytest.raises(HierarchyValidationError, match=r"missing its key column"):
+        packer.denormalize(tables)
 
 
 def test_pack_without_preserve_order(apartment_level_df: pl.DataFrame) -> None:
@@ -639,11 +852,12 @@ class TestComposableLevels:
             )
 
     def test_from_levels_with_key_aliases(self) -> None:
-        """Test that from_levels accepts key_aliases."""
-        spec = HierarchySpec.from_levels(
-            LevelSpec(name="parent", id_fields=["id"]),
-            key_aliases={"parent.id": "parent.child.parent_id"},
-        )
+        """from_levels still accepts key_aliases, but warns that it is deprecated."""
+        with pytest.warns(DeprecationWarning, match="key_aliases is deprecated"):
+            spec = HierarchySpec.from_levels(
+                LevelSpec(name="parent", id_fields=["id"]),
+                key_aliases={"parent.id": "parent.child.parent_id"},
+            )
 
         assert spec.key_aliases == {"parent.id": "parent.child.parent_id"}
 
@@ -1301,6 +1515,70 @@ class TestAnyAllChildSatisfies:
             condition=pl.element().struct.field("population") > 5_000_000,
         )
         assert isinstance(result, pl.LazyFrame)
+
+    # ------------------------------------------------------------------
+    # Childless entities: empty vs null child lists
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _childless_frame() -> pl.DataFrame:
+        """Packed country frame covering every childless / null-attribute shape.
+
+        Built directly rather than via ``pack`` so the empty-list and null-list
+        cases can both be represented — ``pack`` only ever produces non-empty
+        lists.
+        """
+        child = pl.List(pl.Struct({"id": pl.String, "population": pl.Int64}))
+        return pl.DataFrame(
+            {
+                "country.code": ["PASS", "FAIL", "EMPTY", "NULL", "NULLATTR"],
+                "country.city": [
+                    [{"id": "a", "population": 20_000}],  # all children pass
+                    [{"id": "b", "population": 20_000}, {"id": "c", "population": 1}],
+                    [],  # no children (empty list)
+                    None,  # no children (null list, e.g. from a left join)
+                    [{"id": "d", "population": None}],  # condition evaluates to null
+                ],
+            },
+            schema={"country.code": pl.String, "country.city": child},
+        )
+
+    def _codes(self, frame: pl.DataFrame) -> list[str]:
+        return sorted(frame.select("country.code").to_series().to_list())
+
+    def test_all_children_satisfy_childless_entities_pass(self, cl_packer):
+        """Empty *and* null child lists both pass (vacuous truth)."""
+        result = cl_packer.all_children_satisfy(
+            self._childless_frame(),
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 10_000,
+        )
+        assert self._codes(result) == ["EMPTY", "NULL", "PASS"]
+
+    def test_any_child_satisfies_childless_entities_dropped(self, cl_packer):
+        """Empty and null child lists are dropped — nothing can satisfy."""
+        result = cl_packer.any_child_satisfies(
+            self._childless_frame(),
+            from_level="city",
+            to_level="country",
+            condition=pl.element().struct.field("population") > 10_000,
+        )
+        assert self._codes(result) == ["FAIL", "PASS"]
+
+    def test_null_condition_result_counts_as_unsatisfied(self, cl_packer):
+        """A child whose condition evaluates to null does not satisfy it."""
+        frame = self._childless_frame()
+        condition = pl.element().struct.field("population") > 10_000
+
+        all_result = cl_packer.all_children_satisfy(
+            frame, from_level="city", to_level="country", condition=condition
+        )
+        any_result = cl_packer.any_child_satisfies(
+            frame, from_level="city", to_level="country", condition=condition
+        )
+        assert "NULLATTR" not in self._codes(all_result)
+        assert "NULLATTR" not in self._codes(any_result)
 
 
 # =============================================================================

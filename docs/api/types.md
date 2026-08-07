@@ -20,7 +20,21 @@ Collection of `LevelSpec` objects ordered from coarse to fine granularity.
 | Attribute | Type | Description |
 |-----------|------|-------------|
 | `levels` | `Sequence[LevelSpec]` | Ordered list of level specifications |
-| `key_aliases` | `Mapping[str, str]` | Mapping of `{target_column: source_column}` |
+| `key_aliases` | `Mapping[str, str]` | **Deprecated.** Mapping of `{target_column: source_column}` |
+
+!!! warning "`key_aliases` is deprecated"
+    It synthesises a missing key column from another column. Rename the column on
+    the frame instead — one expression, and the renamed column then behaves like
+    any other:
+
+    ```python
+    df = df.with_columns(pl.col("country.city.id").alias("country.code"))
+    ```
+
+    Synthesised keys are stripped from the tables emitted by `split_levels` /
+    `normalize`, so a hierarchy that relies on them cannot round-trip through
+    `denormalize`. Passing a non-empty mapping emits a `DeprecationWarning`; the
+    option will be removed in a future release.
 
 **Class Methods:**
 
@@ -38,6 +52,7 @@ def from_levels(
 Build a HierarchySpec from an ordered sequence of LevelSpec objects.
 
 Validates that `parent_keys` in child levels match the count of `id_fields` in parent levels.
+`key_aliases` is deprecated — see the warning above.
 
 **Example:**
 

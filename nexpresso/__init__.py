@@ -18,12 +18,13 @@ from nexpresso.hierarchical_packer import (
     LevelAttribute,
     LevelSpec,
     ParentStrategy,
+    PartitionStrategy,
     PromoteAggregation,
     SchemaValidationResult,
 )
 from nexpresso.structuring_utils import convert_polars_schema, unnest_all, unnest_rename
 
-__version__ = "0.3.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "__version__",
@@ -39,6 +40,7 @@ __all__ = [
     "LevelAttribute",
     "LevelSpec",
     "ParentStrategy",
+    "PartitionStrategy",
     "PromoteAggregation",
     "SchemaValidationResult",
     # Structuring utilities
