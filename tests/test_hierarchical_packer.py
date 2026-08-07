@@ -25,7 +25,6 @@ TEST_HIERARCHY = HierarchySpec(
         LevelSpec(name="building", id_fields=["number"]),
         LevelSpec(name="apartment", id_fields=["id"], required_fields=["id"]),
     ],
-    key_aliases={"country.code": "country.city.id"},
 )
 
 
@@ -149,15 +148,64 @@ def test_pack_split_join_without_root_attrs_falls_back(packer, apartment_level_d
     _assert_same_rows(aggregated, split_joined)
 
 
-def test_pack_handles_missing_country_code_alias(packer, apartment_level_df):
+def _aliased_hierarchy() -> HierarchySpec:
+    """TEST_HIERARCHY plus the deprecated key_aliases option."""
+    with pytest.warns(DeprecationWarning, match="key_aliases is deprecated"):
+        return HierarchySpec(
+            levels=list(TEST_HIERARCHY.levels),
+            key_aliases={"country.code": "country.city.id"},
+        )
+
+
+def test_key_aliases_emits_deprecation_warning():
+    """key_aliases is deprecated in favour of renaming the column on the frame."""
+    with pytest.warns(DeprecationWarning, match="Rename the column on the frame"):
+        HierarchySpec(
+            levels=[LevelSpec(name="country", id_fields=["code"])],
+            key_aliases={"country.code": "country.city.id"},
+        )
+
+    # The replacement it suggests is named in the message.
+    with pytest.warns(DeprecationWarning, match=r'alias\("country\.code"\)'):
+        HierarchySpec.from_levels(
+            LevelSpec(name="country", id_fields=["code"]),
+            key_aliases={"country.code": "country.city.id"},
+        )
+
+
+def test_no_warning_without_key_aliases(recwarn):
+    """The common path stays warning-free."""
+    HierarchySpec.from_levels(LevelSpec(name="country", id_fields=["code"]))
+
+    assert [w for w in recwarn if issubclass(w.category, DeprecationWarning)] == []
+
+
+def test_pack_handles_missing_country_code_alias(apartment_level_df):
+    aliased = HierarchicalPacker(_aliased_hierarchy())
     df_no_country_code = apartment_level_df.drop("country.code")
 
-    packed_df = packer.pack(df_no_country_code, "street")
+    packed_df = aliased.pack(df_no_country_code, "street")
     assert "country.code" not in packed_df.columns
 
-    roundtrip_df = packer.unpack(packed_df, "apartment")
+    roundtrip_df = aliased.unpack(packed_df, "apartment")
 
     _assert_same_rows(roundtrip_df, df_no_country_code)
+
+
+def test_pack_to_root_with_synthesized_alias(apartment_level_df):
+    """Packing all the way to the root used to raise ColumnNotFoundError.
+
+    The alias column is a group key for the child levels, so it must survive the
+    packing loop, but it has to be dropped before the root fold or it ends up
+    inside the root struct and the post-loop drop cannot find it.
+    """
+    aliased = HierarchicalPacker(_aliased_hierarchy())
+    df_no_country_code = apartment_level_df.drop("country.code")
+
+    packed = aliased.pack(df_no_country_code, "country")
+
+    assert packed.columns == ["country"]
+    assert "code" not in packed.schema["country"].to_schema()
 
 
 def test_split_levels_outputs_expected_tables(packer, apartment_level_df):
@@ -251,6 +299,96 @@ def test_denormalize_reconstructs_nested(packer, apartment_level_df):
     expected = packer.pack(apartment_level_df, "apartment")
 
     _assert_same_rows(rebuilt, expected)
+
+
+# ---------------------------------------------------------------------------
+# normalize / denormalize round-trip
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("level", ["country", "city", "street", "building", "apartment"])
+def test_denormalize_inverts_normalize_at_every_level(packer, apartment_level_df, level):
+    """``denormalize(normalize(df, root_level=L), target_level=L) == pack(df, L)``.
+
+    The root used to be the exception: the upward pass starts at level 1, so the
+    root's own columns were left flat instead of folded into a struct column.
+    Column order is asserted too — the ancestor-attribute joins append at the end,
+    so without a reorder the frames are merely equivalent, not equal.
+    """
+    tables = packer.normalize(apartment_level_df, root_level=level)
+    rebuilt = packer.denormalize(tables, target_level=level)
+    expected = packer.pack(apartment_level_df, level)
+
+    assert list(rebuilt.schema.items()) == list(expected.schema.items())
+    _assert_same_rows(rebuilt, expected)
+
+
+def test_denormalize_defaults_invert_normalize_defaults(packer, apartment_level_df):
+    """The no-argument round trip lands back on ``pack(df, root)``."""
+    rebuilt = packer.denormalize(packer.normalize(apartment_level_df))
+    expected = packer.pack(apartment_level_df, "country")
+
+    assert rebuilt.columns == ["country"] == expected.columns
+    assert rebuilt.schema == expected.schema
+    _assert_same_rows(rebuilt, expected)
+
+
+def test_denormalize_round_trip_preserves_lazyframe(packer, apartment_level_df):
+    rebuilt = packer.denormalize(packer.normalize(apartment_level_df.lazy()))
+
+    assert isinstance(rebuilt, pl.LazyFrame)
+    _assert_same_rows(rebuilt, packer.pack(apartment_level_df, "country"))
+
+
+def test_denormalize_round_trip_with_childless_parent():
+    """A parent with no children survives the round trip (null child list)."""
+    spec = HierarchySpec(
+        levels=[
+            LevelSpec(name="region", id_fields=["id"]),
+            LevelSpec(name="store", id_fields=["id"]),
+        ]
+    )
+    p = HierarchicalPacker(spec)
+    flat = pl.DataFrame(
+        {
+            "region.id": ["north", "south"],
+            "region.name": ["North", "South"],
+            "region.store.id": ["s1", None],  # south has no store
+            "region.store.revenue": [100, None],
+        }
+    )
+
+    rebuilt = p.denormalize(p.normalize(flat))
+
+    _assert_same_rows(rebuilt, p.pack(flat, "region"))
+
+
+def test_denormalize_round_trip_four_levels():
+    spec = HierarchySpec(levels=[LevelSpec(name=n, id_fields=["id"]) for n in "abcd"])
+    p = HierarchicalPacker(spec)
+    flat = pl.DataFrame(
+        {
+            "a.id": ["A1", "A2"],
+            "a.attr": [1, 2],
+            "a.b.id": ["B1", "B2"],
+            "a.b.c.id": ["C1", "C2"],
+            "a.b.c.d.id": ["D1", "D2"],
+        }
+    )
+
+    rebuilt = p.denormalize(p.normalize(flat))
+
+    assert rebuilt.columns == ["a"]
+    _assert_same_rows(rebuilt, p.pack(flat, "a"))
+
+
+def test_denormalize_reports_missing_key_columns(packer, apartment_level_df):
+    """A table missing its own key fails by name, not deep inside a join plan."""
+    tables = packer.normalize(apartment_level_df)
+    tables["city"] = tables["city"].drop("country.city.id")
+
+    with pytest.raises(HierarchyValidationError, match=r"missing its key column"):
+        packer.denormalize(tables)
 
 
 def test_pack_without_preserve_order(apartment_level_df: pl.DataFrame) -> None:
@@ -714,11 +852,12 @@ class TestComposableLevels:
             )
 
     def test_from_levels_with_key_aliases(self) -> None:
-        """Test that from_levels accepts key_aliases."""
-        spec = HierarchySpec.from_levels(
-            LevelSpec(name="parent", id_fields=["id"]),
-            key_aliases={"parent.id": "parent.child.parent_id"},
-        )
+        """from_levels still accepts key_aliases, but warns that it is deprecated."""
+        with pytest.warns(DeprecationWarning, match="key_aliases is deprecated"):
+            spec = HierarchySpec.from_levels(
+                LevelSpec(name="parent", id_fields=["id"]),
+                key_aliases={"parent.id": "parent.child.parent_id"},
+            )
 
         assert spec.key_aliases == {"parent.id": "parent.child.parent_id"}
 

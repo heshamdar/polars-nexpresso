@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -257,17 +258,38 @@ class HierarchySpec:
 
     Args:
         levels: Sequence of LevelSpec objects from root to leaf.
-        key_aliases: Mapping of {target_column: source_column} for aliasing keys.
+        key_aliases: **Deprecated.** Mapping of {target_column: source_column}
+            used to synthesize a missing key column from another column. Rename
+            the column on the frame instead — it is one expression and the
+            renamed column then behaves like any other, including surviving
+            :meth:`HierarchicalPacker.normalize` /
+            :meth:`HierarchicalPacker.denormalize` round-trips, which synthesized
+            keys do not::
+
+                df = df.with_columns(pl.col("country.city.id").alias("country.code"))
     """
 
     levels: Sequence[LevelSpec]
     key_aliases: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate that level names are unique."""
+        """Validate that level names are unique and warn on deprecated options."""
         level_names = [lvl.name for lvl in self.levels]
         if len(level_names) != len(set(level_names)):
             raise ValueError("Level names must be unique inside a HierarchySpec.")
+
+        if self.key_aliases:
+            example_target, example_source = next(iter(self.key_aliases.items()))
+            warnings.warn(
+                "HierarchySpec.key_aliases is deprecated and will be removed in a "
+                "future release. Rename the column on the frame instead: "
+                f'df.with_columns(pl.col("{example_source}").alias("{example_target}")). '
+                "Synthesized key columns are stripped from the per-level tables, so "
+                "normalize()/denormalize() cannot round-trip a hierarchy that relies "
+                "on them.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
 
     @classmethod
     def from_levels(
@@ -281,7 +303,9 @@ class HierarchySpec:
 
         Args:
             *levels: LevelSpec objects ordered from root (coarsest) to leaf (finest).
-            key_aliases: Optional mapping of {target_column: source_column}.
+            key_aliases: **Deprecated** — see :class:`HierarchySpec`. Rename the
+                column on the frame instead. Passing a non-empty mapping emits a
+                ``DeprecationWarning``.
 
         Returns:
             A new HierarchySpec instance.
@@ -1030,10 +1054,16 @@ class HierarchicalPacker:
 
         target_idx = self.spec.index_of(to_level)
         for level_idx in reversed(range(target_idx, len(self._levels_meta))):
+            if level_idx == 0 and added_cols:
+                # Alias columns are scaffolding for the child levels' group keys.
+                # Drop them before the root fold, or they end up inside the root
+                # struct and the post-loop drop can no longer find them.
+                lf = lf.drop(*added_cols, strict=False)
+                schema = lf.collect_schema()
             lf, schema = self._pack_single_level(lf, level_idx, schema, validate=effective_validate)
 
         if added_cols:
-            lf = lf.drop(*added_cols)
+            lf = lf.drop(*added_cols, strict=False)
 
         lf = self._drop_internal_columns(lf)
         return self._match_frame_type(lf, frame)
@@ -1462,16 +1492,30 @@ class HierarchicalPacker:
         their parents. The input should be a mapping produced by
         :meth:`normalize`.
 
+        This is a true inverse of :meth:`normalize` — for every level ``L``::
+
+            packer.denormalize(
+                packer.normalize(df, root_level=L), target_level=L
+            ) == packer.pack(df, L)
+
+        Child levels are attached leaf → root as list-of-struct columns, the
+        root's own columns are folded into the root struct, and when
+        ``target_level`` is finer than the root the ancestors' attribute columns
+        are joined back on (the upward pass only ever attaches descendants).
+
         Args:
-            tables: Mapping of level name to table.
+            tables: Mapping of level name to table, as produced by
+                :meth:`normalize` / :meth:`split_levels`.
             target_level: Optional target level (defaults to root).
 
         Returns:
-            Denormalized frame with nested structures.
+            Denormalized frame with nested structures. Matches the type of the
+            table supplied for ``target_level``.
 
         Raises:
-            ValueError: If tables is empty.
-            KeyError: If required tables are missing.
+            HierarchyValidationError: If ``tables`` is empty, the root table is
+                absent, a table needed to reach ``target_level`` is missing, or a
+                supplied table lacks its own key columns.
         """
         if not tables:
             raise HierarchyValidationError(
@@ -1502,6 +1546,12 @@ class HierarchicalPacker:
             lf, schema = self._ensure_computed_fields(lf, schema)
             prepared_tables[name] = lf
             alias_map[name] = tuple(added)
+
+        # Every level's table must carry its own key columns — they are what the
+        # upward pass joins on. Check up front so a missing key surfaces as a
+        # named error instead of a bare Polars ColumnNotFoundError from deep
+        # inside a join plan.
+        self._validate_table_keys(prepared_tables)
 
         # Snapshot the per-level tables before the upward pass mutates them; the
         # ancestor attributes are re-attached from these when the target level is
@@ -1570,10 +1620,27 @@ class HierarchicalPacker:
         if target_idx > 0:
             result = self._attach_ancestor_attributes(result, target_idx, source_tables)
 
+        # Alias scaffolding goes first so the root fold below cannot bake it into
+        # the struct.
         added_aliases = alias_map.get(target_name, ())
         if added_aliases:
-            result = result.drop(*added_aliases)
+            result = result.drop(*added_aliases, strict=False)
 
+        if target_idx > 0:
+            # The joins above append ancestor attributes at the end. Restore the
+            # column order ``pack`` produces so the two are equal, not merely
+            # equivalent.
+            result = result.select(self._pack_column_order(result.collect_schema(), target_idx))
+
+        if target_idx == 0:
+            # The upward pass starts at level 1, so the root's own columns are
+            # still flat. ``pack`` folds them into a single struct column — do the
+            # same so ``denormalize`` inverts ``normalize`` exactly. Level 0 has no
+            # ancestor keys, so this is a plain struct build with no group_by.
+            result, _ = self._pack_single_level(result, 0, result.collect_schema(), validate=False)
+
+        # After ``_pack_single_level``: it re-adds ROW_ID_COLUMN via ``_with_row_id``
+        # and leaves it top-level (the root has no group keys), so clean up last.
         result = self._drop_internal_columns(result)
 
         # Match output type to the target table's input type
@@ -1581,6 +1648,87 @@ class HierarchicalPacker:
         if isinstance(target_table, pl.DataFrame):
             return result.collect()
         return result
+
+    def _pack_column_order(self, schema: pl.Schema, target_idx: int) -> list[str]:
+        """
+        Column order that :meth:`pack` produces for ``target_idx`` granularity.
+
+        ``pack`` ends each level in a ``group_by(...).agg(...)``, which emits the
+        group keys first, then the carried-through columns, then the nested child
+        struct. Reproducing that lets :meth:`denormalize` return a frame equal to
+        ``pack``'s, not just one with the same contents.
+
+        Args:
+            schema: Schema of the assembled frame.
+            target_idx: Index of the target level.
+
+        Returns:
+            Column names in pack order. Any column that does not belong to the
+            hierarchy keeps its relative position at the end.
+        """
+        target = self._levels_meta[target_idx]
+        child = (
+            self._levels_meta[target_idx + 1] if target_idx + 1 < len(self._levels_meta) else None
+        )
+        present = list(schema.names())
+        remaining = set(present)
+
+        ordered: list[str] = []
+
+        def take(col: str) -> None:
+            if col in remaining:
+                remaining.discard(col)
+                ordered.append(col)
+
+        # 1. Group keys: every ancestor key, root → parent.
+        for key in target.ancestor_keys:
+            take(key)
+
+        # 2. Carried columns, grouped by level root → target, in schema order.
+        for meta in self._levels_meta[: target_idx + 1]:
+            for col in self._own_level_columns(meta, schema):
+                take(col)
+
+        # 3. The nested child struct column last.
+        if child is not None:
+            take(child.path)
+
+        # Anything left (extra non-hierarchy columns) keeps its original order.
+        ordered.extend(col for col in present if col in remaining)
+        return ordered
+
+    def _validate_table_keys(self, prepared_tables: Mapping[str, pl.LazyFrame]) -> None:
+        """
+        Check that each supplied level table carries that level's own key columns.
+
+        Those keys are what :meth:`denormalize` joins children to parents on, so a
+        missing one otherwise fails much later as an opaque Polars
+        ``ColumnNotFoundError`` inside a join plan. Levels with no table are
+        skipped — the caller may legitimately omit levels finer than the target.
+
+        Args:
+            prepared_tables: Per-level tables, already key/alias-prepared.
+
+        Raises:
+            HierarchyValidationError: If a supplied table is missing key columns.
+        """
+        for meta in self._levels_meta:
+            lf = prepared_tables.get(meta.name)
+            if lf is None or not meta.id_columns:
+                continue
+
+            available = set(lf.collect_schema().names())
+            missing = [col for col in meta.id_columns if col not in available]
+            if missing:
+                raise HierarchyValidationError(
+                    f"Table for level '{meta.name}' is missing its key column(s) "
+                    f"{missing}. Key columns identify each row at a level and are "
+                    "what child tables join to. Add them to the table, or rename an "
+                    "existing column to match "
+                    f"(e.g. df.with_columns(pl.col(<source>).alias({missing[0]!r}))).",
+                    level=meta.name,
+                    details={"missing_columns": missing, "available": sorted(available)},
+                )
 
     def _attach_ancestor_attributes(
         self,

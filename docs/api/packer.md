@@ -260,10 +260,17 @@ Reconstruct nested structure from per-level tables — the inverse of
 `normalize` / [`split_levels`](#split_levels) emit.
 
 Child levels are attached to their parents as nested list-of-struct columns,
-walking leaf → root. When `target_level` is finer than the root, the ancestors'
-attribute columns are joined back on afterwards (the upward pass only ever
-attaches descendants), so the result matches `pack(flat_df, target_level)`
-exactly.
+walking leaf → root, and the root's own columns are then folded into the root
+struct. When `target_level` is finer than the root, the ancestors' attribute
+columns are joined back on afterwards (the upward pass only ever attaches
+descendants).
+
+**Round-trip guarantee** — for every level `L`:
+
+```python
+packer.denormalize(packer.normalize(df, root_level=L), target_level=L)
+    == packer.pack(df, L)
+```
 
 **Parameters:**
 
@@ -274,26 +281,21 @@ exactly.
 
 **Returns:** Reconstructed frame with nested structures
 
+**Raises:** `HierarchyValidationError` if the root table is absent, a table
+required to reach `target_level` is missing, or a supplied table lacks its own
+key columns (those keys are what child tables join on).
+
 **Example:**
 
 ```python
 tables = packer.normalize(nested_df)
 
-# Any level below the root reproduces pack() exactly
+nested = packer.denormalize(tables)   # default: back to the root level
+assert nested.equals(packer.pack(flat_df, "country"))   # single `country` struct
+
 streets = packer.denormalize(tables, target_level="street")
 assert streets.equals(packer.pack(flat_df, "street"))
-
-nested = packer.denormalize(tables)   # default: back to the root level
 ```
-
-!!! note "The root level stays flat"
-    At the **root**, `denormalize` leaves the root's own columns as top-level
-    columns alongside the nested child list — `country.code`, `country.name`,
-    `country.city` — whereas `pack(flat_df, "country")` folds them into a single
-    `country` struct column. The contents are the same and `unpack` accepts
-    either, but the two are not column-for-column identical. Pass an explicit
-    `target_level` below the root, or re-`pack` the result, if you need the
-    struct form.
 
 ---
 

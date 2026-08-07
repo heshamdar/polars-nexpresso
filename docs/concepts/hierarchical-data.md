@@ -200,6 +200,12 @@ tables = packer.normalize(nested_df)
 rebuilt = packer.denormalize(tables)
 ```
 
+`denormalize` is a true inverse of `normalize` — for any level `L`:
+
+```python
+packer.denormalize(packer.normalize(df, root_level=L), target_level=L) == packer.pack(df, L)
+```
+
 ### The shape of the per-level tables
 
 Each table is **level-local**. It holds that level's own columns — its id fields

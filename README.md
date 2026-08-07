@@ -295,13 +295,19 @@ Main class for hierarchical operations.
 - `pack_streaming(source, to_level, *, partitions=16, ...)` - Memory-bounded pack for large data
 - `unpack(frame, to_level)` - Unpack to finer granularity
 - `normalize(frame)` - Split into per-level tables
-- `denormalize(tables)` - Reconstruct from per-level tables
+- `denormalize(tables)` - Reconstruct from per-level tables; a true inverse of
+  `normalize`, so `denormalize(normalize(df, root_level=L), target_level=L) == pack(df, L)`
 - `build_from_tables(tables)` - Build hierarchy from normalized tables
 - `validate(frame)` - Check data integrity
 
 #### `HierarchySpec.from_levels(*levels, key_aliases=None)`
 
 Create a hierarchy specification from level definitions.
+
+`key_aliases` is **deprecated** — rename the column on the frame instead
+(`df.with_columns(pl.col("country.city.id").alias("country.code"))`). Synthesised
+keys are stripped from the per-level tables, so a hierarchy relying on them cannot
+round-trip through `normalize` / `denormalize`.
 
 #### `LevelSpec(name, id_fields, required_fields=None, order_by=None, parent_keys=None)`
 
