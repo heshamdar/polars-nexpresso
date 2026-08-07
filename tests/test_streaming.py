@@ -138,10 +138,13 @@ def test_order_by_sorts_child_list_inside_agg():
 
 
 @requires_streaming_pack
+@pytest.mark.parametrize("strategy", ["balanced", "hash"])
 @pytest.mark.parametrize("partitions", [1, 4, 64])
-def test_pack_streaming_matches_pack(packer, flat_df, partitions):
+def test_pack_streaming_matches_pack(packer, flat_df, partitions, strategy):
     ref = packer.pack(flat_df, "country")
-    out = packer.pack_streaming(flat_df, "country", partitions=partitions)
+    out = packer.pack_streaming(
+        flat_df, "country", partitions=partitions, partition_strategy=strategy
+    )
     assert isinstance(out, pl.LazyFrame)
     assert _same(out, ref)
 
@@ -193,6 +196,93 @@ def test_pack_streaming_rejects_bad_partitions(packer, flat_df):
         packer.pack_streaming(flat_df, "country", partitions=0)
 
 
+def test_pack_streaming_rejects_unknown_strategy(packer, flat_df):
+    with pytest.raises(ValueError, match="Invalid partition_strategy"):
+        packer.pack_streaming(flat_df, "country", partition_strategy="round-robin")
+
+
+# =============================================================================
+# Balanced vs hash partitioning
+# =============================================================================
+
+
+@pytest.fixture()
+def skewed_df() -> pl.DataFrame:
+    """A few large entities among many small ones — where hashing balances badly."""
+    rows = []
+    for entity in range(120):
+        n_children = 400 if entity < 4 else (entity % 7) + 1
+        rows.extend(
+            {
+                "country.id": f"C{entity:04d}",
+                "country.city.id": f"c{entity}_{i}",
+                "country.city.country_id": f"C{entity:04d}",
+            }
+            for i in range(n_children)
+        )
+    return pl.DataFrame(rows)
+
+
+@requires_streaming_pack
+def test_balanced_output_is_sorted_by_root_key(packer, skewed_df):
+    """Contiguous ascending key ranges make the concatenated result sorted."""
+    out = packer.pack_streaming(
+        skewed_df, "country", partitions=8, partition_strategy="balanced"
+    ).collect()
+
+    ids = out["country"].struct.field("id").to_list()
+    assert ids == sorted(ids)
+    assert _same(out, packer.pack(skewed_df, "country"))
+
+
+@requires_streaming_pack
+def test_balanced_lowers_peak_bucket_size(packer, skewed_df):
+    """Balancing rows beats hashing entities when entity sizes are uneven.
+
+    Peak memory is bounded by the largest bucket, and no scheme can go below the
+    largest single entity, which cannot be split.
+    """
+    lf = skewed_df.lazy()
+    keys = ["country.id"]
+    floor = lf.group_by(keys).agg(pl.len().alias("n")).collect()["n"].max()
+
+    bucket_map = packer._balanced_bucket_map(lf, keys, 8)
+    balanced = (
+        lf.join(bucket_map.lazy(), on=keys, how="left")
+        .group_by(hierarchical_packer.BUCKET_COLUMN)
+        .agg(pl.len())
+        .collect()["len"]
+        .to_list()
+    )
+    hashed = (
+        lf.with_columns((pl.struct(keys).hash() % 8).alias("b"))
+        .group_by("b")
+        .agg(pl.len())
+        .collect()["len"]
+        .to_list()
+    )
+
+    assert max(balanced) < max(hashed)
+    assert max(balanced) >= floor  # cannot beat the floor
+    # Every entity lands in exactly one bucket.
+    assert bucket_map.height == skewed_df["country.id"].n_unique()
+
+
+@requires_streaming_pack
+def test_balanced_bucket_count_floats_above_target(packer, skewed_df):
+    """An entity is never split, so a bucket closes early rather than overflow."""
+    lf = skewed_df.lazy()
+    bucket_map = packer._balanced_bucket_map(lf, ["country.id"], 4)
+    n_buckets = int(bucket_map[hierarchical_packer.BUCKET_COLUMN].max()) + 1
+
+    # Four 400-child entities alone exceed a quarter of the rows each, so the
+    # greedy pass must open more buckets than requested.
+    assert n_buckets > 4
+    # ...and it must not dump the remainder into one giant final bucket.
+    sizes = bucket_map.group_by(hierarchical_packer.BUCKET_COLUMN).agg(pl.len())["len"].to_list()
+    assert max(sizes) < bucket_map.height
+
+
 @pytest.mark.parametrize(
     "operation",
     [
@@ -239,16 +329,35 @@ def test_lazy_operations_do_not_execute(packer, flat_df, monkeypatch, operation)
 
 
 @requires_streaming_pack
-def test_pack_streaming_bucketing_paths_agree(packer, flat_df, tmp_path, monkeypatch):
-    """The single-pass partitioned sink and the per-bucket filter fallback agree."""
+@pytest.mark.parametrize("strategy", ["balanced", "hash"])
+def test_pack_streaming_bucketing_paths_agree(packer, flat_df, tmp_path, monkeypatch, strategy):
+    """The single-pass partitioned sink and the per-bucket filter fallback agree.
+
+    Polars versions before partitioned sinks (1.30) take the fallback, so both
+    paths have to carry every strategy.
+    """
     ref = packer.pack(flat_df, "country")
 
     fast_dir = tmp_path / "fast"
-    fast = packer.pack_streaming(flat_df, "country", partitions=4, tmp_dir=fast_dir, defer=False)
+    fast = packer.pack_streaming(
+        flat_df,
+        "country",
+        partitions=4,
+        tmp_dir=fast_dir,
+        defer=False,
+        partition_strategy=strategy,
+    )
 
     monkeypatch.setattr(hierarchical_packer, "_supports_partitioned_sink", lambda: False)
     slow_dir = tmp_path / "slow"
-    slow = packer.pack_streaming(flat_df, "country", partitions=4, tmp_dir=slow_dir, defer=False)
+    slow = packer.pack_streaming(
+        flat_df,
+        "country",
+        partitions=4,
+        tmp_dir=slow_dir,
+        defer=False,
+        partition_strategy=strategy,
+    )
 
     assert _same(fast, ref)
     assert _same(slow, ref)
@@ -257,9 +366,12 @@ def test_pack_streaming_bucketing_paths_agree(packer, flat_df, tmp_path, monkeyp
 
 
 @requires_streaming_pack
-def test_pack_streaming_keeps_entities_whole(packer, flat_df):
+@pytest.mark.parametrize("strategy", ["balanced", "hash"])
+def test_pack_streaming_keeps_entities_whole(packer, flat_df, strategy):
     """Every root entity ends up in exactly one output row, never split across buckets."""
-    out = packer.pack_streaming(flat_df, "country", partitions=32).collect()
+    out = packer.pack_streaming(
+        flat_df, "country", partitions=32, partition_strategy=strategy
+    ).collect()
     codes = out["country"].struct.field("id").to_list()
     assert sorted(codes) == sorted(set(codes))
     assert len(codes) == packer.pack(flat_df, "country").height

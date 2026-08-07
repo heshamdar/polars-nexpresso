@@ -292,7 +292,9 @@ Main class for hierarchical operations.
 
 **Key Methods:**
 - `pack(frame, to_level, *, extra_columns="preserve", parent_strategy="aggregate")` - Pack to coarser granularity (`parent_strategy="split_join"` reattaches heavy root attributes via a join)
-- `pack_streaming(source, to_level, *, partitions=16, ...)` - Memory-bounded pack for large data
+- `pack_streaming(source, to_level, *, partitions=16, partition_strategy="balanced", ...)` -
+  Memory-bounded pack for large data (`"balanced"` buckets by row count and returns
+  root-key-sorted output; `"hash"` is one pass cheaper but balances entities, not rows)
 - `unpack(frame, to_level)` - Unpack to finer granularity
 - `normalize(frame)` - Split into per-level tables
 - `denormalize(tables)` - Reconstruct from per-level tables; a true inverse of

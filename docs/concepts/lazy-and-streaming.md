@@ -92,9 +92,9 @@ that forces the fallback.
 ### Working around it: `pack_streaming`
 
 `pack_streaming` bounds memory by *partitioning* rather than by streaming the
-aggregation. It hashes the **root-level key** into `partitions` buckets — so all
-rows of an entity always land together — packs each bucket independently, and
-sinks each packed bucket to Parquet:
+aggregation. It buckets the **root-level key** — so all rows of an entity always
+land together — packs each bucket independently, and sinks each packed bucket to
+Parquet:
 
 ```python
 packed = packer.pack_streaming(
@@ -110,6 +110,48 @@ pass: the input is written once to a partitioned Parquet staging area and each
 bucket is then read back exactly once. (On Polars versions without partitioned
 sinks this degrades to one filtered pass per bucket — still correct, but it
 re-reads the source `partitions` times.)
+
+#### Why not just sort by the key first?
+
+Because **`sort` is itself an in-memory fallback**, on every version tested:
+
+```
+POLARS_VERBOSE=1 … .sort("country.code").sink_parquet(…)
+  polars 1.41.2 -> running in-memory-map in subgraph
+  polars 1.43.2 -> running in-memory-map in subgraph
+```
+
+Sorting the data to make entities contiguous would cost exactly the memory this
+method exists to bound. What *is* cheap is sorting the **per-entity row counts** —
+`group_by(root_key).agg(pl.len())` is a reducing aggregation, which the streaming
+engine runs natively with state proportional to the number of entities rather
+than the number of rows. That is what `partition_strategy="balanced"` does.
+
+#### `partition_strategy`
+
+| | `"balanced"` (default) | `"hash"` |
+|---|---|---|
+| Assignment | contiguous key ranges of ≈ equal **rows** | `hash(key) % partitions` |
+| Extra pass | one (per-entity counts) | none |
+| Balances | rows — what actually bounds memory | entities |
+| Bucket count | floats around `partitions` | exactly `partitions` |
+| Output order | sorted by root key | not guaranteed |
+
+Balancing rows matters when entity sizes are uneven. On a set with a few large
+entities among many small ones (30 230 rows, 300 entities, largest entity
+3 000 rows — the floor no scheme can beat, since an entity cannot be split):
+
+| `partitions` | `"hash"` max bucket | `"balanced"` max bucket | peak reduction |
+|---|---|---|---|
+| 8 | 6 834 (2.28× floor) | **3 775 (1.26×)** | 45% |
+| 16 | 6 472 (2.16× floor) | **3 000 (1.00×)** | 54% |
+| 64 | 3 240 (1.08× floor) | **3 000 (1.00×)** | 7%, using 22 buckets not 64 |
+
+`"balanced"` reaches the floor at `partitions=16` with 12 buckets, where `"hash"`
+still needs 64 buckets to get close. Note the bucket count is a *target*: an
+entity is never split, so a bucket closes early rather than overflow and more
+buckets than requested may be produced. Reach for `"hash"` when you know entity
+sizes are uniform and want to skip the counting pass.
 
 Choose `defer` deliberately:
 
@@ -136,7 +178,10 @@ Choose `defer` deliberately:
 `maintain_order` on the `group_by`. Two consequences:
 
 - **Top-level row order after packing is not guaranteed.** Compare packed frames
-  order-independently.
+  order-independently. The exception is
+  `pack_streaming(..., partition_strategy="balanced")`, whose buckets are
+  contiguous ascending key ranges sorted within each bucket, so the concatenated
+  result *is* ordered by root key.
 - **Child-list order *is* preserved.** A row index is carried through the
   aggregation and the child list is sorted by it inside the `agg`, so
   `preserve_child_order=True` (the default) and any `LevelSpec.order_by`

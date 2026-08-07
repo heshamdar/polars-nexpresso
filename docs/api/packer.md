@@ -125,6 +125,7 @@ def pack_streaming(
     tmp_dir: str | Path | None = None,
     defer: bool = True,
     extra_columns: Literal["preserve", "drop", "error"] = "preserve",
+    partition_strategy: Literal["balanced", "hash"] = "balanced",
 ) -> LazyFrame:
 ```
 
@@ -141,13 +142,33 @@ the packed output — bounding peak memory to one bucket.
 |-----------|------|-------------|
 | `source` | `DataFrame \| LazyFrame \| str \| Path` | Input at the finest granularity. A path/glob is scanned lazily with `scan_parquet`. |
 | `to_level` | `str` | Target level name |
-| `partitions` | `int` | Number of root-key buckets. More buckets = lower peak memory and more temporary files. Must be ≥ 1. |
+| `partitions` | `int` | Target number of root-key buckets. More buckets = lower peak memory and more temporary files. Must be ≥ 1. |
 | `tmp_dir` | `str \| Path \| None` | Directory for intermediate Parquet files. Defaults to a fresh temp directory the caller owns. |
 | `defer` | `bool` | When `True` (default), wraps the work in `pl.defer` so nothing runs until the result is collected. When `False`, sinks eagerly and returns a `scan_parquet` handle (downstream streams straight from disk). |
 | `extra_columns` | `Literal["preserve", "drop", "error"]` | How to handle non-hierarchy columns |
+| `partition_strategy` | `Literal["balanced", "hash"]` | How root keys map to buckets. See below. |
 
-**Returns:** A `LazyFrame` over the packed result. Top-level row order is not
-guaranteed; child-list order follows the same rules as [`pack`](#pack).
+**Returns:** A `LazyFrame` over the packed result. Under `"balanced"` the rows are
+ordered by root key; under `"hash"` top-level row order is not guaranteed.
+Child-list order follows the same rules as [`pack`](#pack) in both cases.
+
+**`partition_strategy`:**
+
+- `"balanced"` (default) — counts rows per entity in one extra streaming pass,
+  then cuts the key-ordered entities into contiguous buckets of roughly
+  `total_rows / partitions` rows. Balances *rows*, which is what bounds peak
+  memory, and leaves the output sorted by root key. The realised bucket count
+  floats around `partitions`: an entity is never split, so a bucket closes early
+  rather than overflow.
+- `"hash"` — assigns by `hash(root_key) % partitions`. One pass cheaper and gives
+  exactly `partitions` buckets, but it balances entities rather than rows, so
+  uneven entity sizes give an uneven peak.
+
+A global `sort` is deliberately *not* used to group entities: sort is itself an
+in-memory fallback under the streaming engine, so it would cost the very memory
+this method bounds. See
+[Lazy Evaluation & Streaming](../concepts/lazy-and-streaming.md) for the measured
+comparison.
 
 **Example:**
 

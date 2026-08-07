@@ -15,6 +15,7 @@ Example
 
 from __future__ import annotations
 
+import math
 import shutil
 import tempfile
 import warnings
@@ -34,6 +35,7 @@ FrameT = TypeVar("FrameT", pl.LazyFrame, pl.DataFrame)
 ColumnSelector = str | pl.Expr
 ExtraColumnsMode = Literal["preserve", "drop", "error"]
 ParentStrategy = Literal["aggregate", "split_join"]
+PartitionStrategy = Literal["balanced", "hash"]
 PromoteAggregation = Literal[
     "list", "set", "sum", "mean", "min", "max", "first", "last", "count", "single"
 ]
@@ -49,6 +51,29 @@ DEFAULT_ESCAPE_CHAR = "\\"
 def _supports_partitioned_sink() -> bool:
     """Whether this Polars version exposes ``pl.PartitionBy`` for partitioned sinks."""
     return hasattr(pl, "PartitionBy")
+
+
+def _sorted_bucket_dirs(stage_dir: Path) -> list[Path]:
+    """
+    Bucket directories written by ``pl.PartitionBy``, in ascending bucket order.
+
+    ``PartitionBy`` names them ``<key>=<value>``. Sorting the names as strings
+    puts ``...=10`` before ``...=2``, which would scramble the contiguous key
+    ranges that make the concatenated output sorted, so order by the parsed
+    integer value instead.
+
+    Args:
+        stage_dir: Directory holding the partitioned output.
+
+    Returns:
+        Bucket directories ordered by their numeric bucket value.
+    """
+
+    def bucket_value(path: Path) -> int:
+        _, _, raw = path.name.partition("=")
+        return int(raw)
+
+    return sorted((p for p in stage_dir.iterdir() if p.is_dir()), key=bucket_value)
 
 
 def _split_path_static(
@@ -100,6 +125,8 @@ __all__ = [
     "HierarchySpec",
     "HierarchicalPacker",
     "HierarchyValidationError",
+    "ParentStrategy",
+    "PartitionStrategy",
     "PromoteAggregation",
     "SchemaInput",
 ]
@@ -1167,6 +1194,7 @@ class HierarchicalPacker:
         tmp_dir: str | Path | None = None,
         defer: bool = True,
         extra_columns: ExtraColumnsMode = "preserve",
+        partition_strategy: PartitionStrategy = "balanced",
     ) -> pl.LazyFrame:
         """
         Memory-bounded :meth:`pack` for datasets too large to pack in one shot.
@@ -1186,13 +1214,20 @@ class HierarchicalPacker:
         partitioned sinks this degrades to one filtered pass per bucket, which is
         correct but re-reads the source ``partitions`` times.
 
+        Note that a global ``sort`` cannot be used to group entities instead: sort
+        is itself an in-memory fallback under the streaming engine, so it would
+        cost exactly the memory this method exists to bound. ``"balanced"`` sorts
+        only the per-entity row counts, which is a native streaming aggregation
+        whose state is proportional to the *number of entities*, not rows.
+
         Args:
             source: Input at the finest granularity. May be a DataFrame, a
                 LazyFrame, or a path/glob to Parquet file(s) (scanned lazily).
             to_level: The target level name to pack down to.
-            partitions: Number of root-key buckets. More buckets means lower peak
-                memory and more temporary files. Must be >= 1; ``1`` skips
-                bucketing entirely and is equivalent to ``pack`` + ``sink_parquet``.
+            partitions: Target number of root-key buckets. More buckets means
+                lower peak memory and more temporary files. Must be >= 1; ``1``
+                skips bucketing entirely. Under ``"balanced"`` this is a target
+                rather than an exact count — see ``partition_strategy``.
             tmp_dir: Directory for the intermediate per-bucket Parquet files.
                 Defaults to a fresh :func:`tempfile.mkdtemp` directory; the caller
                 owns cleanup. Transient staging files are written under a
@@ -1209,18 +1244,40 @@ class HierarchicalPacker:
                 result itself does not fit in memory).
             extra_columns: How to handle columns outside the hierarchy. See
                 :meth:`pack`.
+            partition_strategy: How root keys are assigned to buckets.
+                - ``"balanced"`` (default): count rows per entity in one extra
+                  streaming pass, then cut the key-ordered entities into
+                  contiguous buckets of roughly ``total_rows / partitions`` rows.
+                  Balances *rows*, which is what bounds peak memory, and keeps the
+                  buckets in ascending key order so the result is sorted by root
+                  key. The realised bucket count floats around ``partitions``: an
+                  entity is never split, so a bucket closes early rather than
+                  overflow, and more buckets than requested may be produced.
+                - ``"hash"``: assign by ``hash(root_key) % partitions``. One pass
+                  cheaper and gives exactly ``partitions`` buckets, but it
+                  balances entities rather than rows, so an uneven entity-size
+                  distribution produces an uneven peak. Top-level row order is
+                  not guaranteed.
 
         Returns:
-            A LazyFrame over the packed result. Top-level row order is not
-            guaranteed; child-list order follows the same rules as :meth:`pack`.
+            A LazyFrame over the packed result. Under ``"balanced"`` the rows are
+            ordered by root key; under ``"hash"`` top-level row order is not
+            guaranteed. Child-list order follows the same rules as :meth:`pack`
+            in both cases.
 
         Raises:
-            ValueError: If ``partitions`` < 1.
+            ValueError: If ``partitions`` < 1 or ``partition_strategy`` is unknown.
             HierarchyValidationError: If the root level defines no id fields to
                 partition on.
         """
         if partitions < 1:
             raise ValueError(f"partitions must be >= 1, got {partitions}.")
+
+        if partition_strategy not in ("balanced", "hash"):
+            raise ValueError(
+                f"Invalid partition_strategy: {partition_strategy!r}. "
+                "Must be 'balanced' or 'hash'."
+            )
 
         if defer and not hasattr(pl, "defer"):
             raise RuntimeError(
@@ -1255,53 +1312,156 @@ class HierarchicalPacker:
             else Path(tempfile.mkdtemp(prefix="nexpresso_pack_"))
         )
         out_dir.mkdir(parents=True, exist_ok=True)
-        pattern = str(out_dir / "part_*.parquet")
-
-        bucket_expr = (pl.struct(root_keys).hash() % partitions).alias(BUCKET_COLUMN)
+        sort_output = partition_strategy == "balanced"
 
         def _pack_bucket(bucket_source: pl.LazyFrame, index: int) -> None:
-            self.pack(bucket_source, to_level, extra_columns=extra_columns).sink_parquet(
-                out_dir / f"part_{index:05d}.parquet"
-            )
+            packed = self.pack(bucket_source, to_level, extra_columns=extra_columns)
+            if sort_output:
+                # Buckets are contiguous ascending key ranges, so sorting within
+                # each one makes the concatenation globally sorted. The bucket is
+                # already materialized by the pack, so this stays bounded.
+                sort_by = self._root_sort_exprs(packed.collect_schema())
+                if sort_by:
+                    packed = packed.sort(sort_by)
+            packed.sink_parquet(out_dir / f"part_{index:05d}.parquet")
 
-        def _run_partitions() -> None:
+        def _bucketed(source_lf: pl.LazyFrame) -> tuple[pl.LazyFrame, int]:
+            """Attach BUCKET_COLUMN to *source_lf*; return it and the bucket count."""
+            if partition_strategy == "hash":
+                expr = (pl.struct(root_keys).hash() % partitions).alias(BUCKET_COLUMN)
+                return source_lf.with_columns(expr), partitions
+
+            bucket_map = self._balanced_bucket_map(source_lf, root_keys, partitions)
+            # Buckets are numbered contiguously from 0, so the height of the
+            # distinct set is the count.
+            n_buckets = bucket_map.select(pl.col(BUCKET_COLUMN).n_unique()).item()
+            return source_lf.join(bucket_map.lazy(), on=root_keys, how="left"), int(n_buckets)
+
+        def _run_partitions() -> list[Path]:
             if partitions == 1:
                 _pack_bucket(prepared, 0)
-                return
+                return [out_dir / "part_00000.parquet"]
+
+            bucketed, n_buckets = _bucketed(prepared)
 
             if not _supports_partitioned_sink():
                 # Fallback: one filtered pass per bucket. Correct, but it re-reads
-                # the whole source ``partitions`` times.
-                for i in range(partitions):
-                    _pack_bucket(prepared.filter(bucket_expr == i), i)
-                return
+                # the whole source once per bucket.
+                for i in range(n_buckets):
+                    _pack_bucket(bucketed.filter(pl.col(BUCKET_COLUMN) == i).drop(BUCKET_COLUMN), i)
+                return [out_dir / f"part_{i:05d}.parquet" for i in range(n_buckets)]
 
             # Single streaming pass writes every bucket to its own directory, so
             # the source is read once instead of once per bucket.
             stage_dir = out_dir / "_stage"
-            prepared.with_columns(bucket_expr).sink_parquet(
+            bucketed.sink_parquet(
                 pl.PartitionBy(stage_dir, key=BUCKET_COLUMN, include_key=False),
                 mkdir=True,
             )
             try:
-                # Glob whole bucket *directories*: a bucket may be spread over
-                # several files, and all rows for a root key must be packed together.
-                bucket_dirs = sorted(p for p in stage_dir.iterdir() if p.is_dir())
-                for i, bucket_dir in enumerate(bucket_dirs):
+                # Scan whole bucket *directories*: a bucket may be spread over
+                # several files, and all rows for a root key must be packed
+                # together. Order numerically by the bucket value — the directory
+                # names sort lexicographically ("...=10" before "...=2"), which
+                # would scramble the key ranges.
+                for i, bucket_dir in enumerate(_sorted_bucket_dirs(stage_dir)):
                     _pack_bucket(pl.scan_parquet(bucket_dir / "**/*.parquet"), i)
+                    written = i + 1
             finally:
                 shutil.rmtree(stage_dir, ignore_errors=True)
+            return [out_dir / f"part_{i:05d}.parquet" for i in range(written)]
 
         if defer:
 
             def _materialize() -> pl.DataFrame:
-                _run_partitions()
-                return pl.scan_parquet(pattern).collect(engine="streaming")
+                parts = _run_partitions()
+                return pl.scan_parquet(parts).collect(engine="streaming")
 
             return pl.defer(_materialize, schema=expected_schema)
 
-        _run_partitions()
-        return pl.scan_parquet(pattern)
+        return pl.scan_parquet(_run_partitions())
+
+    def _balanced_bucket_map(
+        self, source_lf: pl.LazyFrame, root_keys: list[str], partitions: int
+    ) -> pl.DataFrame:
+        """
+        Assign each root key to a contiguous, roughly row-balanced bucket.
+
+        Counting rows per entity is a *reducing* aggregation, which the streaming
+        engine runs natively — its state is proportional to the number of
+        entities, not the number of rows — so this stays memory-bounded where a
+        global ``sort`` of the data would not.
+
+        Entities are then walked in key order and packed greedily into buckets of
+        about ``total_rows / partitions`` rows. An entity is never split, so a
+        bucket closes early rather than overflow; the bucket count is therefore
+        driven by the target size and may exceed ``partitions``. Capping it would
+        push every leftover entity into the final bucket and defeat the point.
+
+        Args:
+            source_lf: The prepared source frame.
+            root_keys: Root-level key columns.
+            partitions: Target bucket count.
+
+        Returns:
+            A small DataFrame of ``root_keys`` plus a ``BUCKET_COLUMN``, one row
+            per distinct root key, ordered by key.
+        """
+        counts = (
+            source_lf.group_by(root_keys)
+            .agg(pl.len().alias("__hier_n"))
+            .collect(engine="streaming")
+            .sort(root_keys)
+        )
+        if counts.is_empty():
+            return counts.select(*root_keys).with_columns(
+                pl.lit(0, dtype=pl.UInt32).alias(BUCKET_COLUMN)
+            )
+
+        total = int(counts["__hier_n"].sum())
+        target = max(1, math.ceil(total / partitions))
+
+        assignment: list[int] = []
+        bucket = 0
+        filled = 0
+        for size in counts["__hier_n"]:
+            if filled and filled + size > target:
+                bucket += 1
+                filled = 0
+            assignment.append(bucket)
+            filled += size
+
+        return counts.select(*root_keys).with_columns(
+            pl.Series(BUCKET_COLUMN, assignment, dtype=pl.UInt32)
+        )
+
+    def _root_sort_exprs(self, schema: pl.Schema) -> list[pl.Expr]:
+        """
+        Expressions that sort a packed frame by its root key.
+
+        The root key is a set of top-level columns until the frame is packed all
+        the way to the root, at which point it lives inside the root struct.
+
+        Args:
+            schema: Schema of the packed frame.
+
+        Returns:
+            Sort expressions, or an empty list if the root key is not reachable.
+        """
+        root = self._levels_meta[0]
+        if root.id_columns and all(col in schema for col in root.id_columns):
+            return [pl.col(col) for col in root.id_columns]
+
+        if root.path in schema:
+            dtype = schema[root.path]
+            inner = dtype.inner if isinstance(dtype, pl.List) else dtype
+            if isinstance(inner, pl.Struct):
+                fields = {f.name for f in inner.fields}
+                short = [col[len(root.prefix) :] for col in root.id_columns]
+                if short and all(name in fields for name in short):
+                    return [pl.col(root.path).struct.field(name) for name in short]
+
+        return []
 
     def unpack_streaming(
         self,
