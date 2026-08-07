@@ -62,12 +62,18 @@ def _sorted_bucket_dirs(stage_dir: Path) -> list[Path]:
     ranges that make the concatenated output sorted, so order by the parsed
     integer value instead.
 
+    An empty input produces no partitions at all, so the directory may not even
+    exist; that is reported as "no buckets" rather than an error.
+
     Args:
         stage_dir: Directory holding the partitioned output.
 
     Returns:
-        Bucket directories ordered by their numeric bucket value.
+        Bucket directories ordered by their numeric bucket value, or an empty
+        list if nothing was staged.
     """
+    if not stage_dir.is_dir():
+        return []
 
     def bucket_value(path: Path) -> int:
         _, _, raw = path.name.partition("=")
@@ -1335,18 +1341,36 @@ class HierarchicalPacker:
             # Buckets are numbered contiguously from 0, so the height of the
             # distinct set is the count.
             n_buckets = bucket_map.select(pl.col(BUCKET_COLUMN).n_unique()).item()
-            return source_lf.join(bucket_map.lazy(), on=root_keys, how="left"), int(n_buckets)
+            # ``nulls_equal`` matters: ``group_by`` treats null as its own group, so
+            # the map has a row for it, but a normal join does not match null to
+            # null. Without this those rows get a *null* bucket, which
+            # ``PartitionBy`` writes as a ``__HIVE_DEFAULT_PARTITION__`` directory
+            # that is not an integer bucket id.
+            joined = source_lf.join(bucket_map.lazy(), on=root_keys, how="left", nulls_equal=True)
+            return joined, int(n_buckets)
+
+        def _pack_whole_source() -> list[Path]:
+            """Single part covering everything — used when there is nothing to split.
+
+            Also the empty-input path: a source with no rows yields no buckets at
+            all, and ``scan_parquet`` needs at least one source, so a single
+            (empty) part keeps the result well-formed with the right schema, the
+            way eager ``pack`` already behaves.
+            """
+            _pack_bucket(prepared, 0)
+            return [out_dir / "part_00000.parquet"]
 
         def _run_partitions() -> list[Path]:
             if partitions == 1:
-                _pack_bucket(prepared, 0)
-                return [out_dir / "part_00000.parquet"]
+                return _pack_whole_source()
 
             bucketed, n_buckets = _bucketed(prepared)
 
             if not _supports_partitioned_sink():
                 # Fallback: one filtered pass per bucket. Correct, but it re-reads
                 # the whole source once per bucket.
+                if n_buckets == 0:
+                    return _pack_whole_source()
                 for i in range(n_buckets):
                     _pack_bucket(bucketed.filter(pl.col(BUCKET_COLUMN) == i).drop(BUCKET_COLUMN), i)
                 return [out_dir / f"part_{i:05d}.parquet" for i in range(n_buckets)]
@@ -1364,12 +1388,16 @@ class HierarchicalPacker:
                 # together. Order numerically by the bucket value — the directory
                 # names sort lexicographically ("...=10" before "...=2"), which
                 # would scramble the key ranges.
-                for i, bucket_dir in enumerate(_sorted_bucket_dirs(stage_dir)):
+                bucket_dirs = _sorted_bucket_dirs(stage_dir)
+                for i, bucket_dir in enumerate(bucket_dirs):
                     _pack_bucket(pl.scan_parquet(bucket_dir / "**/*.parquet"), i)
-                    written = i + 1
             finally:
                 shutil.rmtree(stage_dir, ignore_errors=True)
-            return [out_dir / f"part_{i:05d}.parquet" for i in range(written)]
+
+            if not bucket_dirs:
+                return _pack_whole_source()
+
+            return [out_dir / f"part_{i:05d}.parquet" for i in range(len(bucket_dirs))]
 
         if defer:
 

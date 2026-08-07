@@ -92,6 +92,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   picked up the `arr.eval()` version gate — rather than the alias it was
   documented to be. It is now a re-export shim.
 - `__version__` reported `0.3.1` while the package was `0.4.0`.
+- `pack_streaming` crashed on an **empty input** with `partitions > 1`:
+  `PartitionBy` writes no partitions at all, so the staging directory never
+  appeared (`FileNotFoundError`), and on Polars 1.30's fallback path a zero
+  bucket count wrote no parts at all (`ComputeError: expected at least 1
+  source`). It now returns an empty result with the correct schema, as eager
+  `pack` already did.
+- `pack_streaming(partition_strategy="balanced")` crashed on **null root keys**.
+  `group_by` treats null as its own group, but a plain join does not match null
+  to null, so those rows came out with a null bucket that `PartitionBy` wrote as
+  `__HIVE_DEFAULT_PARTITION__` — not an integer bucket id. The join is now
+  null-matching.
 
 ### Performance
 

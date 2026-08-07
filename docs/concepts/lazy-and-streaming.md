@@ -111,6 +111,46 @@ bucket is then read back exactly once. (On Polars versions without partitioned
 sinks this degrades to one filtered pass per bucket — still correct, but it
 re-reads the source `partitions` times.)
 
+#### Why does it write files at all?
+
+Because that is what "partition" means in Polars, and because disk is what makes
+the memory bound real:
+
+```text
+LazyFrame has .partition_by?   False
+DataFrame has .partition_by?   True   -> list[DataFrame], eager
+pl.PartitionBy docstring:      "Configuration for writing to multiple output files."
+   LazyFrame.sink_parquet accepts PartitionBy?  True
+   LazyFrame.collect      accepts PartitionBy?  False
+```
+
+`pl.PartitionBy` is a **sink target**, not a lazy operation. There is no lazy
+`partition_by`; the eager `DataFrame.partition_by` materializes the whole frame
+first, which is exactly the blow-up being avoided. And a LazyFrame is a *plan*,
+not a buffer — N lazily-filtered partitions each re-scan the source when
+collected, which is the slow fallback path.
+
+So the staging files are the bounded-memory buffer. **If your data fits in
+memory, you do not want `pack_streaming` at all — use `pack()`.**
+
+`LazyFrame.sink_batches` does not help either, despite looking like it should.
+Batch boundaries do not respect groups:
+
+```text
+batches=4   entities appearing in >1 batch: 3   -> group boundaries NOT respected
+sink_batches(lazy=True) -> LazyFrame, but collecting it gives height=0
+```
+
+An entity's rows arrive across several callbacks, so you cannot aggregate one per
+batch, and buffering until an entity is complete means holding the whole stream.
+It is also a sink, not a pipe — no data passes through. It *is* useful on the
+**result**, though, for consuming a packed frame incrementally:
+
+```python
+packed = packer.pack_streaming("flat/*.parquet", "region", defer=False)
+packed.sink_batches(write_to_warehouse, engine="streaming")   # never one frame in memory
+```
+
 #### Why not just sort by the key first?
 
 Because **`sort` is itself an in-memory fallback**, on every version tested:
@@ -122,10 +162,25 @@ POLARS_VERBOSE=1 … .sort("country.code").sink_parquet(…)
 ```
 
 Sorting the data to make entities contiguous would cost exactly the memory this
-method exists to bound. What *is* cheap is sorting the **per-entity row counts** —
-`group_by(root_key).agg(pl.len())` is a reducing aggregation, which the streaming
-engine runs natively with state proportional to the number of entities rather
-than the number of rows. That is what `partition_strategy="balanced"` does.
+method exists to bound.
+
+The counting pass is not a clever substitute for sorting — it replaces sorting
+*the data* with sorting *a much smaller table*. To cut entities into contiguous
+key ranges you only need to know **which key belongs in which bucket**, and that
+question is answerable from one row per entity:
+
+1. `group_by(root_key).agg(pl.len())` — a *reducing* aggregation, which the
+   streaming engine runs natively, with state proportional to the number of
+   entities rather than the number of rows.
+2. Sort **that** table by key (hundreds or thousands of rows, not millions) and
+   walk it, accumulating counts and starting a new bucket at the target size.
+   The result is a small `{key → bucket}` map.
+3. Join the map onto the data in the single streaming pass that writes the
+   staging partitions.
+
+The only sort is over the entity table. Measured at 4–7% of end-to-end: 21 ms of
+544 ms at 20k entities, 64 ms of 962 ms at 200k. That is what
+`partition_strategy="balanced"` does.
 
 #### `partition_strategy`
 
@@ -153,13 +208,51 @@ entity is never split, so a bucket closes early rather than overflow and more
 buckets than requested may be produced. Reach for `"hash"` when you know entity
 sizes are uniform and want to skip the counting pass.
 
-Choose `defer` deliberately:
+#### What about partitioning directly on the key columns?
 
-- `defer=True` (default) keeps the call chain lazy, but the packed result is
-  materialized in memory at the defer boundary.
-- `defer=False` sinks the buckets eagerly and hands back a `scan_parquet`
-  handle, so downstream work streams straight from disk. Use this when the
-  *packed* result also does not fit in memory.
+It works — `sink_parquet(pl.PartitionBy(key=root_keys))` streams natively, needs no
+sort, and would be floor-optimal since each partition holds exactly one entity.
+It is also already reachable: raise `partitions` past the entity count and
+`"balanced"` degenerates to precisely that (verified — `partitions=100000` on 300
+entities yields exactly 300 buckets).
+
+The reason it is not the default is per-file Parquet overhead. One file per
+entity means the footers and dictionaries dominate:
+
+| entities | one file per key | 64 buckets |
+|---|---|---|
+| 300 | 0.11 s, 300 files, 0.33 MB | 0.03 s, 63 files, 0.09 MB |
+| 20 000 | 3.87 s, 20 000 files, 19.8 MB | 0.12 s, 64 files, 0.60 MB |
+| 200 000 | 35.5 s, 200 000 files, 187 MB | 0.10 s, 64 files, 3.0 MB |
+
+At 200k entities that is 62× the disk and 350× the time. Hierarchical data
+usually has high root cardinality — that is why you are packing it — so bucketing
+several entities per file is the right default. If your root cardinality is low
+and you want the memory floor, just raise `partitions`.
+
+#### `defer=True` defers the trigger; `defer=False` defers the data
+
+Both keep work out of the call, but they are lazy about different things, and the
+difference shows up in the query plan:
+
+```text
+defer=True  -> PYTHON SCAN []                                  (opaque; materializes on collect)
+defer=False -> Parquet SCAN [part_00000.parquet, ... 9 more]   (a real scan)
+
+downstream filter on defer=False: SELECTION pushed into scan   (predicate pushdown works)
+consuming it with sink_batches:   batches=10, total_rows=300   (never one frame in memory)
+```
+
+- `defer=True` (default) runs nothing until you collect, but the packed result is
+  materialized in memory at the defer boundary, and the opaque `PYTHON SCAN` node
+  blocks predicate pushdown. Fine when the *packed* result comfortably fits —
+  which is common, since packing collapses many rows into one per entity.
+- `defer=False` does the bucketing and packing immediately and hands back a real
+  `scan_parquet` over the parts. Downstream filters push into the scan and the
+  result streams from disk.
+
+**Rule of thumb: if the packed result also does not fit in memory, use
+`defer=False`.**
 
 ### Cost summary
 
