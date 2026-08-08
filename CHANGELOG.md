@@ -38,6 +38,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `any_child_satisfies`. Terminals: `tables`, `to_flat` / `collect`,
   `to_nested` / `collect_nested`, `sink_parquet`.
 
+  **Cross-level references.** Polars rejects named columns inside `list.eval`
+  ("named columns are not allowed in `eval` functions"), so in a packed frame a
+  leaf value can never be combined with a parent attribute — there is no outer
+  scope to reach into. On a view it is an ordinary expression, because
+  underneath it is a join:
+
+  ```python
+  view.with_columns(
+      (
+          pl.col("region.store.sale.amount")
+          * (1 - pl.col("region.store.discount"))   # parent
+          * (1 + pl.col("region.tax_rate"))         # grandparent
+      ).alias("region.store.sale.final")
+  )
+  ```
+
+  `filter` and `any_child_satisfies` take cross-level predicates on the same
+  terms. Referencing a parent *aggregate* from the child is `promote` followed
+  by an ordinary expression, or a window over the parent key when no join is
+  wanted.
+
   A predicate on an ancestor **key** is applied to every table carrying it —
   sound transitive pushdown, since `normalize()` replicates ancestor keys as
   foreign keys — so the deepest scan skips row groups with no join at all.
@@ -49,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`benchmarks/bench_storage.py`** — compares nested / flat / normalized
   layouts across nine representative queries, cross-checking every result
   across layouts before timing so a divergence fails the run.
+
+- **`examples_hierarchy_view.py`** — a runnable tour: the `list.eval`
+  limitation demonstrated directly, then cross-level expressions, rollups and
+  shares, cross-level filtering, conditional aggregation, and a full pipeline
+  ending in the packed shape.
 
 - **`docs/concepts/storage-layouts.md`** and **`docs/api/view.md`** — the
   measurements behind the above, and the API reference.

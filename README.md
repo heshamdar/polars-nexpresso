@@ -111,6 +111,7 @@ Query normalized per-level storage through a nested interface.
 | Feature | Description |
 |---------|-------------|
 | **Nested interface, flat storage** | Address columns by dotted path; the view routes to the owning table |
+| **Cross-level expressions** | Combine leaf, parent and grandparent columns in one expression — impossible inside `list.eval` |
 | **No hand-written joins** | Cross-level operations join automatically, only when needed |
 | **Transitive key pushdown** | Ancestor-key predicates reach the deepest scan with no join |
 | **Deferred consistency** | Filtering one level restricts the others, applied once at materialization |
@@ -364,8 +365,23 @@ hot.collect("sale")      # flat, joined to leaf granularity
 hot.collect_nested()     # the packed List[Struct] shape
 ```
 
-See [Storage Layouts](docs/concepts/storage-layouts.md) for the measurements and
-`benchmarks/bench_storage.py` to reproduce them.
+It also unlocks something `list.eval` cannot express at all — Polars rejects
+named columns inside an eval context, so a leaf value can never be combined with
+a parent attribute in a packed frame. On a view it is just an expression:
+
+```python
+view.with_columns(
+    (
+        pl.col("region.store.sale.amount")
+        * (1 - pl.col("region.store.discount"))   # parent
+        * (1 + pl.col("region.tax_rate"))         # grandparent
+    ).alias("region.store.sale.final")
+)
+```
+
+See [Storage Layouts](docs/concepts/storage-layouts.md) for the measurements,
+`python examples_hierarchy_view.py` for a runnable tour, and
+`benchmarks/bench_storage.py` to reproduce the numbers.
 
 ## Performance
 
