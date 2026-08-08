@@ -439,6 +439,23 @@ class TestAnyChildSatisfies:
         )
         assert kept.height == flat.filter(predicate)["region.id"].n_unique()
 
+    def test_predicate_may_span_levels(self, view: HierarchyView, flat: pl.DataFrame):
+        """The predicate is evaluated at child_level but may reach upward."""
+        predicate = pl.col(AMOUNT) > pl.col("region.id") * 5
+        kept = (
+            view.any_child_satisfies(predicate, at_level="store", child_level="sale")
+            .tables()["store"]
+            .collect()
+        )
+        want = flat.filter(predicate)["region.store.id"].n_unique()
+        assert kept.height == want
+
+    def test_borrowed_columns_do_not_leak(self, view: HierarchyView):
+        restricted = view.any_child_satisfies(
+            pl.col(AMOUNT) > pl.col("region.id") * 5, at_level="store", child_level="sale"
+        )
+        assert "region.name" not in restricted.tables()["store"].collect_schema().names()
+
     def test_requires_finer_child(self, view: HierarchyView):
         with pytest.raises(ValueError, match="must be finer"):
             view.any_child_satisfies(

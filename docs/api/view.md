@@ -126,6 +126,85 @@ def any_child_satisfies(
 Keeps only `at_level` rows having at least one matching descendant — a
 semi-join. `child_level` may skip levels.
 
+## Cross-level references
+
+Inside `list.eval` Polars forbids named columns outright:
+
+```text
+ComputeError: named columns are not allowed in `eval` functions; consider using `element`
+```
+
+So a leaf value can never be combined with a parent attribute in a packed
+frame — there is no outer scope to reach into. On a view this is an ordinary
+expression, because underneath it is a join:
+
+```python
+# leaf x parent
+view.with_columns(
+    (pl.col("region.store.sale.amount") * (1 - pl.col("region.store.discount")))
+    .alias("region.store.sale.net")
+)
+
+# leaf x grandparent, and all three levels at once
+view.with_columns(
+    (
+        pl.col("region.store.sale.amount")
+        * (1 - pl.col("region.store.discount"))
+        * (1 + pl.col("region.tax_rate"))
+    ).alias("region.store.sale.final")
+)
+```
+
+`filter` and `any_child_satisfies` accept cross-level predicates on the same
+terms — the ancestor columns are joined in for the evaluation and dropped
+again, so the target level keeps its own schema.
+
+```python
+# 'regions containing a sale that alone owes more than 15 in tax'
+view.any_child_satisfies(
+    pl.col("region.store.sale.amount") * pl.col("region.tax_rate") > 15.0,
+    at_level="region",
+    child_level="sale",
+)
+```
+
+### Referencing a parent aggregate from the child
+
+Two steps, both cheap: roll up with `promote`, then read the result back down.
+
+```python
+view.promote("amount", from_level="sale", to_level="store", agg="sum", alias="revenue")
+    .with_columns(
+        (pl.col("region.store.sale.amount") / pl.col("region.store.revenue"))
+        .alias("region.store.sale.share")
+    )
+```
+
+When the aggregate is over the immediate parent, a window over the parent key
+is cheaper still and needs no join at all — `normalize()` puts the parent key
+on the child table:
+
+```python
+view.with_columns(
+    (pl.col("region.store.sale.amount") / pl.col("region.store.sale.amount").sum().over("region.store.id"))
+    .alias("region.store.sale.share")
+)
+```
+
+### Conditional aggregation
+
+Mask at the leaf, then promote, so non-matching children contribute zero
+instead of disappearing from the hierarchy:
+
+```python
+view.with_columns(
+    pl.when(pl.col("region.store.sale.qty") >= 3)
+    .then(pl.col("region.store.sale.amount"))
+    .otherwise(0.0)
+    .alias("region.store.sale.bulk")
+).promote("bulk", from_level="sale", to_level="store", agg="sum", alias="bulk_revenue")
+```
+
 ## Terminal methods
 
 | Method | Returns | Cost |

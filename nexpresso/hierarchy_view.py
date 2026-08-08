@@ -415,6 +415,20 @@ class HierarchyView:
             dirty.add(parent)
         return tables
 
+    def _evaluate_at(self, level: str, predicate: pl.Expr) -> pl.LazyFrame:
+        """
+        ``level``'s table filtered by ``predicate``, whatever levels it spans.
+
+        Ancestor columns the predicate needs are joined in for the evaluation
+        and dropped again, so the result keeps ``level``'s own schema.
+        """
+        roots = predicate.meta.root_names()
+        present = self._columns_of(level)
+        if not roots or set(roots) <= present:
+            return self._tables[level].filter(predicate)
+        widened, added = self._augmented(level, roots)
+        return widened.filter(predicate).drop(added)
+
     def _augmented(self, level: str, columns: Iterable[str]) -> tuple[pl.LazyFrame, list[str]]:
         """
         ``level``'s table widened with ancestor-owned ``columns``.
@@ -507,8 +521,7 @@ class HierarchyView:
                 )
             ordered = list(self._tables)
             deepest = max((o for o in owners if o is not None), key=ordered.index)
-            widened, added = self._augmented(deepest, roots)
-            tables[deepest] = widened.filter(predicate).drop(added)
+            tables[deepest] = self._evaluate_at(deepest, predicate)
             touched.add(deepest)
         return self._rebuild(tables, restricted=touched)
 
@@ -671,7 +684,9 @@ class HierarchyView:
         predicate pushdown.
 
         Args:
-            predicate: Boolean expression over ``child_level`` columns.
+            predicate: Boolean expression evaluated at ``child_level``. It may
+                reference ancestor columns too — those are joined in for the
+                evaluation and dropped again.
             at_level: Level to filter.
             child_level: Descendant level the predicate applies to.
 
@@ -696,7 +711,7 @@ class HierarchyView:
                 f"Level {child_level!r} carries none of {at_level!r}'s key columns "
                 f"{self._key_columns(at_level)}."
             )
-        matching = self._tables[child_level].filter(predicate).select(keys).unique()
+        matching = self._evaluate_at(child_level, predicate).select(keys).unique()
         tables = dict(self._tables)
         tables[at_level] = tables[at_level].join(matching, on=keys, how="semi")
         return self._rebuild(tables, restricted={at_level})
