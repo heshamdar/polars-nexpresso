@@ -2148,15 +2148,18 @@ class HierarchicalPacker:
         lf = self._to_lazy(data)
 
         if column_mapping:
+            # Resolve the schema once: called inline below it would re-resolve the
+            # plan for every entry in the mapping.
+            mapping_schema = lf.collect_schema()
             # Rename columns first according to mapping
             rename_exprs = [
                 pl.col(raw_col).alias(target_col)
                 for raw_col, target_col in column_mapping.items()
-                if raw_col in lf.collect_schema()
+                if raw_col in mapping_schema
             ]
             if rename_exprs:
                 # Select all columns, applying renames
-                all_cols = lf.collect_schema().keys()
+                all_cols = mapping_schema.keys()
                 select_exprs: list[pl.Expr] = []
                 for col in all_cols:
                     if col in column_mapping:

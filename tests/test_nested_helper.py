@@ -14,8 +14,10 @@ Tests cover:
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 from nexpresso import NestedExpressionBuilder, apply_nested_operations, generate_nested_exprs
+from nexpresso.expressions import _references_struct_context
 from tests.conftest import requires_arr_eval
 
 
@@ -742,3 +744,66 @@ def test_struct_with_pl_expr_field():
 
     assert result["struct_col"][0]["sum"] == 30
     assert result["struct_col"][0]["multiplied"] == 200
+
+
+# =============================================================================
+# Struct-context detection (select-mode fast path)
+# =============================================================================
+
+
+class TestStructContextDetection:
+    """Guards the ``pl.field()`` detection that routes ``select`` mode.
+
+    ``select`` mode assembles the result struct directly when no transform
+    references ``pl.field()``, and falls back to ``struct.with_fields`` when one
+    does. The fallback is correct but re-materializes the struct once per field
+    read, so it is only worth paying when actually needed. Detection keys off the
+    expression repr; these tests fail loudly if a Polars release changes it.
+    """
+
+    def test_marker_detects_pl_field_in_all_forms(self) -> None:
+        """The marker matches pl.field() however it was constructed."""
+        referencing = [
+            pl.field("a") * 2,
+            pl.col("s").struct.field("a") * pl.field("b"),
+            pl.element().struct.field("a") * pl.field("z"),
+        ]
+        assert _references_struct_context(referencing)
+        for expr in referencing:
+            assert _references_struct_context([expr]), str(expr)
+
+    def test_marker_ignores_struct_field_access(self) -> None:
+        """Plain struct field access and literals must not match."""
+        non_referencing = [
+            pl.col("s").struct.field("a") * 2,
+            pl.lit(5),
+            pl.element().struct.field("a") + 1,
+        ]
+        assert not _references_struct_context(non_referencing)
+
+    def test_select_mode_still_resolves_pl_field_from_expr(self) -> None:
+        """A raw pl.Expr using pl.field() resolves against the original struct."""
+        df = pl.DataFrame({"s": [{"a": 2, "b": 10}]})
+        result = apply_nested_operations(
+            df, {"s": {"a": pl.field("a") * pl.field("b")}}, struct_mode="select"
+        )
+        assert result["s"][0] == {"a": 20}
+
+    def test_select_mode_still_resolves_pl_field_from_callable(self) -> None:
+        """A callable returning pl.field() takes the with_fields fallback."""
+        df = pl.DataFrame({"s": [{"a": 2, "b": 10}]})
+        result = apply_nested_operations(
+            df, {"s": {"a": lambda x: x * pl.field("b")}}, struct_mode="select"
+        )
+        assert result["s"][0] == {"a": 20}
+
+    def test_fast_and_fallback_paths_agree(self) -> None:
+        """Both routes produce identical output for the same transform."""
+        df = pl.DataFrame({"s": [{"a": 2, "b": 10}, {"a": 3, "b": 20}]})
+        fast = apply_nested_operations(
+            df, {"s": {"a": lambda x: x * 2, "b": None}}, struct_mode="select"
+        )
+        fallback = apply_nested_operations(
+            df, {"s": {"a": pl.field("a") * 2, "b": None}}, struct_mode="select"
+        )
+        assert_frame_equal(fast, fallback)

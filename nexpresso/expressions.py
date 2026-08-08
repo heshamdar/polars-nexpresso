@@ -6,7 +6,7 @@ fields in Polars DataFrames, particularly for complex nested structures like lis
 structs and deeply nested hierarchies.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import lru_cache
 from typing import Literal
 
@@ -30,6 +30,35 @@ def _polars_version() -> version.Version:
 def _supports_arr_eval() -> bool:
     """Check if the current Polars version supports arr.eval()."""
     return _polars_version() >= version.parse(ARR_EVAL_MIN_VERSION)
+
+
+#: Substring identifying a ``pl.field()`` reference in an expression's repr.
+#: Polars renders it ``.field(["x"])`` on 1.30 and ``pl.field(["x"])`` from 1.35
+#: onward, so the leading dot form is what both have in common. Struct field
+#: *access* renders as ``struct.field_by_name(x)()`` and does not match.
+_STRUCT_FIELD_REF_MARKER = '.field(["'
+
+
+def _references_struct_context(exprs: Sequence[pl.Expr]) -> bool:
+    """
+    Whether any expression contains a ``pl.field()`` reference.
+
+    ``pl.field()`` resolves only inside a struct context, which decides whether
+    ``select`` mode may assemble a struct directly or must route through
+    ``struct.with_fields``. Detection is by expression repr on purpose: a
+    ``pl.field()`` can arrive either as a raw ``pl.Expr`` in the spec or as the
+    return value of a user callable, and Polars exposes no public API for
+    inspecting an expression's node types. ``TestStructContextDetection`` locks
+    the marker against the supported Polars range so a repr change fails loudly
+    in CI rather than silently mis-routing expressions.
+
+    Args:
+        exprs: Built field expressions for one struct.
+
+    Returns:
+        True if any expression references ``pl.field()``.
+    """
+    return any(_STRUCT_FIELD_REF_MARKER in str(expr) for expr in exprs)
 
 
 # Type aliases for better readability
@@ -220,16 +249,29 @@ class NestedExpressionBuilder:
         # Build the struct appropriately based on mode
         if self._struct_mode == "select":
             # In select mode, only include specified fields
-            selected_fields: list[Expr] = []
-            if final_exprs:
-                struct_with_transforms: Expr = base_expr.struct.with_fields(final_exprs)
-                selected_fields.extend(
-                    [struct_with_transforms.struct.field(name) for name in field_spec.keys()]
-                )
-            else:
-                # No transformations, just select
-                selected_fields.extend([base_expr.struct.field(name) for name in field_spec.keys()])
-            return pl.struct(selected_fields)
+            names = list(field_spec.keys())
+            if not names:
+                # Let pl.struct raise its own "expected at least 1 expression" error.
+                return pl.struct([])
+
+            if not final_exprs:
+                # No transformations, just select.
+                return pl.struct(base_expr.struct.field(*names))
+
+            if len(final_exprs) == len(names) and not _references_struct_context(final_exprs):
+                # Every transform already reaches its own field explicitly, so the
+                # result struct can be assembled directly from them. The
+                # ``with_fields`` route below re-materializes the whole struct once
+                # per field read, which is quadratic in the field count — ~90x
+                # slower at 64 fields.
+                return pl.struct(final_exprs)
+
+            # A ``pl.field()`` reference only resolves inside a struct context, so
+            # the transforms have to be applied via ``with_fields`` and the wanted
+            # fields read back off the result. Read them in one
+            # ``struct.field(*names)`` call so at least the expression itself stays
+            # linear in the field count.
+            return pl.struct(base_expr.struct.with_fields(final_exprs).struct.field(*names))
         else:
             # In with_fields mode, use with_fields() which preserves original field references
             # This ensures pl.field() references the original struct, not transformed fields
