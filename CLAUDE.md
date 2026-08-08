@@ -697,6 +697,8 @@ Before creating a release:
 
 - [ ] Update version in `pyproject.toml`
 - [ ] Update version in `nexpresso/__init__.py`
+- [ ] Refresh the lockfile: `uv lock` (it records the project version, so it
+      goes stale on every bump if not regenerated)
 - [ ] Update CHANGELOG.md (if exists)
 - [ ] Run full test suite: `uv run python tests/test_matrix.py`
 - [ ] Run examples: `uv run python examples.py`

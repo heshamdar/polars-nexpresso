@@ -39,6 +39,28 @@ moves no data.
     Measured 1.3–1.7× faster on a 300k-row three-level frame. Eager input
     already does this internally.
 
+!!! tip "Stack nested CSE on top of `collect_all`"
+    `collect_all` lets Polars see all the level plans at once, but by default its
+    common-subplan elimination only dedupes one level of nesting. `split_levels`
+    needs more than that: each level's plan branches off the progressive-unpack
+    chain, and that chain is *itself* reused by the next level. Polars 1.41 added
+    **nested** common subplan elimination for exactly this shape, gated behind an
+    environment variable:
+
+    ```bash
+    export POLARS_ALLOW_NESTED_CSPE=1
+    ```
+
+    On a `scan_parquet` → `split_levels` → `collect_all` pipeline over a
+    three-level hierarchy this doubles the number of reused cache nodes in the
+    plan (2 → 4) and measured **1.5–1.8× faster** (300k rows: 45 ms → 25 ms;
+    960k rows: 127 ms → 83 ms). It needs no code change and stacks with the
+    `collect_all` win above.
+
+    Two caveats: it is opt-in upstream because it is still considered
+    experimental, and it does nothing on Polars < 1.41 (the variable is simply
+    ignored).
+
 !!! warning "`validate_on_pack` is eager-only"
     The uniformity check inside `pack` has to execute the query to see the data,
     so running it on a `LazyFrame` would break the lazy contract. It is therefore

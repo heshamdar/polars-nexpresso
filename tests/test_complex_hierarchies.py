@@ -361,6 +361,42 @@ class TestNullHandling:
         # Should still work, just with null children
         assert packed.height == 1
 
+    def test_empty_child_list_keeps_parent_row(self) -> None:
+        """A parent whose child list is empty survives unpack as a null-child row.
+
+        ``pack``/``build_from_tables`` represent a childless parent as a
+        one-element list holding a null struct, so this shape only arrives from
+        externally-built packed data (Parquet/JSON, where ``[]`` is the natural
+        encoding of "no children"). Polars 2.0 flips ``explode``'s
+        ``empty_as_null`` default to False, which would drop such parents
+        entirely; ``_explode_and_unnest`` pins it to keep them.
+        """
+        spec = HierarchySpec.from_levels(
+            LevelSpec(name="parent", id_fields=["id"]),
+            LevelSpec(name="child", id_fields=["id"], parent_keys=["parent_id"]),
+        )
+        packer = HierarchicalPacker(spec)
+
+        child_dtype = pl.List(pl.Struct({"id": pl.String, "value": pl.Int64}))
+        packed = pl.DataFrame(
+            {
+                "parent": [
+                    {"id": "p1", "name": "P1", "child": [{"id": "c1", "value": 10}]},
+                    {"id": "p2", "name": "P2", "child": []},
+                ]
+            },
+            schema={
+                "parent": pl.Struct({"id": pl.String, "name": pl.String, "child": child_dtype})
+            },
+        )
+
+        unpacked = packer.unpack(packed, "child").sort("parent.id")
+
+        assert unpacked.height == 2, "childless parent must not be dropped"
+        assert unpacked["parent.id"].to_list() == ["p1", "p2"]
+        assert unpacked["parent.child.id"].to_list() == ["c1", None]
+        assert unpacked["parent.child.value"].to_list() == [10, None]
+
 
 # =============================================================================
 # Name Collision Scenarios
