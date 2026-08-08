@@ -63,9 +63,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hot.collect_nested()     # the packed List[Struct] shape
   ```
 
-  Operations: `filter`, `with_columns`, `drop`, `promote`,
+  Operations: `filter`, `with_columns`, `select`, `drop`, `promote`,
   `any_child_satisfies`. Terminals: `tables`, `to_flat` / `collect`,
   `to_nested` / `collect_nested`, `sink_parquet`.
+
+  `with_columns` routes by the **output** column's path, so a column named
+  `"region.store.sale.net"` lands on the `sale` table whatever levels its inputs
+  came from, and accepts `**named_exprs` to spell that destination explicitly.
+  Computing an ancestor-level column from descendant input is refused with a
+  pointer to `promote()`.
+
+  Broadcasting an ancestor-key predicate applies only to **row-wise**
+  predicates; an aggregating one (`count`, `sum`, `quantile`, a window) is
+  rejected, because each level holds the key at a different granularity and
+  intersecting per-level aggregates is meaningless.
 
   **Cross-level references.** Polars rejects named columns inside `list.eval`
   ("named columns are not allowed in `eval` functions"), so in a packed frame a
@@ -99,6 +110,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`benchmarks/bench_storage.py`** — compares nested / flat / normalized
   layouts across nine representative queries, cross-checking every result
   across layouts before timing so a divergence fails the run.
+
+- **`HierarchicalPacker.split_path` / `join_path` / `escape_field`** — public
+  counterparts of the private path helpers, so collaborators can build column
+  paths that agree with the ones the packer emits.
+
+- **`HierarchicalPacker.GROUP_AGGREGATIONS`** — group-by counterparts of
+  `_LIST_AGGREGATIONS`, kept adjacent to them so the packed and normalized
+  aggregation paths cannot drift on null handling.
 
 - **`tests/test_view_packed_equivalence.py`** — 259 cases asserting the packed
   and view paths agree. A shared case table expresses each operation twice —

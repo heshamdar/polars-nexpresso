@@ -111,6 +111,7 @@ class HierarchyView:
         # Levels whose row set may have shrunk. Only these need a consistency
         # cascade at materialization, so an unfiltered view costs no joins.
         self._restricted = frozenset(_restricted)
+        self._schema_cache: dict[str, set[str]] = {}
         # Keep hierarchy order (root -> leaf) regardless of mapping order.
         self._tables: dict[str, pl.LazyFrame] = {
             lvl.name: (
@@ -321,30 +322,58 @@ class HierarchyView:
     # =========================================================================
 
     def _owner_of(self, column: str) -> str | None:
-        """Longest level path that prefixes ``column`` and owns it directly."""
-        best: str | None = None
-        best_len = -1
+        """
+        The level that owns ``column``, resolved by hierarchy path.
+
+        Splitting is delegated to the packer so that escaped separators are
+        honoured: a field literally named ``net.sales`` is stored as
+        ``region.store.net\\.sales`` and must resolve to ``store``, not fail as
+        though it named a deeper level.
+        """
+        parts = self._packer.split_path(column)
+        if len(parts) < 2:
+            return None
+        # A column is a direct field of the level whose path is everything but
+        # the last component.
+        owner_path = self._packer.join_path(parts[:-1])
         for name, meta in self._meta.items():
-            prefix = meta.path + self._packer.separator
-            if column.startswith(prefix) and len(meta.path) > best_len:
-                # Must be a direct field of this level, not of a descendant.
-                remainder = column[len(prefix) :]
-                if self._packer.separator not in remainder:
-                    best, best_len = name, len(meta.path)
-        return best
+            if meta.path == owner_path:
+                return name
+        return None
+
+    def _qualified(self, level: str, field: str) -> str:
+        """Full column path for an unqualified ``field`` at ``level``."""
+        return self._packer.join_path([*self._packer.split_path(self._meta[level].path), field])
 
     def _key_columns(self, level: str) -> list[str]:
         """Ancestor foreign keys plus this level's own ids."""
         meta = self._meta[level]
         return [*meta.ancestor_keys, *meta.id_columns]
 
-    def _columns_of(self, level: str) -> set[str]:
-        return set(self._tables[level].collect_schema().names())
+    def _columns_of(self, level: str, tables: Mapping[str, pl.LazyFrame] | None = None) -> set[str]:
+        """
+        Column names at ``level``, cached per view.
 
-    def _carriers_of(self, columns: Iterable[str]) -> list[str]:
+        ``self._tables`` never changes for the lifetime of a view, so resolving
+        each level's schema once avoids re-planning on every routing decision.
+        A ``tables`` override is used while an operation is still accumulating,
+        where the working frames differ from the view's own.
+        """
+        if tables is not None:
+            return set(tables[level].collect_schema().names())
+        cached = self._schema_cache.get(level)
+        if cached is None:
+            cached = set(self._tables[level].collect_schema().names())
+            self._schema_cache[level] = cached
+        return cached
+
+    def _carriers_of(
+        self, columns: Iterable[str], tables: Mapping[str, pl.LazyFrame] | None = None
+    ) -> list[str]:
         """Levels whose table carries *every* one of ``columns``."""
         needed = set(columns)
-        return [name for name in self._tables if needed <= self._columns_of(name)]
+        source = tables if tables is not None else self._tables
+        return [name for name in source if needed <= self._columns_of(name, tables)]
 
     def _rebuild(
         self,
@@ -415,42 +444,58 @@ class HierarchyView:
             dirty.add(parent)
         return tables
 
-    def _evaluate_at(self, level: str, predicate: pl.Expr) -> pl.LazyFrame:
+    def _augmented(
+        self,
+        tables: dict[str, pl.LazyFrame],
+        level: str,
+        columns: Iterable[str],
+    ) -> tuple[pl.LazyFrame, list[str]]:
         """
-        ``level``'s table filtered by ``predicate``, whatever levels it spans.
-
-        Ancestor columns the predicate needs are joined in for the evaluation
-        and dropped again, so the result keeps ``level``'s own schema.
-        """
-        roots = predicate.meta.root_names()
-        present = self._columns_of(level)
-        if not roots or set(roots) <= present:
-            return self._tables[level].filter(predicate)
-        widened, added = self._augmented(level, roots)
-        return widened.filter(predicate).drop(added)
-
-    def _augmented(self, level: str, columns: Iterable[str]) -> tuple[pl.LazyFrame, list[str]]:
-        """
-        ``level``'s table widened with ancestor-owned ``columns``.
+        ``level``'s working frame widened with ancestor-owned ``columns``.
 
         Ancestor keys are already present in every descendant table, so pulling
-        an ancestor *attribute* down is a single join on those keys.
+        an ancestor *attribute* down is a single join on those keys. The join is
+        a LEFT join on purpose: borrowing a column to evaluate an expression
+        must never drop rows, even where referential integrity is broken.
+
+        Reads from ``tables`` rather than ``self._tables`` so that earlier
+        arguments in the same operation are not discarded.
+
+        Args:
+            tables: The working frames for this operation.
+            level: Level to widen.
+            columns: Columns the expression references.
 
         Returns:
-            The widened frame and the list of columns that were added (so the
-            caller can drop them again).
+            The widened frame and the columns that were added, for the caller to
+            drop again.
+
+        Raises:
+            KeyError: If a column is not available in this view.
+            ValueError: If the column is owned by a descendant rather than an
+                ancestor, or no shared key columns exist.
         """
-        lf = self._tables[level]
-        present = self._columns_of(level)
+        lf = tables[level]
+        present = self._columns_of(level, tables)
+        order = list(tables)
         added: list[str] = []
         for name in columns:
             if name in present:
                 continue
             owner = self._owner_of(name)
-            if owner is None or owner not in self._tables:
+            if owner is None or owner not in tables:
                 raise KeyError(
-                    f"Column {name!r} is not available in this view "
-                    f"(owning level missing or unknown)."
+                    f"Unknown column {name!r}: not available in this view. "
+                    f"Known columns: {sorted(self.columns)}."
+                )
+            # Borrowing only ever goes *up* the hierarchy. Pulling a descendant
+            # column into an ancestor would fan the ancestor out to child
+            # granularity — silently turning 4 region rows into 120.
+            if order.index(owner) >= order.index(level):
+                raise ValueError(
+                    f"Cannot compute a {level!r}-level column from {owner!r}-level input "
+                    f"{name!r}: {owner!r} is not an ancestor of {level!r}. "
+                    "Use promote() to aggregate a child attribute upward."
                 )
             keys = [c for c in self._key_columns(owner) if c in present]
             if not keys:
@@ -459,9 +504,44 @@ class HierarchyView:
                     f"no shared key columns. Expected {self._key_columns(owner)} "
                     f"to be present as foreign keys."
                 )
-            lf = lf.join(self._tables[owner].select([*keys, name]), on=keys, how="left")
+            lf = lf.join(tables[owner].select([*keys, name]), on=keys, how="left")
             added.append(name)
         return lf, added
+
+    def _apply_at(
+        self,
+        tables: dict[str, pl.LazyFrame],
+        level: str,
+        expr: pl.Expr,
+        method: str,
+    ) -> None:
+        """
+        Run ``expr`` against ``level`` via ``method``, borrowing what it needs.
+
+        Ancestor columns the expression references are joined in for the
+        evaluation and dropped again, so the level keeps its own schema.
+        """
+        roots = expr.meta.root_names()
+        if not roots or set(roots) <= self._columns_of(level, tables):
+            tables[level] = getattr(tables[level], method)(expr)
+            return
+        widened, borrowed = self._augmented(tables, level, roots)
+        tables[level] = getattr(widened, method)(expr).drop(borrowed)
+
+    def _deepest_owner(self, tables: Mapping[str, pl.LazyFrame], roots: Iterable[str]) -> str:
+        """The finest level owning any of ``roots``; that is where they can meet."""
+        order = list(tables)
+        owners = [(c, self._owner_of(c)) for c in roots]
+        unknown = [c for c, owner in owners if owner is None or owner not in tables]
+        if unknown:
+            known = sorted(self.columns)
+            hint = (
+                " (present in the view but not resolvable from its path)"
+                if any(c in known for c in unknown)
+                else ""
+            )
+            raise KeyError(f"Unknown column(s): {unknown}{hint}. Known columns: {known}.")
+        return max((owner for _, owner in owners if owner), key=order.index)
 
     # =========================================================================
     # Operations
@@ -473,12 +553,12 @@ class HierarchyView:
 
         A predicate over a single level's columns is applied to that level's
         table. Because :meth:`~nexpresso.HierarchicalPacker.normalize`
-        replicates ancestor **keys** into descendant tables, a predicate on an
-        ancestor key is applied to *every* table that carries it — sound
-        transitive pushdown that lets the deepest scan skip row groups without
-        any join. A predicate spanning several levels is evaluated at the
-        deepest level involved, with the ancestor columns joined in and dropped
-        again afterwards.
+        replicates ancestor **keys** into descendant tables, a *row-wise*
+        predicate on an ancestor key is applied to every table that carries it —
+        sound transitive pushdown that lets the deepest scan skip row groups
+        without any join. A predicate spanning several levels is evaluated at
+        the deepest level involved, with the ancestor columns joined in and
+        dropped again afterwards.
 
         Args:
             *predicates: Boolean expressions over dotted column paths.
@@ -488,6 +568,17 @@ class HierarchyView:
 
         Raises:
             KeyError: If a predicate references an unknown column.
+            ValueError: If a predicate aggregates over a replicated ancestor
+                key — see the note below.
+
+        Note:
+            Broadcasting is only valid for **row-wise** predicates. Each level
+            holds an ancestor key at a different granularity, so an aggregate
+            over one — ``count``, ``sum``, ``mean``, ``quantile``, a window —
+            means something different per level, and intersecting those results
+            is meaningless. Such a predicate is rejected rather than silently
+            answered wrongly. Apply it to a single level's table via
+            :meth:`tables` if that is what you want.
 
         Examples:
             >>> view.filter(pl.col("region.store.sale.amount") > 990)
@@ -504,48 +595,90 @@ class HierarchyView:
                 touched.add(first)
                 continue
 
-            carriers = [name for name in self._carriers_of(roots) if name in tables]
+            carriers = self._carriers_of(roots, tables)
+            if len(carriers) > 1 and not self._is_row_wise(
+                predicate, roots, tables[carriers[0]].collect_schema()
+            ):
+                self._reject_aggregating_broadcast(predicate, roots, carriers)
             if carriers:
                 for name in carriers:
-                    tables[name] = tables[name].filter(predicate)
+                    self._apply_at(tables, name, predicate, "filter")
                 touched.update(carriers)
                 continue
 
             # Spans levels: evaluate at the deepest owner, joining the rest in.
-            owners = [self._owner_of(c) for c in roots]
-            unknown = [c for c, o in zip(roots, owners) if o is None]
-            if unknown:
-                raise KeyError(
-                    f"Predicate references unknown column(s): {unknown}. "
-                    f"Known columns: {self.columns[:10]}..."
-                )
-            ordered = list(self._tables)
-            deepest = max((o for o in owners if o is not None), key=ordered.index)
-            tables[deepest] = self._evaluate_at(deepest, predicate)
+            deepest = self._deepest_owner(tables, roots)
+            self._apply_at(tables, deepest, predicate, "filter")
             touched.add(deepest)
         return self._rebuild(tables, restricted=touched)
 
-    def with_columns(self, *exprs: pl.Expr) -> HierarchyView:
-        """
-        Add or replace columns, routed to the level that owns their inputs.
+    _PROBE_HEIGHT = 3
 
-        The new column lands on the level of the deepest input it references,
-        which is where it belongs in the hierarchy. Ancestor inputs are joined
-        in for the computation and dropped again.
+    def _is_row_wise(self, predicate: pl.Expr, roots: Iterable[str], schema: pl.Schema) -> bool:
+        """
+        Whether ``predicate`` yields one value per row rather than collapsing.
+
+        Polars exposes no public "is this elementwise" API, so ask the
+        expression: evaluate it against a small correctly-typed probe frame and
+        see whether the output keeps the row count. A row-wise predicate maps
+        N rows to N; any aggregate collapses to 1. Probing needs more than one
+        row, since an aggregate over a single row also returns a single row.
+
+        Detection failures are treated as row-wise — the guard exists to catch
+        an obvious footgun, not to police every expression.
+        """
+        try:
+            probe = pl.DataFrame(
+                {c: pl.Series([None] * self._PROBE_HEIGHT, dtype=schema[c]) for c in roots}
+            )
+            return probe.lazy().select(predicate).collect().height == self._PROBE_HEIGHT
+        except Exception:  # pragma: no cover - unusual expressions
+            return True
+
+    def _reject_aggregating_broadcast(
+        self, predicate: pl.Expr, roots: Iterable[str], carriers: list[str]
+    ) -> None:
+        """Refuse to broadcast a predicate whose meaning depends on row multiplicity."""
+        raise ValueError(
+            f"Cannot broadcast an aggregating predicate over ancestor key(s) {sorted(roots)}: "
+            f"they are replicated across levels {carriers} at different granularities, so the "
+            "aggregate means something different on each and intersecting the results is "
+            "meaningless. Apply it to one level's table via tables() instead."
+        )
+
+    def with_columns(self, *exprs: pl.Expr, **named_exprs: pl.Expr) -> HierarchyView:
+        """
+        Add or replace columns, routed by the **output** column's path.
+
+        A derived column belongs where its name says it does:
+        ``"region.store.sale.net"`` lands on the ``sale`` table regardless of
+        which levels its inputs came from. Ancestor inputs are joined in for the
+        computation and dropped again.
+
+        Keyword form spells the destination explicitly and is usually clearer
+        than an ``.alias()`` chain, since the path is the important part::
+
+            view.with_columns(**{
+                "region.store.sale.net": pl.col(amount) * (1 - pl.col(discount)),
+            })
 
         Args:
-            *exprs: Aliased expressions over dotted column paths.
+            *exprs: Expressions whose output name is a full dotted column path
+                (i.e. aliased).
+            **named_exprs: Expressions keyed by their output path.
 
         Returns:
             A new view with the columns added.
 
         Raises:
-            KeyError: If an expression references an unknown column.
-            ValueError: If an expression has no output name (missing ``.alias``).
+            KeyError: If an expression references an unknown column, or its
+                output name does not resolve to a level in this view.
+            ValueError: If an expression has no output name, or computes an
+                ancestor-level column from descendant-level input (use
+                :meth:`promote` for that).
         """
         tables = dict(self._tables)
-        for expr in exprs:
-            roots = expr.meta.root_names()
+        for expr in (*exprs, *(e.alias(name) for name, e in named_exprs.items())):
             try:
                 output_name = expr.meta.output_name()
             except Exception as exc:  # pragma: no cover - polars raises variously
@@ -553,26 +686,61 @@ class HierarchyView:
                     f"Expression has no resolvable output name; add .alias(...): {expr}"
                 ) from exc
 
-            carriers = [name for name in self._carriers_of(roots) if name in tables]
-            if carriers:
-                ordered = list(self._tables)
-                target = max(carriers, key=ordered.index) if roots else next(iter(tables))
-                tables[target] = tables[target].with_columns(expr)
-                continue
-
-            owners = [self._owner_of(c) for c in roots]
-            unknown = [c for c, o in zip(roots, owners) if o is None]
-            if unknown:
+            target = self._owner_of(output_name)
+            if target is None or target not in tables:
                 raise KeyError(
-                    f"Expression {output_name!r} references unknown column(s): {unknown}."
+                    f"Output column {output_name!r} does not name a level in this view. "
+                    f"Use a full dotted path such as "
+                    f"{self._qualified(list(tables)[-1], 'my_column')!r}."
                 )
-            ordered = list(self._tables)
-            deepest = max((o for o in owners if o is not None), key=ordered.index)
-            widened, added = self._augmented(deepest, roots)
-            tables[deepest] = widened.with_columns(expr).drop(added)
+            self._apply_at(tables, target, expr, "with_columns")
         return self._rebuild(tables)
 
-    def drop(self, *columns: str) -> HierarchyView:
+    def select(self, *columns: str) -> HierarchyView:
+        """
+        Keep only the named columns, plus the keys that relate the levels.
+
+        Projection is what makes per-level Parquet scans cheap — each level's
+        scan reads only the leaves you asked for — so this is the counterpart to
+        :meth:`drop` and usually the better way to express intent.
+
+        Key columns are always retained regardless of whether they are listed;
+        without them the levels cannot be joined or nested. A level left with
+        nothing but its keys is kept, so the hierarchy's shape is preserved.
+
+        Args:
+            *columns: Dotted column paths to keep.
+
+        Returns:
+            A new view restricted to those columns.
+
+        Raises:
+            ValueError: If a column is not present in any level.
+
+        Examples:
+            >>> view.select("region.name", "region.store.sale.amount")
+        """
+        wanted = set(columns)
+        unknown = sorted(wanted - set(self.columns))
+        if unknown:
+            raise ValueError(
+                f"Column(s) {unknown} not found in any level of this view. "
+                f"Known columns: {sorted(self.columns)}."
+            )
+
+        tables = dict(self._tables)
+        for name in tables:
+            present = self._columns_of(name)
+            keep = [
+                column
+                for column in self._tables[name].collect_schema().names()
+                if column in wanted or column in self._key_columns(name)
+            ]
+            if set(keep) != present:
+                tables[name] = tables[name].select(keep)
+        return self._rebuild(tables)
+
+    def drop(self, *columns: str, strict: bool = True) -> HierarchyView:
         """
         Drop columns from whichever level carries them.
 
@@ -580,12 +748,16 @@ class HierarchyView:
 
         Args:
             *columns: Dotted column paths to drop.
+            strict: Raise if a column is not present in any level. Dotted paths
+                are long and hand-written, so a typo silently doing nothing is
+                worse than an error; pass ``False`` for best-effort dropping.
 
         Returns:
             A new view without those columns.
 
         Raises:
-            ValueError: If a column is a key column of any level.
+            ValueError: If a column is a key column of any level, or is absent
+                from every level and ``strict`` is True.
         """
         tables = dict(self._tables)
         for column in columns:
@@ -595,9 +767,17 @@ class HierarchyView:
                         f"Cannot drop {column!r}: it is a key column of level {name!r} "
                         "and is required to relate the levels."
                     )
-            for name in list(tables):
-                if column in self._columns_of(name):
-                    tables[name] = tables[name].drop(column)
+            holders = [name for name in tables if column in self._columns_of(name)]
+            if not holders:
+                if strict:
+                    raise ValueError(
+                        f"Column {column!r} not found in any level of this view. "
+                        f"Known columns: {sorted(self.columns)}. "
+                        "Pass strict=False to ignore missing columns."
+                    )
+                continue
+            for name in holders:
+                tables[name] = tables[name].drop(column)
         return self._rebuild(tables)
 
     def promote(
@@ -646,13 +826,13 @@ class HierarchyView:
                 f"to_level {to_level!r}. Got indices {from_idx} and {to_idx}."
             )
 
-        source = f"{self._meta[from_level].path}{self._packer.separator}{attribute}"
+        source = self._qualified(from_level, attribute)
         if source not in self._columns_of(from_level):
             raise ValueError(
                 f"Attribute {attribute!r} not found at level {from_level!r} "
                 f"(looked for column {source!r})."
             )
-        target = f"{self._meta[to_level].path}{self._packer.separator}{alias or attribute}"
+        target = self._qualified(to_level, alias or attribute)
         keys = [c for c in self._key_columns(to_level) if c in self._columns_of(from_level)]
         if not keys:
             raise ValueError(
@@ -666,7 +846,13 @@ class HierarchyView:
             .agg(_aggregate(pl.col(source), agg).alias(target))
         )
         tables = dict(self._tables)
-        tables[to_level] = tables[to_level].join(rolled, on=keys, how="left")
+        joined = tables[to_level].join(rolled, on=keys, how="left")
+        if agg == "count":
+            # A parent with no surviving children gets no group at all, so the
+            # left join leaves null. list.len() on an empty list gives 0, and
+            # promote_attribute agrees; match it.
+            joined = joined.with_columns(pl.col(target).fill_null(0))
+        tables[to_level] = joined
         return self._rebuild(tables)
 
     def any_child_satisfies(
@@ -711,7 +897,9 @@ class HierarchyView:
                 f"Level {child_level!r} carries none of {at_level!r}'s key columns "
                 f"{self._key_columns(at_level)}."
             )
-        matching = self._evaluate_at(child_level, predicate).select(keys).unique()
+        tables = dict(self._tables)
+        self._apply_at(tables, child_level, predicate, "filter")
+        matching = tables[child_level].select(keys).unique()
         tables = dict(self._tables)
         tables[at_level] = tables[at_level].join(matching, on=keys, how="semi")
         return self._rebuild(tables, restricted={at_level})
@@ -831,27 +1019,16 @@ class HierarchyView:
 
 
 def _aggregate(expr: pl.Expr, agg: PromoteAggregation) -> pl.Expr:
-    """Apply a :data:`~nexpresso.PromoteAggregation` to a grouped column."""
-    match agg:
-        case "list":
-            return expr
-        case "set":
-            return expr.unique()
-        case "sum":
-            return expr.sum()
-        case "mean":
-            return expr.mean()
-        case "min":
-            return expr.min()
-        case "max":
-            return expr.max()
-        case "first":
-            return expr.first()
-        case "last":
-            return expr.last()
-        case "count":
-            return expr.len()
-        case "single":
-            return expr.first()
-        case _:
-            raise ValueError(f"Unsupported aggregation: {agg!r}.")
+    """
+    Apply a :data:`~nexpresso.PromoteAggregation` to a grouped column.
+
+    Delegates to :data:`HierarchicalPacker.GROUP_AGGREGATIONS` so that
+    ``promote`` and ``promote_attribute`` cannot drift apart on null handling.
+    """
+    try:
+        return HierarchicalPacker.GROUP_AGGREGATIONS[agg](expr)
+    except KeyError:
+        raise ValueError(
+            f"Unsupported aggregation: {agg!r}. "
+            f"Must be one of {sorted(HierarchicalPacker.GROUP_AGGREGATIONS)}."
+        ) from None

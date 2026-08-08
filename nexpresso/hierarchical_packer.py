@@ -2395,6 +2395,24 @@ class HierarchicalPacker:
         "single": lambda e: e.list.eval(pl.element().drop_nulls().unique()).list.first(),
     }
 
+    #: Group-by counterparts of :data:`_LIST_AGGREGATIONS`, for callers that
+    #: aggregate a child *table* instead of a nested list column (notably
+    #: :class:`~nexpresso.HierarchyView.promote`). Kept adjacent so the two
+    #: stay in step — they must agree on null handling, or the packed and
+    #: normalized paths quietly disagree.
+    GROUP_AGGREGATIONS: dict[PromoteAggregation, Callable[[pl.Expr], pl.Expr]] = {
+        "list": lambda e: e,
+        "set": lambda e: e.drop_nulls().unique(),
+        "sum": lambda e: e.sum(),
+        "mean": lambda e: e.mean(),
+        "min": lambda e: e.min(),
+        "max": lambda e: e.max(),
+        "first": lambda e: e.first(),
+        "last": lambda e: e.last(),
+        "count": lambda e: e.len(),
+        "single": lambda e: e.drop_nulls().unique().first(),
+    }
+
     # Like _LIST_AGGREGATIONS but used at intermediate levels when traversing more
     # than one hop.  The only difference is "count": at intermediate hops we sum
     # the per-child counts rather than re-counting the outer list length.
@@ -2801,6 +2819,52 @@ class HierarchicalPacker:
     # ------------------------------------------------------------------
     # Separator Escaping
     # ------------------------------------------------------------------
+    def escape_field(self, name: str) -> str:
+        """
+        Escape separator characters in a field name.
+
+        Public because collaborators (notably
+        :class:`~nexpresso.HierarchyView`) must build column paths that agree
+        with the ones this packer emits.
+
+        Args:
+            name: The field name to escape.
+
+        Returns:
+            The escaped field name.
+        """
+        return self._escape_field(name)
+
+    def split_path(self, path: str) -> list[str]:
+        """
+        Split a column path into components, respecting escaped separators.
+
+        Public counterpart of :meth:`_split_path`; see :meth:`escape_field` for
+        why. A field literally named ``net.sales`` round-trips as a single
+        component rather than splitting into two.
+
+        Args:
+            path: The path to split.
+
+        Returns:
+            List of path components.
+        """
+        return self._split_path(path)
+
+    def join_path(self, components: Sequence[str]) -> str:
+        """
+        Join path components, escaping separators inside each one.
+
+        Public counterpart of :meth:`_join_path`; see :meth:`escape_field`.
+
+        Args:
+            components: The path components to join.
+
+        Returns:
+            The joined, escaped path.
+        """
+        return self._join_path(components)
+
     def _escape_field(self, name: str) -> str:
         """
         Escape separator characters in a field name.
