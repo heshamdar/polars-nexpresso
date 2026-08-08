@@ -60,17 +60,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Create virtual environment
-        run: uv venv
-
-      - name: Install build dependencies
-        run: uv pip install build twine
-
       - name: Build package
         run: uv build
 
+      # Run twine as an isolated tool. `uv run` would sync the project
+      # environment from uv.lock first, downgrading twine's own dependencies
+      # (e.g. packaging) and breaking the import.
       - name: Check package
-        run: uv run twine check dist/*
+        run: uvx twine check dist/*
 
       - name: Publish to TestPyPI
         if: inputs.test_pypi == true
