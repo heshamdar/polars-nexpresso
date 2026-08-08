@@ -15,12 +15,14 @@ Example
 
 from __future__ import annotations
 
+import inspect
 import math
 import shutil
 import tempfile
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeVar
 
@@ -51,6 +53,12 @@ DEFAULT_ESCAPE_CHAR = "\\"
 def _supports_partitioned_sink() -> bool:
     """Whether this Polars version exposes ``pl.PartitionBy`` for partitioned sinks."""
     return hasattr(pl, "PartitionBy")
+
+
+@lru_cache(maxsize=1)
+def _supports_explode_empty_as_null() -> bool:
+    """Whether ``explode()`` accepts ``empty_as_null`` (Polars >= 1.41)."""
+    return "empty_as_null" in inspect.signature(pl.LazyFrame.explode).parameters
 
 
 def _sorted_bucket_dirs(stage_dir: Path) -> list[Path]:
@@ -1591,6 +1599,12 @@ class HierarchicalPacker:
                 frames = dict(zip(tables, pl.collect_all(list(tables.values()))))
 
             Eager input already does this internally.
+
+            On Polars >= 1.41, setting ``POLARS_ALLOW_NESTED_CSPE=1`` in the
+            environment speeds this up a further 1.5-1.8x. Each level's plan is
+            built on the previous level's, so the shared subplans are *nested*;
+            the default common-subplan elimination only dedupes one level deep
+            and re-runs the rest. See ``docs/concepts/lazy-and-streaming.md``.
         """
         lf, added_cols, schema = self._prepare_frame(frame)
 
@@ -3321,7 +3335,13 @@ class HierarchicalPacker:
         # ``pack`` always produces List, but a caller may hand us data whose level
         # column was cast to a fixed-size Array; ``explode`` handles both.
         if isinstance(dtype, (pl.List, pl.Array)):
-            lf = lf.explode(meta.path)
+            if _supports_explode_empty_as_null():
+                # Polars 2.0 flips this default to False, which would silently drop
+                # parents whose child list is empty. Pin it so a childless parent
+                # keeps surviving unpack as a single null-child row.
+                lf = lf.explode(meta.path, empty_as_null=True)
+            else:
+                lf = lf.explode(meta.path)
 
         lf = lf.with_columns(
             pl.col(meta.path).name.prefix_fields(f"{meta.path}{self.separator}")

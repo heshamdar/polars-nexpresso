@@ -251,7 +251,9 @@ cities_with_country_name = tables["city"].join(
     frames = dict(zip(tables, pl.collect_all(list(tables.values()))))
     ```
 
-    Eager input already does this internally.
+    Eager input already does this internally. On Polars >= 1.41, also setting
+    `POLARS_ALLOW_NESTED_CSPE=1` in the environment is worth a further 1.5–1.8×
+    here — see [Lazy and streaming](lazy-and-streaming.md).
 
 ## Validation
 
