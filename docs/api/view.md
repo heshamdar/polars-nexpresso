@@ -25,7 +25,9 @@ class HierarchyView:
 
 Columns are addressed by their full dotted path (`"region.store.sale.amount"`),
 exactly as in a flat/unpacked frame, regardless of which physical table holds
-them.
+them. Paths are split with the packer's own escaping rules, so a field whose
+name contains the separator (stored as `region.store.net\.sales`) resolves
+correctly.
 
 ## Constructors
 
@@ -70,27 +72,74 @@ join.
 | Predicate references | Routing |
 |---|---|
 | One level's columns | Applied to that level's table |
-| An ancestor **key** | Applied to *every* table carrying it (sound transitive pushdown; the deepest scan skips row groups with no join) |
+| An ancestor **key**, row-wise | Applied to *every* table carrying it (sound transitive pushdown; the deepest scan skips row groups with no join) |
+| An ancestor **key**, aggregating | **Rejected** — see the note below |
 | An ancestor **attribute** | Applied to the ancestor, propagated by semi-join |
 | Columns across levels | Evaluated at the deepest level, ancestor columns joined in and dropped again |
+
+!!! warning "Aggregating predicates over an ancestor key are refused"
+    Broadcasting is valid only for **row-wise** predicates. Each level holds an
+    ancestor key at a different granularity, so an aggregate over one —
+    `count`, `sum`, `mean`, `quantile`, a window — means something different per
+    level, and intersecting those results is meaningless.
+
+    ```python
+    view.filter(pl.col("region.id").count() > 10)   # ValueError
+    ```
+
+    Apply such a predicate to one level's table via `tables()` instead.
 
 ### with_columns
 
 ```python
-def with_columns(self, *exprs: pl.Expr) -> HierarchyView: ...
+def with_columns(self, *exprs: pl.Expr, **named_exprs: pl.Expr) -> HierarchyView: ...
 ```
 
-Adds or replaces columns. Each lands on the level of the deepest input it
-references. Expressions must be aliased.
+Adds or replaces columns, routed by the **output** column's path — a column
+named `"region.store.sale.net"` lands on the `sale` table regardless of which
+levels its inputs came from. Ancestor inputs are joined in and dropped again.
+
+The keyword form spells the destination explicitly and is usually clearer than
+an `.alias()` chain, since the path is the important part:
+
+```python
+view.with_columns(**{
+    "region.store.sale.net": pl.col("region.store.sale.amount") * (1 - pl.col("region.store.discount")),
+})
+```
+
+Computing an *ancestor*-level column from descendant input is refused — that is
+an aggregation, so use [`promote`](#promote):
+
+```python
+view.with_columns(pl.col("region.store.sale.amount").sum().alias("region.total"))
+# ValueError: ... Use promote() to aggregate a child attribute upward.
+```
+
+### select
+
+```python
+def select(self, *columns: str) -> HierarchyView: ...
+```
+
+Keeps only the named columns. Key columns are always retained regardless of
+whether they are listed — without them the levels cannot be joined or nested.
+Projection is what makes per-level Parquet scans cheap, so this is usually the
+better way to express intent than `drop`.
+
+```python
+view.select("region.name", "region.store.sale.amount")
+```
 
 ### drop
 
 ```python
-def drop(self, *columns: str) -> HierarchyView: ...
+def drop(self, *columns: str, strict: bool = True) -> HierarchyView: ...
 ```
 
 Drops columns from whichever level carries them. Refuses key columns — they are
-the join structure of the view.
+the join structure of the view. A column absent from every level raises;
+pass `strict=False` for best-effort dropping.
 
 ### promote
 
@@ -110,6 +159,11 @@ The relational counterpart of
 [`promote_attribute`](packer.md): a `group_by` on the child table joined onto
 the parent. Never builds an intermediate `List[Struct]`. `from_level` must be
 the immediate child of `to_level`.
+
+Aggregations come from `HierarchicalPacker.GROUP_AGGREGATIONS`, the group-by
+counterpart of the list aggregations `promote_attribute` uses, so the two agree
+on null handling (`set` and `single` drop nulls; `count` is 0 — not null — for a
+parent with no surviving children).
 
 ### any_child_satisfies
 
