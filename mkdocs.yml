@@ -70,6 +70,7 @@ nav:
     - Hierarchical Data: concepts/hierarchical-data.md
     - Struct Modes: concepts/struct-modes.md
     - Lazy Evaluation & Streaming: concepts/lazy-and-streaming.md
+    - Storage Layouts: concepts/storage-layouts.md
   - Guides:
     - Building from Database Tables: guides/database-to-nested.md
     - Analytics Workflow: guides/analytics-workflow.md
@@ -77,6 +78,7 @@ nav:
   - API Reference:
     - Expressions: api/expressions.md
     - Hierarchical Packer: api/packer.md
+    - Hierarchy View: api/view.md
     - Types: api/types.md
   - Examples: examples.md
 

@@ -104,6 +104,18 @@ packed = packer.pack(flat, "region")        # Aggregate back to region level
 | **Custom Separators** | Use any separator (default: `.`) |
 | **Type Preservation** | DataFrame in = DataFrame out |
 
+### Hierarchy View
+
+Query normalized per-level storage through a nested interface.
+
+| Feature | Description |
+|---------|-------------|
+| **Nested interface, flat storage** | Address columns by dotted path; the view routes to the owning table |
+| **No hand-written joins** | Cross-level operations join automatically, only when needed |
+| **Transitive key pushdown** | Ancestor-key predicates reach the deepest scan with no join |
+| **Deferred consistency** | Filtering one level restricts the others, applied once at materialization |
+| **Nest only at the boundary** | `collect_nested()` when a consumer genuinely needs `List[Struct]` |
+
 ## Core Concepts
 
 ### Field Value Types
@@ -324,6 +336,36 @@ python examples.py
 # Or run specific module examples
 python -m nexpresso.hierarchical_packer
 ```
+
+## Storage Layouts
+
+`List[Struct]` is a good in-memory shape and a poor storage shape. Parquet
+shreds nested columns into one column chunk per leaf, but a row group holds N
+**top-level** rows — so packing collapses row-group skipping, the main reason
+Parquet is fast. On a 2M-row three-level hierarchy, querying the packed file is
+**30-196x slower** than the same data stored flat, and the packed file is only
+~15% smaller.
+
+Store flat or normalized; pack at the boundary where something consumes nesting.
+`HierarchyView` makes the normalized layout ergonomic:
+
+```python
+from nexpresso import HierarchyView
+
+# One-time conversion.
+HierarchyView.from_frame(flat_df, packer).sink_parquet("warehouse/")
+
+# Every subsequent query scans one Parquet dataset per level.
+view = HierarchyView.scan_parquet("warehouse/", packer)
+
+hot = view.filter(pl.col("region.store.sale.amount") > 990)
+hot.tables()["sale"]     # cheapest: no join, no nesting
+hot.collect("sale")      # flat, joined to leaf granularity
+hot.collect_nested()     # the packed List[Struct] shape
+```
+
+See [Storage Layouts](docs/concepts/storage-layouts.md) for the measurements and
+`benchmarks/bench_storage.py` to reproduce them.
 
 ## Performance
 
