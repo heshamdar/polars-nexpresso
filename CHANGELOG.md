@@ -5,6 +5,54 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`HierarchyView` — query normalized storage through a nested interface.**
+  `List[Struct]` is a good in-memory shape and a poor storage shape: Parquet
+  shreds nested columns into per-leaf column chunks, but a row group holds N
+  *top-level* rows, so packing collapses row-group skipping and predicate
+  pushdown. On a 2M-row three-level hierarchy, querying the packed file is
+  **30–196x slower** than the same data stored flat, while the packed file is
+  only ~15% smaller.
+
+  `HierarchyView` stores one flat table per level and presents them as if they
+  were nested. Columns are addressed by dotted hierarchy path; the view routes
+  each operation to the table that owns it and joins across levels only when an
+  operation genuinely spans them — callers never write a join.
+
+  ```python
+  from nexpresso import HierarchyView
+
+  HierarchyView.from_frame(flat_df, packer).sink_parquet("warehouse/")
+  view = HierarchyView.scan_parquet("warehouse/", packer)
+
+  hot = view.filter(pl.col("region.store.sale.amount") > 990)
+  hot.tables()["sale"]     # cheapest: no join, no nesting
+  hot.collect("sale")      # flat, joined to leaf granularity
+  hot.collect_nested()     # the packed List[Struct] shape
+  ```
+
+  Operations: `filter`, `with_columns`, `drop`, `promote`,
+  `any_child_satisfies`. Terminals: `tables`, `to_flat` / `collect`,
+  `to_nested` / `collect_nested`, `sink_parquet`.
+
+  A predicate on an ancestor **key** is applied to every table carrying it —
+  sound transitive pushdown, since `normalize()` replicates ancestor keys as
+  foreign keys — so the deepest scan skips row groups with no join at all.
+
+  `empty_parents` controls what happens to parents left with no surviving
+  children: `"prune"` (default) matches `pack()`, `"keep"` retains them with
+  empty child lists and skips the upward semi-join cascade.
+
+- **`benchmarks/bench_storage.py`** — compares nested / flat / normalized
+  layouts across nine representative queries, cross-checking every result
+  across layouts before timing so a divergence fails the run.
+
+- **`docs/concepts/storage-layouts.md`** and **`docs/api/view.md`** — the
+  measurements behind the above, and the API reference.
+
 ## [0.5.0] - 2026-08-07
 
 ### Changed (breaking)
