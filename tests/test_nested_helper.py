@@ -18,7 +18,6 @@ from polars.testing import assert_frame_equal
 
 from nexpresso import NestedExpressionBuilder, apply_nested_operations, generate_nested_exprs
 from nexpresso.expressions import _references_struct_context
-from tests.conftest import requires_arr_eval
 
 
 def test_create_new_top_level_column():
@@ -492,7 +491,6 @@ def test_list_of_lists_of_structs():
     assert result["nested_items"][0][1][0]["value"] == 6
 
 
-@requires_arr_eval
 def test_array_type():
     """Test that Array types work with arr.eval() in Polars.
 

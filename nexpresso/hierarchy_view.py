@@ -812,26 +812,18 @@ class HierarchyView:
         """
         Write one Parquet file per level, in the layout :meth:`scan_parquet` reads.
 
-        Prefers ``sink_parquet`` so the write is streamed rather than collected
-        into memory first. Polars < 1.25 cannot sink Parquet from the standard
-        engine, so those versions fall back to ``collect().write_parquet()`` —
-        correct, but no longer memory-bounded.
+        Uses ``sink_parquet``, so the write is streamed rather than collected
+        into memory first.
 
         Args:
             destination: Directory to write into. Created if absent.
             pattern: Naming pattern with ``{level}`` substituted.
-            **sink_kwargs: Forwarded to :meth:`polars.LazyFrame.sink_parquet`,
-                or to :meth:`polars.DataFrame.write_parquet` on the fallback path.
+            **sink_kwargs: Forwarded to :meth:`polars.LazyFrame.sink_parquet`.
         """
         root = Path(destination)
         root.mkdir(parents=True, exist_ok=True)
         for name, lf in self._resolved_tables().items():
-            path = root / f"{pattern.format(level=name)}.parquet"
-            try:
-                lf.sink_parquet(path, **sink_kwargs)
-            except pl.exceptions.InvalidOperationError:
-                # Older Polars: no Parquet sink outside the streaming engine.
-                lf.collect().write_parquet(path, **sink_kwargs)
+            lf.sink_parquet(root / f"{pattern.format(level=name)}.parquet", **sink_kwargs)
 
     def __repr__(self) -> str:
         levels = ", ".join(f"{name}({len(self._columns_of(name))} cols)" for name in self._tables)

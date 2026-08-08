@@ -1,7 +1,7 @@
 # Polars Nexpresso ☕
 
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![Polars](https://img.shields.io/badge/polars-%3E%3D1.20.0-blue)](https://www.pola.rs/)
+[![Polars](https://img.shields.io/badge/polars-%3E%3D1.41.1-blue)](https://www.pola.rs/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **Polars Nexpresso** is a utility library for working with nested and hierarchical data in Polars. It provides two main capabilities:

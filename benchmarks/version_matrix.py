@@ -4,9 +4,7 @@ from __future__ import annotations
 
 # Keep aligned with tests/test_matrix.py DEFAULT_VERSIONS.
 DEFAULT_POLARS_VERSIONS: tuple[str, ...] = (
-    "1.20.0",  # Minimum supported version
-    "1.30.0",  # Intermediate version
-    "1.35.1",  # arr.eval() baseline
+    "1.41.1",  # Minimum supported version
     "latest",  # Latest available version
 )
 

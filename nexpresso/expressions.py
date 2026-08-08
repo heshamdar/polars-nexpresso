@@ -7,35 +7,18 @@ structs and deeply nested hierarchies.
 """
 
 from collections.abc import Callable, Sequence
-from functools import lru_cache
 from typing import Literal
 
 import polars as pl
-from packaging import version
 from polars._typing import PolarsDataType
 from polars.expr.expr import Expr
 
 from nexpresso.hierarchical_packer import FrameT
 
-#: Minimum Polars version that provides ``Expr.arr.eval()``.
-ARR_EVAL_MIN_VERSION = "1.35.1"
-
-
-@lru_cache(maxsize=1)
-def _polars_version() -> version.Version:
-    """Get the current Polars version as a parsed Version object."""
-    return version.parse(pl.__version__)
-
-
-def _supports_arr_eval() -> bool:
-    """Check if the current Polars version supports arr.eval()."""
-    return _polars_version() >= version.parse(ARR_EVAL_MIN_VERSION)
-
-
 #: Substring identifying a ``pl.field()`` reference in an expression's repr.
-#: Polars renders it ``.field(["x"])`` on 1.30 and ``pl.field(["x"])`` from 1.35
-#: onward, so the leading dot form is what both have in common. Struct field
-#: *access* renders as ``struct.field_by_name(x)()`` and does not match.
+#: Polars renders it ``pl.field(["x"])``; matching on the leading dot form keeps
+#: the check robust to that prefix changing. Struct field *access* renders as
+#: ``struct.field_by_name(x)()`` and does not match.
 _STRUCT_FIELD_REF_MARKER = '.field(["'
 
 
@@ -173,17 +156,8 @@ class NestedExpressionBuilder:
             return self._process_list_field(dtype.inner, field_spec, base_expr)
 
         # Handle Array types (fixed-size arrays)
-        # As of Polars 1.0+, Arrays support arr.eval() for element-wise operations
         if isinstance(dtype, pl.Array):
-            if not _supports_arr_eval():
-                raise ValueError(
-                    f"Array types require Polars >= {ARR_EVAL_MIN_VERSION} for "
-                    f"arr.eval() support. Current version: {pl.__version__}. "
-                    "Workaround: Convert the Array to a List first using "
-                    ".cast(pl.List(inner_type))."
-                )
             inner_expr = self._process_nested_field(dtype.inner, field_spec, pl.element())
-            # Use arr.eval for arrays (available in Polars 1.0+)
             return base_expr.arr.eval(inner_expr)
 
         # Handle Struct types

@@ -7,8 +7,8 @@ different environments dynamically.
 
 Usage:
     python tests/test_matrix.py                    # Test all versions
-    python tests/test_matrix.py --versions 1.20.0 1.30.0  # Test specific versions
-    python tests/test_matrix.py --min-version 1.20.0      # Test from minimum version
+    python tests/test_matrix.py --versions 1.41.1 latest  # Test specific versions
+    python tests/test_matrix.py --min-version 1.41.1      # Test from minimum version
 """
 
 import argparse
@@ -21,8 +21,7 @@ import pytest
 
 # Polars versions to test against
 DEFAULT_VERSIONS = [
-    "1.30.0",  # Supported version
-    "1.35.1",  # Current minimum in pyproject.toml
+    "1.41.1",  # Current minimum in pyproject.toml
     "latest",  # Latest available version
 ]
 

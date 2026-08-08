@@ -78,16 +78,16 @@ uv run python -m benchmarks.bench_packer --preset smoke --check-invariants
 Compare performance across Polars versions using isolated uv environments (same approach as `tests/test_matrix.py`):
 
 ```bash
-# Default versions: 1.20.0, 1.30.0, 1.35.1, latest
+# Default versions: 1.41.1, latest
 uv run python -m benchmarks.benchmark_matrix --preset smoke
 
 # Specific versions with forwarded bench_packer flags
 uv run python -m benchmarks.benchmark_matrix \
-  --versions 1.20.0 1.35.1 latest \
+  --versions 1.41.1 latest \
   --preset medium --repeat 3 --operations pack,unpack
 
 # From a minimum version onward
-uv run python -m benchmarks.benchmark_matrix --min-version 1.30.0 --preset smoke
+uv run python -m benchmarks.benchmark_matrix --min-version 1.41.1 --preset smoke
 
 # Aggregate JSON for tracking regressions across releases
 uv run python -m benchmarks.benchmark_matrix --preset smoke --matrix-output /tmp/matrix.json

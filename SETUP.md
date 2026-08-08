@@ -31,11 +31,11 @@ uv run python test_matrix.py
 The `test_matrix.py` script tests the library against multiple Polars versions to ensure compatibility:
 
 ```bash
-# Test all default versions (1.20.0, 1.30.0, 1.35.1, latest)
+# Test all default versions (1.41.1, latest)
 uv run python test_matrix.py
 
 # Test specific versions
-uv run python test_matrix.py --versions 1.0.0 1.15.0 1.30.0
+uv run python test_matrix.py --versions 1.41.1 latest
 
 # Test from a minimum version onwards
 uv run python test_matrix.py --min-version 1.10.0

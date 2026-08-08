@@ -10,7 +10,6 @@ import polars as pl
 import pytest
 
 from nexpresso import HierarchicalPacker, HierarchySpec, LevelSpec, hierarchical_packer
-from tests.conftest import requires_streaming_pack
 
 SPEC = HierarchySpec.from_levels(
     LevelSpec(name="country", id_fields=["id"]),
@@ -169,7 +168,6 @@ def test_order_by_sorts_child_list_inside_agg():
 # =============================================================================
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 @pytest.mark.parametrize("partitions", [1, 4, 64])
 def test_pack_streaming_matches_pack(packer, flat_df, partitions, strategy):
@@ -181,7 +179,6 @@ def test_pack_streaming_matches_pack(packer, flat_df, partitions, strategy):
     assert _same(out, ref)
 
 
-@requires_streaming_pack
 def test_pack_streaming_eager_sink_returns_scan(packer, flat_df):
     ref = packer.pack(flat_df, "country")
     out = packer.pack_streaming(flat_df, "country", partitions=4, defer=False)
@@ -189,14 +186,12 @@ def test_pack_streaming_eager_sink_returns_scan(packer, flat_df):
     assert _same(out, ref)
 
 
-@requires_streaming_pack
 def test_pack_streaming_accepts_lazyframe(packer, flat_df):
     ref = packer.pack(flat_df, "country")
     out = packer.pack_streaming(flat_df.lazy(), "country", partitions=4)
     assert _same(out, ref)
 
 
-@requires_streaming_pack
 def test_pack_streaming_accepts_parquet_path(packer, flat_df, tmp_path):
     src = tmp_path / "src.parquet"
     flat_df.write_parquet(src)
@@ -205,7 +200,6 @@ def test_pack_streaming_accepts_parquet_path(packer, flat_df, tmp_path):
     assert _same(out, ref)
 
 
-@requires_streaming_pack
 def test_pack_streaming_chains_lazily(packer, flat_df):
     ref = packer.pack(flat_df, "country")
     n = (
@@ -216,7 +210,6 @@ def test_pack_streaming_chains_lazily(packer, flat_df):
     assert n == ref.height
 
 
-@requires_streaming_pack
 def test_pack_streaming_to_intermediate_level(packer, flat_df):
     ref = packer.pack(flat_df, "city")
     out = packer.pack_streaming(flat_df, "city", partitions=4)
@@ -255,7 +248,6 @@ def skewed_df() -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
-@requires_streaming_pack
 def test_balanced_output_is_sorted_by_root_key(packer, skewed_df):
     """Contiguous ascending key ranges make the concatenated result sorted."""
     out = packer.pack_streaming(
@@ -267,7 +259,6 @@ def test_balanced_output_is_sorted_by_root_key(packer, skewed_df):
     assert _same(out, packer.pack(skewed_df, "country"))
 
 
-@requires_streaming_pack
 def test_balanced_lowers_peak_bucket_size(packer, skewed_df):
     """Balancing rows beats hashing entities when entity sizes are uneven.
 
@@ -300,7 +291,6 @@ def test_balanced_lowers_peak_bucket_size(packer, skewed_df):
     assert bucket_map.height == skewed_df["country.id"].n_unique()
 
 
-@requires_streaming_pack
 def test_balanced_sorted_with_many_buckets(packer, skewed_df, tmp_path):
     """Sortedness must survive >= 10 buckets.
 
@@ -324,7 +314,6 @@ def test_balanced_sorted_with_many_buckets(packer, skewed_df, tmp_path):
     assert _same(out, packer.pack(skewed_df, "country"))
 
 
-@requires_streaming_pack
 def test_balanced_degenerates_to_one_bucket_per_entity(packer, skewed_df):
     """Raising partitions past the entity count is the partition-by-key limit."""
     n_entities = skewed_df["country.id"].n_unique()
@@ -334,7 +323,6 @@ def test_balanced_degenerates_to_one_bucket_per_entity(packer, skewed_df):
     assert n_buckets == n_entities
 
 
-@requires_streaming_pack
 def test_balanced_and_hash_agree_on_skewed_data(packer, skewed_df, tmp_path):
     """The two strategies differ in bucketing, never in contents."""
     results = {
@@ -353,7 +341,6 @@ def test_balanced_and_hash_agree_on_skewed_data(packer, skewed_df, tmp_path):
     _assert_matches_pack(results["hash"], packer.pack(skewed_df, "country"))
 
 
-@requires_streaming_pack
 def test_balanced_bucket_count_floats_above_target(packer, skewed_df):
     """An entity is never split, so a bucket closes early rather than overflow."""
     lf = skewed_df.lazy()
@@ -413,44 +400,26 @@ def test_lazy_operations_do_not_execute(packer, flat_df, monkeypatch, operation)
     assert not executed, f"operation executed the query instead of staying lazy: {executed}"
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
-def test_pack_streaming_bucketing_paths_agree(packer, flat_df, tmp_path, monkeypatch, strategy):
-    """The single-pass partitioned sink and the per-bucket filter fallback agree.
-
-    Polars versions before partitioned sinks (1.30) take the fallback, so both
-    paths have to carry every strategy.
-    """
+def test_pack_streaming_bucketing_matches_pack(packer, flat_df, tmp_path, strategy):
+    """Every bucketing strategy reproduces a plain pack()."""
     ref = packer.pack(flat_df, "country")
 
-    fast_dir = tmp_path / "fast"
-    fast = packer.pack_streaming(
+    out_dir = tmp_path / "out"
+    result = packer.pack_streaming(
         flat_df,
         "country",
         partitions=4,
-        tmp_dir=fast_dir,
+        tmp_dir=out_dir,
         defer=False,
         partition_strategy=strategy,
     )
 
-    monkeypatch.setattr(hierarchical_packer, "_supports_partitioned_sink", lambda: False)
-    slow_dir = tmp_path / "slow"
-    slow = packer.pack_streaming(
-        flat_df,
-        "country",
-        partitions=4,
-        tmp_dir=slow_dir,
-        defer=False,
-        partition_strategy=strategy,
-    )
-
-    assert _same(fast, ref)
-    assert _same(slow, ref)
+    assert _same(result, ref)
     # The staging area used by the partitioned sink is cleaned up.
-    assert not (fast_dir / "_stage").exists()
+    assert not (out_dir / "_stage").exists()
 
 
-@requires_streaming_pack
 def test_pack_streaming_cleans_staging_on_failure(packer, flat_df, tmp_path, monkeypatch):
     """The staging area is removed even when a bucket pack blows up."""
     boom = RuntimeError("bucket pack failed")
@@ -472,7 +441,6 @@ def test_pack_streaming_cleans_staging_on_failure(packer, flat_df, tmp_path, mon
     assert not (tmp_path / "_stage").exists()
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 def test_pack_streaming_defer_does_not_execute_at_call_time(packer, flat_df, tmp_path, strategy):
     """``defer=True`` must not touch the data until the caller collects.
@@ -499,7 +467,6 @@ def test_pack_streaming_defer_does_not_execute_at_call_time(packer, flat_df, tmp
     _assert_matches_pack(collected, packer.pack(flat_df, "country"))
 
 
-@requires_streaming_pack
 def test_pack_streaming_eager_returns_a_real_scan(packer, flat_df, tmp_path):
     """``defer=False`` hands back a Parquet scan, so downstream work streams.
 
@@ -517,7 +484,6 @@ def test_pack_streaming_eager_returns_a_real_scan(packer, flat_df, tmp_path):
     assert "SELECTION" in pushed or "FILTER" in pushed
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 def test_pack_streaming_keeps_entities_whole(packer, flat_df, strategy):
     """Every root entity ends up in exactly one output row, never split across buckets."""
@@ -550,7 +516,6 @@ def _two_level_df(pairs) -> pl.DataFrame:
     )
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 @pytest.mark.parametrize("partitions", [1, 4])
 def test_pack_streaming_empty_input(two_level_packer, tmp_path, strategy, partitions):
@@ -575,7 +540,6 @@ def test_pack_streaming_empty_input(two_level_packer, tmp_path, strategy, partit
     _assert_matches_pack(out, two_level_packer.pack(empty, "country"))
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 @pytest.mark.parametrize(
     ("pairs", "label"),
@@ -606,7 +570,6 @@ def test_pack_streaming_null_root_keys(two_level_packer, tmp_path, strategy, pai
     _assert_matches_pack(out, two_level_packer.pack(df, "country"))
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 @pytest.mark.parametrize(
     ("pairs", "label"),
@@ -635,7 +598,6 @@ def test_pack_streaming_degenerate_inputs(two_level_packer, tmp_path, strategy, 
 # =============================================================================
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 def test_pack_streaming_multi_column_root_key(tmp_path, strategy):
     spec = HierarchySpec(
@@ -665,7 +627,6 @@ def test_pack_streaming_multi_column_root_key(tmp_path, strategy):
     _assert_matches_pack(out, p.pack(df, "country"))
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 def test_pack_streaming_non_string_root_key(two_level_packer, tmp_path, strategy):
     """Bucketing must not assume the key is a string."""
@@ -683,7 +644,6 @@ def test_pack_streaming_non_string_root_key(two_level_packer, tmp_path, strategy
     _assert_matches_pack(out, two_level_packer.pack(df, "country"))
 
 
-@requires_streaming_pack
 def test_pack_streaming_honours_order_by(tmp_path):
     """A level's order_by still controls child-list order through the streaming path."""
     spec = HierarchySpec(
@@ -700,7 +660,6 @@ def test_pack_streaming_honours_order_by(tmp_path):
     assert [c["id"] for c in out["country"][0]["city"]] == ["a", "b", "c"]
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 def test_pack_streaming_without_preserve_child_order(tmp_path, strategy):
     """Contents still match; only child-list order is unspecified."""
@@ -720,7 +679,6 @@ def test_pack_streaming_without_preserve_child_order(tmp_path, strategy):
     assert _children_ignoring_order(out) == _children_ignoring_order(p.pack(df, "country"))
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("extra_columns", ["preserve", "drop"])
 def test_pack_streaming_extra_columns(two_level_packer, tmp_path, extra_columns):
     """Non-hierarchy columns follow the same rules as eager ``pack``."""
@@ -740,7 +698,6 @@ def test_pack_streaming_extra_columns(two_level_packer, tmp_path, extra_columns)
     _assert_matches_pack(out, two_level_packer.pack(df, "country", extra_columns=extra_columns))
 
 
-@requires_streaming_pack
 def test_pack_streaming_with_validation_enabled(tmp_path):
     """validate_on_pack=True must not break the per-bucket packs."""
     p = HierarchicalPacker(TWO_LEVEL, validate_on_pack=True)
@@ -751,7 +708,6 @@ def test_pack_streaming_with_validation_enabled(tmp_path):
     _assert_matches_pack(out, p.pack(df, "country"))
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("source_kind", ["dataframe", "lazyframe", "str_path", "path", "glob"])
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 def test_pack_streaming_source_forms(packer, flat_df, tmp_path, source_kind, strategy):
@@ -781,7 +737,6 @@ def test_pack_streaming_source_forms(packer, flat_df, tmp_path, source_kind, str
     _assert_matches_pack(out.collect(), packer.pack(flat_df, "country"))
 
 
-@requires_streaming_pack
 def test_pack_streaming_tmp_dir_accepts_str(packer, flat_df, tmp_path):
     out = packer.pack_streaming(
         flat_df, "country", partitions=4, tmp_dir=str(tmp_path / "as_str"), defer=False
@@ -803,13 +758,6 @@ def test_pack_streaming_requires_root_id_fields(flat_df):
 
     with pytest.raises(hierarchical_packer.HierarchyValidationError, match="id_fields"):
         p.pack_streaming(flat_df, "country", partitions=2)
-
-
-def test_pack_streaming_defer_requires_pl_defer(packer, flat_df, monkeypatch):
-    monkeypatch.delattr(pl, "defer", raising=False)
-
-    with pytest.raises(RuntimeError, match="pl.defer"):
-        packer.pack_streaming(flat_df, "country", defer=True)
 
 
 # =============================================================================
@@ -888,7 +836,6 @@ def test_unpack_streaming_stays_lazy_without_sink(packer, flat_df, monkeypatch):
     assert not executed
 
 
-@requires_streaming_pack
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])
 def test_pack_streaming_unpack_streaming_round_trip(packer, flat_df, tmp_path, strategy):
     """pack_streaming -> unpack_streaming returns the original rows."""

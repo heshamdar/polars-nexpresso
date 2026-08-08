@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **Minimum Polars raised to 1.41.1.** Newer Polars releases carry substantial
+  changes, and supporting versions back to 1.20 meant carrying fallbacks for
+  APIs that have long since shipped. The floor is 1.41.**1** rather than 1.41.0
+  because 1.41.0 was yanked from PyPI and cannot be installed.
+
+  The CI matrix is now `["1.41.1", "latest"]`, and these compatibility branches
+  are removed as unreachable:
+
+  - `_supports_arr_eval()` / `ARR_EVAL_MIN_VERSION` and the `ValueError` raised
+    for `Array` types on older Polars — `arr.eval()` is now used directly.
+  - `_supports_partitioned_sink()` and `pack_streaming`'s per-bucket filter
+    fallback — `pl.PartitionBy` is always available, so the single-pass
+    partitioned sink is the only path.
+  - The `pl.defer` availability check in `pack_streaming(defer=True)` and its
+    `RuntimeError`.
+  - `_supports_explode_empty_as_null()` — `explode(empty_as_null=True)` is now
+    passed unconditionally (still pinned explicitly, since Polars 2.0 flips the
+    default).
+  - `HierarchyView.sink_parquet`'s `collect().write_parquet()` fallback.
+
+  The version-pinned skip markers in `tests/conftest.py` (`requires_arr_eval`,
+  `requires_struct_with_fields`, `requires_list_eval`, `requires_collect_schema`,
+  `requires_group_by_maintain_order`, `requires_streaming_pack`) are gone —
+  every one was vacuous at 1.41. The generic helpers (`get_polars_version`,
+  `polars_version_at_least`, `polars_version_below`, `skip_if_polars_below`)
+  remain for gating features newer than the floor.
+
 ### Added
 
 - **`HierarchyView` — query normalized storage through a nested interface.**
