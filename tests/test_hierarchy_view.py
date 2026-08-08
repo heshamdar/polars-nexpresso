@@ -168,6 +168,25 @@ class TestFilterRouting:
             table = filtered.tables()[level].collect()
             assert table["region.id"].unique().to_list() == [2]
 
+    def test_ancestor_key_predicate_reaches_every_scan(
+        self, view: HierarchyView, packer: HierarchicalPacker, tmp_path
+    ):
+        """
+        The predicate must sit ON each level's scan, not merely be implied.
+
+        Applying it to only one level would still be *correct* — the
+        consistency cascade restores the same rows — so no data assertion can
+        catch the difference. But the deepest scan would then read every row
+        group and filter afterwards, losing exactly the row-group skipping this
+        routing exists to buy. Hence a plan assertion.
+        """
+        view.sink_parquet(tmp_path)
+        filtered = HierarchyView.scan_parquet(tmp_path, packer).filter(pl.col("region.id") == 2)
+        plan = filtered.tables()["sale"].explain().upper()
+        assert plan.count("SELECTION") >= len(filtered.levels), (
+            "the ancestor-key predicate did not reach every level's scan:\n" + plan
+        )
+
     def test_ancestor_key_matches_flat(self, view: HierarchyView, flat: pl.DataFrame):
         assert_same_rows(
             view.filter(pl.col("region.id") == 2).collect("sale"),

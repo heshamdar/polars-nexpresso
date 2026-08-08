@@ -71,6 +71,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   layouts across nine representative queries, cross-checking every result
   across layouts before timing so a divergence fails the run.
 
+- **`tests/test_view_packed_equivalence.py`** — 259 cases asserting the packed
+  and view paths agree. A shared case table expresses each operation twice —
+  once against the flat frame, once against the view — and four laws are checked
+  per case: `collect_nested()` matches `pack()`, denormalizing the view's own
+  tables matches `pack()`, the flat form matches `unpack()`, and every level's
+  table matches `split_levels()`. Comparisons are strict: same values, dtypes,
+  struct field order and child ordering, normalized only by a root-row sort.
+  Operations the nested expression builder can express are additionally checked
+  head-to-head against `apply_nested_operations`.
+
+  Covers uneven fan-out, single-child parents and nulls; 2-, 3- and 4-level
+  hierarchies; and both `empty_parents` modes. The suite was mutation-tested —
+  removing either consistency cascade, weakening the ancestor join to an inner
+  join, or evaluating a cross-level predicate at the wrong level each make it
+  fail.
+
 - **`examples_hierarchy_view.py`** — a runnable tour: the `list.eval`
   limitation demonstrated directly, then cross-level expressions, rollups and
   shares, cross-level filtering, conditional aggregation, and a full pipeline
