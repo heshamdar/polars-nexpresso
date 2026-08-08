@@ -27,7 +27,7 @@ uv sync
 ## Requirements
 
 - Python 3.10+
-- Polars 1.20.0+
+- Polars 1.41.1+
 
 ## Your First Transformation
 

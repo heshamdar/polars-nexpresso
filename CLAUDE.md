@@ -27,7 +27,7 @@ This document provides comprehensive guidance for AI assistants working with the
 **Project Name:** Polars Nexpresso
 **Description:** A utility library for working with nested and hierarchical data in Polars
 **Language:** Python 3.10+
-**Primary Dependency:** polars >= 1.20.0
+**Primary Dependency:** polars >= 1.41.1
 **Package Manager:** uv
 **License:** MIT
 
@@ -247,7 +247,7 @@ uv run pytest --cov=nexpresso --cov-report=html
 uv run python tests/test_matrix.py
 
 # Test specific versions
-uv run python tests/test_matrix.py --versions 1.20.0 1.30.0 latest
+uv run python tests/test_matrix.py --versions 1.41.1 latest
 
 # Stop on first failure
 uv run python tests/test_matrix.py --stop-on-failure
@@ -460,11 +460,9 @@ def validate(self, frame: FrameT, raise_on_error: bool = True) -> list[str]:
 
 ```python
 # ✅ Good - Explains WHY, not WHAT
-# Use arr.eval() for Polars >= 1.35.1, fall back to list.eval() for older versions
-if _supports_arr_eval():
-    expr = base_expr.arr.eval(transformed_expr)
-else:
-    expr = base_expr.list.eval(transformed_expr)
+# Polars 2.0 flips this default to False, which would silently drop parents
+# whose child list is empty. Pin it so a childless parent survives unpack.
+lf = lf.explode(meta.path, empty_as_null=True)
 
 # ✅ Good - Section headers for organization
 # =============================================================================
@@ -561,19 +559,18 @@ def list_of_structs_df() -> pl.DataFrame:
 
 ### Version-Specific Testing
 
-**Skip tests for unsupported versions:**
+The minimum supported Polars is **1.41.1**. Everything available at 1.41 may be
+used unconditionally — `arr.eval()`, `pl.defer`, `pl.PartitionBy` and
+`explode(empty_as_null=)` all predate it, so no gate is needed for them.
+
+**Skip tests for features newer than the floor:**
 
 ```python
-from conftest import requires_arr_eval, skip_if_polars_below
+from conftest import skip_if_polars_below
 
-@requires_arr_eval
-def test_array_operations():
-    """Test arr.eval() - requires Polars >= 1.35.1."""
-    pass
-
-@skip_if_polars_below("1.30.0")
+@skip_if_polars_below("1.45.0")
 def test_new_feature():
-    """Test feature added in Polars 1.30.0."""
+    """Test a feature added after the 1.41 floor."""
     pass
 ```
 
@@ -583,7 +580,7 @@ def test_new_feature():
 from conftest import get_polars_version, polars_version_at_least
 
 def test_conditional_behavior():
-    if polars_version_at_least("1.35.1"):
+    if polars_version_at_least("1.45.0"):
         # Test new behavior
         pass
     else:
@@ -594,14 +591,14 @@ def test_conditional_behavior():
 ### Multi-Version Testing
 
 ```bash
-# Test all default versions (1.20.0, 1.30.0, 1.35.1, latest)
+# Test all default versions (1.41.1, latest)
 uv run python tests/test_matrix.py
 
 # Custom version list
-uv run python tests/test_matrix.py --versions 1.20.0 1.35.1 latest
+uv run python tests/test_matrix.py --versions 1.41.1 latest
 
 # Test from minimum version onwards
-uv run python tests/test_matrix.py --min-version 1.25.0
+uv run python tests/test_matrix.py --min-version 1.41.1
 
 # Stop on first failure
 uv run python tests/test_matrix.py --stop-on-failure
@@ -645,7 +642,7 @@ Triggers on:
 ```yaml
 strategy:
   matrix:
-    polars-version: ["1.20.0", "1.30.0", "1.35.1", "latest"]
+    polars-version: ["1.41.1", "latest"]
 ```
 
 **Steps:**
@@ -787,6 +784,9 @@ def _process_nested_field(
 
 **Check version and provide fallbacks:**
 
+Only needed for APIs newer than the 1.41 floor. Anything at or below 1.41 is
+used directly — gating it adds a dead branch.
+
 ```python
 from functools import lru_cache
 from packaging import version
@@ -796,18 +796,19 @@ def _polars_version() -> version.Version:
     """Get the current Polars version."""
     return version.parse(pl.__version__)
 
-def _supports_arr_eval() -> bool:
-    """Check if arr.eval() is available."""
-    return _polars_version() >= version.parse("1.35.1")
+def _supports_future_api() -> bool:
+    """Check whether an API newer than the supported floor is available."""
+    return _polars_version() >= version.parse("1.45.0")
 
-def _apply_transformation(self, base_expr: pl.Expr, transform: pl.Expr) -> pl.Expr:
-    """Apply transformation with version-appropriate method."""
-    if _supports_arr_eval():
-        return base_expr.arr.eval(transform)
-    else:
-        # Fallback for older versions
-        return base_expr.list.eval(transform)
+def _apply(self, expr: pl.Expr) -> pl.Expr:
+    """Use the newer API where present, otherwise the supported equivalent."""
+    if _supports_future_api():
+        return expr.new_api()
+    return expr.established_equivalent()
 ```
+
+When the floor rises past such a check, delete the check and the fallback rather
+than leaving an always-true branch.
 
 ### Pattern 5: Builder with Validation
 
@@ -932,18 +933,17 @@ def good_process(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf.select(...)
 ```
 
-❌ **Don't ignore version compatibility:**
+❌ **Don't gate on versions at or below the 1.41 floor:**
 ```python
-# Bad - assumes new API exists
-def bad_use_new_feature():
-    return df.arr.eval(...)  # ⚠️ Breaks on Polars < 1.35.1
-
-# Good - check version
-def good_use_new_feature():
+# Bad - always true on every supported version, so the fallback is dead code
+def bad_use_feature(expr):
     if _supports_arr_eval():
-        return df.arr.eval(...)
-    else:
-        return df.list.eval(...)  # Fallback
+        return expr.arr.eval(...)
+    return expr.list.eval(...)
+
+# Good - the floor guarantees it
+def good_use_feature(expr):
+    return expr.arr.eval(...)
 ```
 
 ❌ **Don't write vague error messages:**

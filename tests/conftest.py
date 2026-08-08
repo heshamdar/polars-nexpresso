@@ -52,47 +52,6 @@ def polars_version_below(max_version: str) -> bool:
 
 
 # =============================================================================
-# Skip Markers for Version-Specific Features
-# =============================================================================
-
-# arr.eval() was added in Polars 1.35.1
-requires_arr_eval = pytest.mark.skipif(
-    polars_version_below("1.35.1"),
-    reason="arr.eval() requires Polars >= 1.35.1",
-)
-
-# struct.with_fields() behavior changed in 0.19.0
-requires_struct_with_fields = pytest.mark.skipif(
-    polars_version_below("0.19.0"),
-    reason="struct.with_fields() requires Polars >= 0.19.0",
-)
-
-# list.eval() with pl.element() became stable in 0.18.0
-requires_list_eval = pytest.mark.skipif(
-    polars_version_below("0.18.0"),
-    reason="list.eval() with pl.element() requires Polars >= 0.18.0",
-)
-
-# LazyFrame.collect_schema() was added in 0.20.0
-requires_collect_schema = pytest.mark.skipif(
-    polars_version_below("0.20.0"),
-    reason="LazyFrame.collect_schema() requires Polars >= 0.20.0",
-)
-
-# group_by with maintain_order parameter
-requires_group_by_maintain_order = pytest.mark.skipif(
-    polars_version_below("0.19.0"),
-    reason="group_by(maintain_order=True) requires Polars >= 0.19.0",
-)
-
-# pack_streaming(defer=True) needs pl.defer + collect(engine="streaming")
-requires_streaming_pack = pytest.mark.skipif(
-    not hasattr(pl, "defer") or polars_version_below("1.30.0"),
-    reason="pack_streaming requires pl.defer and collect(engine='streaming')",
-)
-
-
-# =============================================================================
 # Helper function for custom version requirements
 # =============================================================================
 

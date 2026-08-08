@@ -7,8 +7,8 @@ isolated uv environments, similar to tests/test_matrix.py.
 
 Usage:
     uv run python -m benchmarks.benchmark_matrix --preset smoke
-    uv run python -m benchmarks.benchmark_matrix --versions 1.20.0 1.35.1 latest --preset medium
-    uv run python -m benchmarks.benchmark_matrix --min-version 1.30.0 --operations pack
+    uv run python -m benchmarks.benchmark_matrix --versions 1.41.1 latest --preset medium
+    uv run python -m benchmarks.benchmark_matrix --min-version 1.41.1 --operations pack
 """
 
 from __future__ import annotations

@@ -15,14 +15,12 @@ Example
 
 from __future__ import annotations
 
-import inspect
 import math
 import shutil
 import tempfile
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeVar
 
@@ -48,17 +46,6 @@ ORDER_TEMP_COLUMN_PREFIX = "__hier_order_"
 BUCKET_COLUMN = "__hier_bucket"
 DEFAULT_SEPARATOR = "."
 DEFAULT_ESCAPE_CHAR = "\\"
-
-
-def _supports_partitioned_sink() -> bool:
-    """Whether this Polars version exposes ``pl.PartitionBy`` for partitioned sinks."""
-    return hasattr(pl, "PartitionBy")
-
-
-@lru_cache(maxsize=1)
-def _supports_explode_empty_as_null() -> bool:
-    """Whether ``explode()`` accepts ``empty_as_null`` (Polars >= 1.41)."""
-    return "empty_as_null" in inspect.signature(pl.LazyFrame.explode).parameters
 
 
 def _sorted_bucket_dirs(stage_dir: Path) -> list[Path]:
@@ -1293,13 +1280,6 @@ class HierarchicalPacker:
                 "Must be 'balanced' or 'hash'."
             )
 
-        if defer and not hasattr(pl, "defer"):
-            raise RuntimeError(
-                "pack_streaming(defer=True) requires a Polars version that provides "
-                "pl.defer. Upgrade Polars, or call with defer=False to sink eagerly "
-                "and return a scan_parquet handle."
-            )
-
         source_lf = (
             pl.scan_parquet(source) if isinstance(source, (str, Path)) else self._to_lazy(source)
         )
@@ -1373,15 +1353,8 @@ class HierarchicalPacker:
                 return _pack_whole_source()
 
             bucketed, n_buckets = _bucketed(prepared)
-
-            if not _supports_partitioned_sink():
-                # Fallback: one filtered pass per bucket. Correct, but it re-reads
-                # the whole source once per bucket.
-                if n_buckets == 0:
-                    return _pack_whole_source()
-                for i in range(n_buckets):
-                    _pack_bucket(bucketed.filter(pl.col(BUCKET_COLUMN) == i).drop(BUCKET_COLUMN), i)
-                return [out_dir / f"part_{i:05d}.parquet" for i in range(n_buckets)]
+            if n_buckets == 0:
+                return _pack_whole_source()
 
             # Single streaming pass writes every bucket to its own directory, so
             # the source is read once instead of once per bucket.
@@ -3338,13 +3311,10 @@ class HierarchicalPacker:
         # ``pack`` always produces List, but a caller may hand us data whose level
         # column was cast to a fixed-size Array; ``explode`` handles both.
         if isinstance(dtype, (pl.List, pl.Array)):
-            if _supports_explode_empty_as_null():
-                # Polars 2.0 flips this default to False, which would silently drop
-                # parents whose child list is empty. Pin it so a childless parent
-                # keeps surviving unpack as a single null-child row.
-                lf = lf.explode(meta.path, empty_as_null=True)
-            else:
-                lf = lf.explode(meta.path)
+            # Polars 2.0 flips this default to False, which would silently drop
+            # parents whose child list is empty. Pin it so a childless parent
+            # keeps surviving unpack as a single null-child row.
+            lf = lf.explode(meta.path, empty_as_null=True)
 
         lf = lf.with_columns(
             pl.col(meta.path).name.prefix_fields(f"{meta.path}{self.separator}")
