@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-11
+
 ### Changed (breaking)
 
 - **Minimum Polars raised to 1.41.1.** Newer Polars releases carry substantial
@@ -143,6 +145,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`docs/concepts/storage-layouts.md`** and **`docs/api/view.md`** — the
   measurements behind the above, and the API reference.
 
+### Fixed
+
+- **`HierarchyView` routing bugs** — multi-argument `filter`/`with_columns`
+  no longer discard earlier arguments when a cross-level path is taken;
+  `with_columns` routes by output path (not inputs); escaped separator
+  handling in `_owner_of`/`promote` uses the public path helpers;
+  aggregating ancestor-key predicates are rejected instead of silently
+  returning wrong row counts.
+
 ## [0.5.0] - 2026-08-07
 
 ### Changed (breaking)
@@ -255,4 +266,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pack uniformity check reduces violation counts inside the engine rather
   than pulling one row per group into Python.
 
+[0.6.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.6.0
 [0.5.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.5.0
