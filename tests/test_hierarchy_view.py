@@ -65,7 +65,7 @@ class TestConstruction:
         self, flat: pl.DataFrame, packer: HierarchicalPacker, view: HierarchyView
     ):
         direct = HierarchyView.from_tables(packer.normalize(flat), packer)
-        assert_same_rows(direct.collect("sale"), view.collect("sale"), SALE_ID)
+        assert_same_rows(direct.level("sale").collect(), view.level("sale").collect(), SALE_ID)
 
     def test_rejects_unknown_level(self, flat: pl.DataFrame, packer: HierarchicalPacker):
         tables = packer.normalize(flat)
@@ -89,7 +89,7 @@ class TestConstruction:
             "sale.parquet",
         }
         rescanned = HierarchyView.scan_parquet(tmp_path, packer)
-        assert_same_rows(rescanned.collect("sale"), view.collect("sale"), SALE_ID)
+        assert_same_rows(rescanned.level("sale").collect(), view.level("sale").collect(), SALE_ID)
 
     def test_scan_parquet_reports_missing_levels(
         self, view: HierarchyView, packer: HierarchicalPacker, tmp_path
@@ -105,12 +105,21 @@ class TestConstruction:
 
 
 class TestIntrospection:
-    """The view presents a nested face over flat tables."""
+    """What the view can tell you about itself without moving data."""
 
-    def test_schema_is_nested(
+    def test_schema_comes_from_the_frame_you_ask_for(
         self, view: HierarchyView, packer: HierarchicalPacker, flat: pl.DataFrame
     ):
-        assert view.schema == packer.pack(flat, "region").schema
+        """Each granularity has its own schema, so each is asked for by name."""
+        assert view.nested().collect_schema() == packer.pack(flat, "region").schema
+        assert (
+            view.level("sale").collect_schema()
+            == packer.unpack(packer.pack(flat, "region"), "sale").schema
+        )
+
+    def test_key_columns_are_ancestor_keys_then_own_ids(self, view: HierarchyView):
+        assert view.key_columns("region") == ["region.id"]
+        assert view.key_columns("sale") == ["region.id", "region.store.id", SALE_ID]
 
     def test_columns_are_dotted_paths(self, view: HierarchyView):
         assert AMOUNT in view.columns
@@ -125,9 +134,9 @@ class TestIntrospection:
         with pytest.raises(KeyError, match="not owned by any level"):
             view.level_of("region.store.sale.nonexistent.deep")
 
-    def test_explain_returns_plans(self, view: HierarchyView):
-        assert "JOIN" in view.explain("sale").upper()
-        assert view.explain() != ""
+    def test_plans_are_available_per_granularity(self, view: HierarchyView):
+        assert "JOIN" in view.level("sale").explain().upper()
+        assert view.nested().explain() != ""
 
     def test_explain_scan_shows_pushdown(
         self, view: HierarchyView, packer: HierarchicalPacker, tmp_path
@@ -137,7 +146,8 @@ class TestIntrospection:
         plan = (
             HierarchyView.scan_parquet(tmp_path, packer)
             .filter(pl.col("region.id") == 2)
-            .explain("sale")
+            .level("sale")
+            .explain()
         )
         assert "SCAN" in plan.upper()
         assert "SELECTION" in plan.upper()
@@ -146,8 +156,8 @@ class TestIntrospection:
         assert "region" in repr(view) and "prune" in repr(view)
 
     def test_nothing_executes_until_terminal(self, view: HierarchyView):
-        assert isinstance(view.to_flat("sale"), pl.LazyFrame)
-        assert isinstance(view.to_nested(), pl.LazyFrame)
+        assert isinstance(view.level("sale"), pl.LazyFrame)
+        assert isinstance(view.nested(), pl.LazyFrame)
         assert all(isinstance(t, pl.LazyFrame) for t in view.tables().values())
 
 
@@ -156,7 +166,7 @@ class TestFilterRouting:
 
     def test_leaf_attribute(self, view: HierarchyView, flat: pl.DataFrame):
         assert_same_rows(
-            view.filter(pl.col(AMOUNT) > 12).collect("sale"),
+            view.filter(pl.col(AMOUNT) > 12).level("sale").collect(),
             flat.filter(pl.col(AMOUNT) > 12),
             SALE_ID,
         )
@@ -189,21 +199,23 @@ class TestFilterRouting:
 
     def test_ancestor_key_matches_flat(self, view: HierarchyView, flat: pl.DataFrame):
         assert_same_rows(
-            view.filter(pl.col("region.id") == 2).collect("sale"),
+            view.filter(pl.col("region.id") == 2).level("sale").collect(),
             flat.filter(pl.col("region.id") == 2),
             SALE_ID,
         )
 
     def test_ancestor_attribute_requires_join(self, view: HierarchyView, flat: pl.DataFrame):
         assert_same_rows(
-            view.filter(pl.col("region.name") == "r1").collect("sale"),
+            view.filter(pl.col("region.name") == "r1").level("sale").collect(),
             flat.filter(pl.col("region.name") == "r1"),
             SALE_ID,
         )
 
     def test_cross_level_predicate(self, view: HierarchyView, flat: pl.DataFrame):
         predicate = pl.col(AMOUNT) > pl.col("region.id") * 4
-        assert_same_rows(view.filter(predicate).collect("sale"), flat.filter(predicate), SALE_ID)
+        assert_same_rows(
+            view.filter(predicate).level("sale").collect(), flat.filter(predicate), SALE_ID
+        )
 
     def test_cross_level_predicate_drops_borrowed_columns(self, view: HierarchyView):
         """Columns joined in to evaluate a predicate must not leak into the table."""
@@ -212,14 +224,17 @@ class TestFilterRouting:
 
     def test_multiple_predicates_compose(self, view: HierarchyView, flat: pl.DataFrame):
         assert_same_rows(
-            view.filter(pl.col(AMOUNT) > 5, pl.col("region.id") == 1).collect("sale"),
+            view.filter(pl.col(AMOUNT) > 5, pl.col("region.id") == 1).level("sale").collect(),
             flat.filter(pl.col(AMOUNT) > 5, pl.col("region.id") == 1),
             SALE_ID,
         )
 
     def test_chained_filters_compose(self, view: HierarchyView, flat: pl.DataFrame):
         assert_same_rows(
-            view.filter(pl.col(AMOUNT) > 5).filter(pl.col("region.id") == 1).collect("sale"),
+            view.filter(pl.col(AMOUNT) > 5)
+            .filter(pl.col("region.id") == 1)
+            .level("sale")
+            .collect(),
             flat.filter(pl.col(AMOUNT) > 5).filter(pl.col("region.id") == 1),
             SALE_ID,
         )
@@ -229,44 +244,9 @@ class TestFilterRouting:
             view.filter(pl.col("region.store.sale.nope.deep") > 1)
 
     def test_source_view_is_unchanged(self, view: HierarchyView):
-        before = view.collect("sale").height
+        before = view.level("sale").collect().height
         view.filter(pl.col(AMOUNT) > 12)
-        assert view.collect("sale").height == before
-
-
-class TestWithColumns:
-    """Derived columns land on the level of their deepest input."""
-
-    def test_leaf_expression(self, view: HierarchyView, flat: pl.DataFrame):
-        expr = (pl.col(AMOUNT) * 2).alias("region.store.sale.doubled")
-        assert_same_rows(view.with_columns(expr).collect("sale"), flat.with_columns(expr), SALE_ID)
-
-    def test_lands_on_owning_level(self, view: HierarchyView):
-        widened = view.with_columns((pl.col(AMOUNT) * 2).alias("region.store.sale.doubled"))
-        assert "region.store.sale.doubled" in widened.tables()["sale"].collect_schema().names()
-        assert (
-            "region.store.sale.doubled" not in widened.tables()["region"].collect_schema().names()
-        )
-
-    def test_cross_level_expression(self, view: HierarchyView, flat: pl.DataFrame):
-        expr = (pl.col(AMOUNT) + pl.col("region.id")).alias("region.store.sale.adj")
-        assert_same_rows(view.with_columns(expr).collect("sale"), flat.with_columns(expr), SALE_ID)
-
-    def test_unknown_column_raises(self, view: HierarchyView):
-        with pytest.raises(KeyError, match="[Uu]nknown column"):
-            view.with_columns(
-                (pl.col("region.store.sale.nope.deep") * 2).alias("region.store.sale.x")
-            )
-
-
-class TestDrop:
-    def test_drops_attribute(self, view: HierarchyView):
-        dropped = view.drop("region.store.name")
-        assert "region.store.name" not in dropped.collect("sale").columns
-
-    def test_refuses_key_columns(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="key column"):
-            view.drop("region.id")
+        assert view.level("sale").collect().height == before
 
 
 class TestCrossLevelConsistency:
@@ -296,15 +276,7 @@ class TestCrossLevelConsistency:
     def test_tables_and_collect_agree(self, view: HierarchyView):
         """The cheap terminal and the joined terminal must tell the same story."""
         filtered = view.filter(pl.col("region.name") == "r1")
-        assert filtered.tables()["sale"].collect().height == filtered.collect("sale").height
-
-    def test_any_child_satisfies_restricts_descendants(self, view: HierarchyView):
-        restricted = view.any_child_satisfies(
-            pl.col(AMOUNT) > 15, at_level="store", child_level="sale"
-        )
-        surviving = set(restricted.tables()["store"].collect()["region.store.id"].to_list())
-        sale_stores = set(restricted.tables()["sale"].collect()["region.store.id"].to_list())
-        assert sale_stores <= surviving
+        assert filtered.tables()["sale"].collect().height == filtered.level("sale").collect().height
 
     def test_unfiltered_view_adds_no_joins(self, view: HierarchyView):
         """An untouched view must resolve to its scans, not to a join cascade."""
@@ -333,7 +305,7 @@ class TestEmptyParentSemantics:
     def test_prune_matches_pack(
         self, view: HierarchyView, flat: pl.DataFrame, packer: HierarchicalPacker
     ):
-        got = view.filter(self.RARE).collect_nested()
+        got = view.filter(self.RARE).nested().collect()
         want = packer.pack(flat.filter(self.RARE), "region")
         assert_frame_equal(got.sort("region.id"), want.sort("region.id"), check_dtypes=False)
 
@@ -344,9 +316,10 @@ class TestEmptyParentSemantics:
         kept = (
             HierarchyView.from_frame(flat, packer, empty_parents="keep")
             .filter(self.RARE)
-            .collect_nested()
+            .nested()
+            .collect()
         )
-        pruned = HierarchyView.from_frame(flat, packer).filter(self.RARE).collect_nested()
+        pruned = HierarchyView.from_frame(flat, packer).filter(self.RARE).nested().collect()
 
         def total_stores(frame: pl.DataFrame) -> int:
             return frame.select(pl.col("region.store").list.len().sum()).item()
@@ -358,7 +331,7 @@ class TestEmptyParentSemantics:
         chained = (
             HierarchyView.from_frame(flat, packer, empty_parents="keep")
             .filter(pl.col(AMOUNT) > 1)
-            .drop("region.store.name")
+            .filter(pl.col("region.id") >= 0)
         )
         assert "keep" in repr(chained)
 
@@ -368,7 +341,7 @@ class TestNestedRoundTrip:
 
     def test_unfiltered(self, view: HierarchyView, flat: pl.DataFrame, packer: HierarchicalPacker):
         assert_frame_equal(
-            view.collect_nested().sort("region.id"),
+            view.nested().collect().sort("region.id"),
             packer.pack(flat, "region").sort("region.id"),
             check_dtypes=False,
         )
@@ -376,132 +349,35 @@ class TestNestedRoundTrip:
     def test_filtered(self, view: HierarchyView, flat: pl.DataFrame, packer: HierarchicalPacker):
         predicate = pl.col(AMOUNT) > 12
         assert_frame_equal(
-            view.filter(predicate).collect_nested().sort("region.id"),
+            view.filter(predicate).nested().collect().sort("region.id"),
             packer.pack(flat.filter(predicate), "region").sort("region.id"),
             check_dtypes=False,
         )
 
     def test_collect_at_intermediate_level(self, view: HierarchyView):
-        stores = view.collect("store")
+        stores = view.level("store").collect()
         assert stores.height == N_REGION * N_STORE
         assert AMOUNT not in stores.columns
 
     def test_collect_defaults_to_finest_level(self, view: HierarchyView):
-        assert view.collect().height == ROWS
+        assert view.level().collect().height == ROWS
 
     def test_collect_unknown_level(self, view: HierarchyView):
         with pytest.raises(KeyError, match="not present in this view"):
-            view.collect("planet")
-
-
-class TestPromote:
-    """Relational attribute promotion, without building List[Struct]."""
-
-    def test_matches_promote_attribute(
-        self, view: HierarchyView, flat: pl.DataFrame, packer: HierarchicalPacker
-    ):
-        got = view.promote(
-            "amount", from_level="sale", to_level="store", agg="sum", alias="total"
-        ).collect("store")
-        want = packer.promote_attribute(
-            flat, "amount", from_level="sale", to_level="store", agg="sum", alias="total"
-        )
-        cols = ["region.store.id", "region.store.total"]
-        assert_same_rows(got.select(cols), want.select(cols), "region.store.id")
-
-    def test_lands_on_parent_level(self, view: HierarchyView):
-        promoted = view.promote("amount", from_level="sale", to_level="store", agg="sum")
-        assert "region.store.amount" in promoted.tables()["store"].collect_schema().names()
-
-    @pytest.mark.parametrize("agg", ["sum", "mean", "min", "max", "count", "first", "last"])
-    def test_aggregations(self, view: HierarchyView, agg):
-        promoted = view.promote("amount", from_level="sale", to_level="store", agg=agg, alias="agg")
-        assert promoted.collect("store").height == N_REGION * N_STORE
-
-    def test_list_aggregation_yields_list(self, view: HierarchyView):
-        promoted = view.promote(
-            "amount", from_level="sale", to_level="store", agg="list", alias="all"
-        )
-        dtype = promoted.tables()["store"].collect_schema()["region.store.all"]
-        assert isinstance(dtype, pl.List)
-
-    def test_requires_immediate_child(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="immediate child"):
-            view.promote("amount", from_level="sale", to_level="region", agg="sum")
-
-    def test_rejects_missing_attribute(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="not found at level"):
-            view.promote("nope", from_level="sale", to_level="store", agg="sum")
-
-    def test_rejects_unknown_level(self, view: HierarchyView):
-        with pytest.raises(KeyError, match="not present in this view"):
-            view.promote("amount", from_level="sale", to_level="planet", agg="sum")
-
-
-class TestAnyChildSatisfies:
-    """Existence questions become semi-joins."""
-
-    def test_matches_flat_ground_truth(self, view: HierarchyView, flat: pl.DataFrame):
-        predicate = pl.col(AMOUNT) > 15
-        kept = (
-            view.any_child_satisfies(predicate, at_level="store", child_level="sale")
-            .tables()["store"]
-            .collect()
-        )
-        want = flat.filter(predicate)["region.store.id"].n_unique()
-        assert kept.height == want
-
-    def test_skips_levels(self, view: HierarchyView, flat: pl.DataFrame):
-        predicate = pl.col(AMOUNT) > 15
-        kept = (
-            view.any_child_satisfies(predicate, at_level="region", child_level="sale")
-            .tables()["region"]
-            .collect()
-        )
-        assert kept.height == flat.filter(predicate)["region.id"].n_unique()
-
-    def test_predicate_may_span_levels(self, view: HierarchyView, flat: pl.DataFrame):
-        """The predicate is evaluated at child_level but may reach upward."""
-        predicate = pl.col(AMOUNT) > pl.col("region.id") * 5
-        kept = (
-            view.any_child_satisfies(predicate, at_level="store", child_level="sale")
-            .tables()["store"]
-            .collect()
-        )
-        want = flat.filter(predicate)["region.store.id"].n_unique()
-        assert kept.height == want
-
-    def test_borrowed_columns_do_not_leak(self, view: HierarchyView):
-        restricted = view.any_child_satisfies(
-            pl.col(AMOUNT) > pl.col("region.id") * 5, at_level="store", child_level="sale"
-        )
-        assert "region.name" not in restricted.tables()["store"].collect_schema().names()
-
-    def test_requires_finer_child(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="must be finer"):
-            view.any_child_satisfies(
-                pl.col("region.name") == "r0", at_level="sale", child_level="region"
-            )
-
-    def test_rejects_unknown_level(self, view: HierarchyView):
-        with pytest.raises(KeyError, match="not present in this view"):
-            view.any_child_satisfies(pl.col(AMOUNT) > 1, at_level="planet", child_level="sale")
+            view.level("planet").collect()
 
 
 class TestLazyContract:
     """Lazy in, lazy out — nothing executes without a terminal call."""
 
-    def test_operations_return_new_views(self, view: HierarchyView):
-        assert isinstance(view.filter(pl.col(AMOUNT) > 1), HierarchyView)
-        assert isinstance(view.drop("region.store.name"), HierarchyView)
-        assert isinstance(
-            view.promote("amount", from_level="sale", to_level="store", agg="sum"),
-            HierarchyView,
-        )
+    def test_filter_returns_a_new_view(self, view: HierarchyView):
+        filtered = view.filter(pl.col(AMOUNT) > 1)
+        assert isinstance(filtered, HierarchyView)
+        assert filtered is not view
 
     def test_lazy_input_stays_lazy(self, flat: pl.DataFrame, packer: HierarchicalPacker):
         view = HierarchyView.from_frame(flat.lazy(), packer)
-        assert isinstance(view.to_flat("sale"), pl.LazyFrame)
+        assert isinstance(view.level("sale"), pl.LazyFrame)
 
     def test_tables_are_unexecuted(self, view: HierarchyView):
         tables = view.filter(pl.col(AMOUNT) > 12).tables()
@@ -528,67 +404,20 @@ class TestMultiArgumentRouting:
 
     def test_filter_keeps_every_predicate(self, view: HierarchyView, flat: pl.DataFrame):
         assert (
-            view.filter(self.LEAF_ONLY, self.CROSS_LEVEL).collect("sale").height
+            view.filter(self.LEAF_ONLY, self.CROSS_LEVEL).level("sale").collect().height
             == flat.filter(self.LEAF_ONLY, self.CROSS_LEVEL).height
         )
 
     def test_filter_multi_arg_matches_chained(self, view: HierarchyView):
         assert (
-            view.filter(self.LEAF_ONLY, self.CROSS_LEVEL).collect("sale").height
-            == view.filter(self.LEAF_ONLY).filter(self.CROSS_LEVEL).collect("sale").height
+            view.filter(self.LEAF_ONLY, self.CROSS_LEVEL).level("sale").collect().height
+            == view.filter(self.LEAF_ONLY).filter(self.CROSS_LEVEL).level("sale").collect().height
         )
 
     def test_two_cross_level_predicates_both_apply(self, view: HierarchyView, flat: pl.DataFrame):
         a = pl.col(AMOUNT) > pl.col("region.name").str.len_chars()
         b = pl.col(AMOUNT) < pl.col("region.name").str.len_chars() * 3
-        assert view.filter(a, b).collect("sale").height == flat.filter(a, b).height
-
-    def test_with_columns_keeps_every_expression(self, view: HierarchyView):
-        widened = view.with_columns(
-            (pl.col(AMOUNT) * 2).alias("region.store.sale.doubled"),
-            (pl.col(AMOUNT) + pl.col("region.name").str.len_chars()).alias("region.store.sale.adj"),
-        )
-        names = widened.tables()["sale"].collect_schema().names()
-        assert "region.store.sale.doubled" in names
-        assert "region.store.sale.adj" in names
-
-    def test_two_cross_level_expressions_both_apply(self, view: HierarchyView):
-        widened = view.with_columns(
-            (pl.col(AMOUNT) + pl.col("region.name").str.len_chars()).alias("region.store.sale.a"),
-            (pl.col(AMOUNT) * pl.col("region.name").str.len_chars()).alias("region.store.sale.b"),
-        )
-        names = widened.tables()["sale"].collect_schema().names()
-        assert "region.store.sale.a" in names and "region.store.sale.b" in names
-
-
-class TestAliasRouting:
-    """
-    A derived column belongs where its *name* says, not where its inputs live.
-
-    Routing by inputs put the column on the wrong table: an ancestor-named
-    column vanished from the nested output, and a leaf-named column built from
-    parent inputs created a struct field literally called "sale.origin".
-    """
-
-    def test_column_lands_where_its_name_says(self, view: HierarchyView):
-        widened = view.with_columns(pl.col("region.store.name").alias("region.store.sale.origin"))
-        assert "region.store.sale.origin" in widened.tables()["sale"].collect_schema().names()
-
-    def test_nested_schema_stays_well_formed(self, view: HierarchyView):
-        widened = view.with_columns(pl.col("region.store.name").alias("region.store.sale.origin"))
-        store_inner = widened.schema["region.store"].inner.to_schema()
-        assert "sale.origin" not in store_inner
-        sale_inner = store_inner["sale"].inner.to_schema()
-        assert "origin" in sale_inner
-
-    def test_aggregating_upward_is_refused(self, view: HierarchyView):
-        """A parent-named column from child inputs needs promote(), not a join."""
-        with pytest.raises(ValueError, match="promote"):
-            view.with_columns(pl.col(AMOUNT).sum().alias("region.total"))
-
-    def test_unprefixed_alias_is_refused(self, view: HierarchyView):
-        with pytest.raises((KeyError, ValueError)):
-            view.with_columns((pl.col(AMOUNT) * 2).alias("doubled"))
+        assert view.filter(a, b).level("sale").collect().height == flat.filter(a, b).height
 
 
 class TestEscapedSeparators:
@@ -615,42 +444,43 @@ class TestEscapedSeparators:
 
     def test_cross_level_filter_on_escaped_column(self, escaped):
         view, column = escaped
-        result = view.filter(pl.col(column) > pl.col("region.id")).collect("store")
+        result = view.filter(pl.col(column) > pl.col("region.id")).level("store").collect()
         assert result.height > 0
 
-    def test_cross_level_expression_on_escaped_column(self, escaped):
+    def test_escaped_column_survives_the_axis_join(self, escaped):
         view, column = escaped
-        widened = view.with_columns((pl.col(column) * 2).alias("region.store.net\\.doubled"))
-        assert "region.store.net\\.doubled" in widened.tables()["store"].collect_schema().names()
+        assert column in view.level("store").collect_schema().names()
 
-    def test_promote_escaped_attribute(self, escaped):
-        view, _ = escaped
-        promoted = view.promote("net.sales", from_level="store", to_level="region", agg="sum")
-        assert "region.net\\.sales" in promoted.tables()["region"].collect_schema().names()
-
-
-class TestDropStrictness:
-    def test_unknown_column_raises(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="not found"):
-            view.drop("region.store.nmae")
-
-    def test_non_strict_tolerates_unknown(self, view: HierarchyView):
-        assert view.drop("region.store.nmae", strict=False).columns == view.columns
-
-    def test_known_column_still_drops(self, view: HierarchyView):
-        assert "region.store.name" not in view.drop("region.store.name").columns
+    def test_rollup_of_an_escaped_attribute(self, escaped):
+        """A group_by on key_columns does not care that the name contains a dot."""
+        view, column = escaped
+        rolled = (
+            view.level("store")
+            .group_by(view.key_columns("region"))
+            .agg(pl.col(column).sum().alias("region.net\\.sales"))
+            .collect()
+        )
+        assert "region.net\\.sales" in rolled.columns
 
 
-class TestAggregatingPredicateGuard:
+class TestAggregatingPredicateRouting:
     """
     Broadcasting an ancestor-key predicate to every carrier is only sound for
     row-wise predicates. Each table holds the key at a different granularity, so
-    an aggregate over it means something different per level.
+    an aggregate over it means something different per level. Such a predicate
+    is therefore evaluated once, at the level that owns the column.
     """
 
-    def test_aggregating_predicate_is_refused(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="aggregat"):
-            view.filter(pl.col("region.id").count() > 10)
+    def test_aggregating_predicate_evaluates_at_the_owning_level(self, view: HierarchyView):
+        """count() over an ancestor key counts entities of that level."""
+        n_regions = view.tables()["region"].collect().height
+
+        kept = view.filter(pl.col("region.id").count() == n_regions)
+        assert kept.tables()["region"].collect().height == n_regions
+
+        dropped = view.filter(pl.col("region.id").count() > n_regions)
+        assert dropped.tables()["region"].collect().height == 0
+        assert dropped.tables()["sale"].collect().height == 0, "cascade must follow"
 
     def test_row_wise_key_predicate_still_broadcasts(
         self, view: HierarchyView, packer: HierarchicalPacker, tmp_path
@@ -659,107 +489,3 @@ class TestAggregatingPredicateGuard:
         filtered = HierarchyView.scan_parquet(tmp_path, packer).filter(pl.col("region.id") == 2)
         plan = filtered.tables()["sale"].explain().upper()
         assert plan.count("SELECTION") >= len(filtered.levels)
-
-
-class TestSelect:
-    """Projection — the counterpart to drop, and what makes scans cheap."""
-
-    def test_keeps_named_columns(self, view: HierarchyView):
-        projected = view.select("region.name", AMOUNT)
-        assert "region.name" in projected.columns
-        assert AMOUNT in projected.columns
-
-    def test_drops_unnamed_columns(self, view: HierarchyView):
-        projected = view.select("region.name", AMOUNT)
-        assert "region.store.name" not in projected.columns
-
-    def test_always_retains_keys(self, view: HierarchyView):
-        projected = view.select(AMOUNT)
-        for level in view.levels:
-            table = projected.tables()[level].collect_schema().names()
-            assert all(k in table for k in view._key_columns(level))
-
-    def test_still_nests(self, view: HierarchyView, packer: HierarchicalPacker):
-        nested = view.select("region.name", AMOUNT).collect_nested()
-        assert nested.height == N_REGION
-        sale_inner = nested.schema["region.store"].inner.to_schema()["sale"].inner.to_schema()
-        assert "amount" in sale_inner and "name" not in sale_inner
-
-    def test_unknown_column_raises(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="not found"):
-            view.select("region.store.sale.nope")
-
-    def test_prunes_the_scan(self, view: HierarchyView, packer: HierarchicalPacker, tmp_path):
-        view.sink_parquet(tmp_path)
-        plan = (
-            HierarchyView.scan_parquet(tmp_path, packer).select(AMOUNT).tables()["sale"].explain()
-        )
-        assert "region.store.sale.name" not in plan
-
-
-class TestNamedExprs:
-    """with_columns(**named) spells the destination path explicitly."""
-
-    def test_keyword_form_matches_alias_form(self, view: HierarchyView):
-        by_kw = view.with_columns(**{"region.store.sale.net": pl.col(AMOUNT) * 2})
-        by_alias = view.with_columns((pl.col(AMOUNT) * 2).alias("region.store.sale.net"))
-        assert_frame_equal(
-            by_kw.collect("sale").sort(SALE_ID), by_alias.collect("sale").sort(SALE_ID)
-        )
-
-    def test_mixed_positional_and_keyword(self, view: HierarchyView):
-        widened = view.with_columns(
-            (pl.col(AMOUNT) * 2).alias("region.store.sale.a"),
-            **{"region.store.sale.b": pl.col(AMOUNT) * 3},
-        )
-        names = widened.tables()["sale"].collect_schema().names()
-        assert "region.store.sale.a" in names and "region.store.sale.b" in names
-
-    def test_keyword_form_routes_cross_level(self, view: HierarchyView):
-        widened = view.with_columns(
-            **{"region.store.sale.adj": pl.col(AMOUNT) + pl.col("region.name").str.len_chars()}
-        )
-        assert "region.store.sale.adj" in widened.tables()["sale"].collect_schema().names()
-
-
-class TestPromoteMatchesPacker:
-    """promote() must not drift from promote_attribute() on null handling."""
-
-    @pytest.fixture
-    def tagged(self, flat: pl.DataFrame) -> pl.DataFrame:
-        return flat.with_columns(
-            pl.when(pl.col(AMOUNT) > 3)
-            .then(pl.col("region.store.name"))
-            .alias("region.store.sale.tag")
-        )
-
-    @pytest.mark.parametrize("agg", ["set", "single"])
-    def test_null_dropping_aggregations(
-        self, agg, tagged: pl.DataFrame, packer: HierarchicalPacker
-    ):
-        view = HierarchyView.from_frame(tagged, packer)
-        got = view.promote("tag", from_level="sale", to_level="store", agg=agg, alias="t").collect(
-            "store"
-        )
-        want = packer.promote_attribute(
-            tagged, "tag", from_level="sale", to_level="store", agg=agg, alias="t"
-        )
-        col = "region.store.t"
-
-        def norm(frame):
-            series = frame.sort("region.store.id")[col]
-            return [sorted(v, key=str) if isinstance(v, list) else v for v in series.to_list()]
-
-        assert norm(got) == norm(want)
-
-    def test_count_on_childless_parent_is_zero(
-        self, flat: pl.DataFrame, packer: HierarchicalPacker
-    ):
-        kept = HierarchyView.from_frame(flat, packer, empty_parents="keep").filter(
-            pl.col(AMOUNT) > 15
-        )
-        counts = kept.promote(
-            "amount", from_level="sale", to_level="store", agg="count", alias="n"
-        ).collect("store")["region.store.n"]
-        assert counts.null_count() == 0
-        assert (counts == 0).sum() > 0

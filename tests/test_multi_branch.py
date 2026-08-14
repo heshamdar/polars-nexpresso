@@ -435,17 +435,17 @@ class TestBranchingView:
         return HierarchyView.from_tables(branching_tables, branching_packer)
 
     def test_to_flat_joins_only_one_axis(self, view: HierarchyView):
-        building = view.to_flat("building").collect_schema().names()
+        building = view.level("building").collect_schema().names()
         assert "country.city.street.building.id" in building
         assert not [c for c in building if "service" in c]
 
-        service = view.to_flat("service").collect_schema().names()
+        service = view.level("service").collect_schema().names()
         assert "country.city.service.kind" in service
         assert not [c for c in service if "street" in c]
 
     def test_to_flat_without_a_level_is_ambiguous(self, view: HierarchyView):
         with pytest.raises(ValueError, match="leaf levels"):
-            view.to_flat()
+            view.level()
 
     def test_filter_on_one_branch_cascades_to_the_other(self, view: HierarchyView):
         """
@@ -475,41 +475,49 @@ class TestBranchingView:
                 pl.col("country.city.street.length") > pl.col("country.city.service.budget")
             )
 
-    def test_cross_branch_borrow_rejected(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="not an ancestor"):
-            view.with_columns(
-                (pl.col("country.city.service.budget") * 2).alias("country.city.street.doubled")
-            )
+    def test_a_branch_is_absent_from_the_other_branch_axis(self, view: HierarchyView):
+        """
+        Each axis stops at the shared ancestor, so the branches never meet.
 
-    def test_ancestor_borrow_still_works(self, view: HierarchyView):
-        widened = view.with_columns(
-            (pl.col("country.city.population") * 2).alias("country.city.service.scaled")
+        This is what makes a cross-branch expression impossible to write rather
+        than silently wrong: the columns are simply not on the same frame.
+        """
+        street_columns = view.level("street").collect_schema().names()
+        service_columns = view.level("service").collect_schema().names()
+        assert "country.city.service.budget" not in street_columns
+        assert "country.city.street.length" not in service_columns
+        # ...while the shared ancestor is on both.
+        assert "country.city.population" in street_columns
+        assert "country.city.population" in service_columns
+
+    def test_ancestor_attributes_reach_the_second_branch(self, view: HierarchyView):
+        scaled = (
+            view.level("service")
+            .with_columns((pl.col("country.city.population") * 2).alias("scaled"))
+            .collect()
         )
-        rows = widened.tables()["service"].collect()
-        assert rows["country.city.service.scaled"].to_list() == [16, 16, 8, 4]
+        assert scaled["scaled"].to_list() == [16, 16, 8, 4]
 
-    def test_promote_from_the_second_branch(self, view: HierarchyView):
-        promoted = view.promote(
-            "budget", from_level="service", to_level="city", agg="sum", alias="total_budget"
+    def test_rollup_from_the_second_branch(self, view: HierarchyView):
+        rolled = (
+            view.level("service")
+            .group_by(view.key_columns("city"))
+            .agg(pl.col("country.city.service.budget").sum().alias("total_budget"))
+            .collect()
+            .sort("country.city.id")
         )
-        rows = promoted.tables()["city"].collect().sort("country.city.id")
-        assert rows["country.city.total_budget"].to_list() == [300, 300, 400]
+        assert rolled["total_budget"].to_list() == [300, 300, 400]
 
-    def test_any_child_satisfies_on_the_second_branch(self, view: HierarchyView):
-        matched = view.any_child_satisfies(
-            pl.col("country.city.service.kind") == "water",
-            at_level="city",
-            child_level="service",
+    def test_existence_on_the_second_branch(self, view: HierarchyView):
+        keys = view.key_columns("city")
+        matching = (
+            view.level("service")
+            .filter(pl.col("country.city.service.kind") == "water")
+            .select(keys)
+            .unique()
         )
-        assert matched.tables()["city"].collect()["country.city.id"].to_list() == ["LA"]
-
-    def test_any_child_satisfies_across_branches_rejected(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="must be finer"):
-            view.any_child_satisfies(
-                pl.col("country.city.service.kind") == "water",
-                at_level="street",
-                child_level="service",
-            )
+        cities = view.level("city").join(matching, on=keys, how="semi").collect()
+        assert cities["country.city.id"].to_list() == ["LA"]
 
     def test_nested_matches_the_packer(
         self,
@@ -519,7 +527,7 @@ class TestBranchingView:
     ):
         direct = branching_packer.denormalize(branching_tables, at_level="country")
         assert_frame_equal(
-            view.collect_nested(),
+            view.nested().collect(),
             direct,  # type: ignore[arg-type]
             **UNORDERED,
         )
@@ -528,10 +536,10 @@ class TestBranchingView:
         view.sink_parquet(tmp_path)
         restored = HierarchyView.scan_parquet(tmp_path, view._packer)  # noqa: SLF001
         assert_frame_equal(
-            restored.to_flat("service").collect().sort("country.city.service.kind"),
-            view.to_flat("service").collect().sort("country.city.service.kind"),
+            restored.level("service").collect().sort("country.city.service.kind"),
+            view.level("service").collect().sort("country.city.service.kind"),
         )
         assert_frame_equal(
-            restored.to_flat("building").collect().sort("country.city.street.building.id"),
-            view.to_flat("building").collect().sort("country.city.street.building.id"),
+            restored.level("building").collect().sort("country.city.street.building.id"),
+            view.level("building").collect().sort("country.city.street.building.id"),
         )
