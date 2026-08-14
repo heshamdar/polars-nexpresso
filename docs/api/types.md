@@ -114,6 +114,7 @@ class LevelSpec:
     required_fields: Sequence[ColumnSelector] | None = None
     order_by: Sequence[pl.Expr] | None = None
     parent_keys: Sequence[str] | None = None
+    parent: str | None = None
 ```
 
 Declarative description of a hierarchy level.
@@ -127,6 +128,7 @@ Declarative description of a hierarchy level.
 | `required_fields` | `Sequence[ColumnSelector] \| None` | Columns that must be non-null |
 | `order_by` | `Sequence[pl.Expr] \| None` | Expressions for ordering children |
 | `parent_keys` | `Sequence[str] \| None` | Foreign keys to parent level |
+| `parent` | `str \| None` | Name of the parent level. Leave `None` for a linear chain; set it to branch. See [Multiple branches](../concepts/hierarchical-data.md#multiple-branches-per-level) |
 
 **Example:**
 
@@ -139,6 +141,17 @@ LevelSpec(
     parent_keys=["region_id"],
 )
 ```
+
+Two levels naming the same `parent` are siblings — independent branches off that
+level, each rooting its own axis:
+
+```python
+LevelSpec(name="street",  id_fields=["id"],   parent="city", parent_keys=["city_id"])
+LevelSpec(name="service", id_fields=["kind"], parent="city", parent_keys=["city_id"])
+```
+
+`parent` is all-or-nothing across a spec: if any non-root level declares it,
+every non-root level must.
 
 ---
 

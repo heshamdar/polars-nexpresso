@@ -121,7 +121,106 @@ LevelSpec(
     required_fields=None,  # Columns that must be non-null
     order_by=None,         # Expressions for ordering children
     parent_keys=None,      # Foreign keys to parent level (for build_from_tables)
+    parent=None,           # Parent level name; None = the level declared before
 )
+```
+
+## Multiple Branches per Level
+
+Real hierarchies are not always a single chain. A city has streets, and streets
+have buildings — but a city also has *services* (police, fire, water, medical).
+Services are a genuine property of a city and are orthogonal to streets: they
+are neither above nor below them.
+
+Give a level an explicit `parent` and it becomes a **tree**:
+
+```python
+spec = HierarchySpec.from_levels(
+    LevelSpec(name="country",  id_fields=["code"]),
+    LevelSpec(name="city",     id_fields=["id"],   parent="country", parent_keys=["code"]),
+    LevelSpec(name="street",   id_fields=["id"],   parent="city",    parent_keys=["city_id"]),
+    LevelSpec(name="building", id_fields=["id"],   parent="street",  parent_keys=["street_id"]),
+    LevelSpec(name="service",  id_fields=["kind"], parent="city",    parent_keys=["city_id"]),
+)
+```
+
+```
+country
+  └── city
+        ├── street ── building
+        └── service
+```
+
+`parent` is all-or-nothing: either no level declares it (the spec is read as a
+linear chain in declaration order, exactly as before) or every non-root level
+declares it. Half-inferring would silently attach `service` to `building` just
+because it was declared last.
+
+Packing folds every branch, so a city's struct carries both:
+
+```python
+nested.schema["country"]
+# Struct({'code': …, 'name': …, 'city': List(Struct({
+#     'id': …, 'population': …,
+#     'street':  List(Struct({'id': …, 'building': List(Struct({…}))})),
+#     'service': List(Struct({'kind': …, 'budget': …})),
+# }))})
+```
+
+### Axes
+
+The root → level chain is an **axis**. Every level has exactly one — a level has
+only one path back to the root even when the tree branches — so column paths
+(`country.city.service.kind`) and key propagation stay unambiguous.
+
+`pack` and `unpack` work along the axis their target level names:
+
+```python
+packer.get_axis("building")   # ['country', 'city', 'street', 'building']
+packer.get_axis("service")    # ['country', 'city', 'service']
+packer.axes                   # both, one per leaf
+```
+
+A flat frame has exactly one granularity, so it can only carry one axis at a
+time — exploding streets *and* services together would cross every street with
+every service. `unpack` therefore explodes only the target's axis and leaves
+sibling branches packed as `List[Struct]` columns, replicated onto each row:
+
+```python
+flat = packer.unpack(nested, "building")
+flat.columns
+# ['country.code', 'country.name', 'country.city.id', 'country.city.population',
+#  'country.city.street.id', …, 'country.city.street.building.id',
+#  'country.city.service']            # ← still nested, untouched
+
+flat = packer.unpack(nested, "service")
+flat.columns
+# […, 'country.city.service.kind', 'country.city.service.budget',
+#  'country.city.street']             # ← the other branch, still nested
+```
+
+Nothing is lost, so re-packing either frame reproduces the original nested one.
+
+### Where branches show up
+
+| API | Behaviour with branches |
+|-----|------------------------|
+| `pack` / `unpack` | Traverse the target's axis; siblings ride along packed |
+| `normalize` / `split_levels` | One flat table per level — the shape that represents a tree without duplication |
+| `denormalize` | A parent gets one `List[Struct]` column per branch |
+| `promote_attribute`, `any_child_satisfies` | Work on any branch; `from_level` must be an immediate child of `to_level` |
+| `attribute_expr` | `from_level` must be a descendant of `to_level`; a sibling is rejected |
+| `HierarchyView.to_flat` | Joins one axis; needs an explicit level when the tree has several leaves |
+| `HierarchyView.filter` | Restrictions cascade across branches — filtering services prunes cities, and those cities prune streets |
+| `leaf_level` | Raises when there are several leaves; use `leaf_levels` |
+| `next_level` | Raises when a level has several children; use `children_of` |
+
+An expression spanning two branches is rejected rather than silently answered
+with a cross join. Aggregate one branch onto the shared ancestor first:
+
+```python
+by_city = view.promote("budget", from_level="service", to_level="city", agg="sum")
+by_city.filter(pl.col("country.city.street.length") > pl.col("country.city.budget"))
 ```
 
 ## Building from Database Tables

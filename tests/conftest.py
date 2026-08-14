@@ -15,6 +15,8 @@ import polars as pl
 import pytest
 from packaging import version
 
+from nexpresso import HierarchicalPacker, HierarchySpec, LevelSpec
+
 if TYPE_CHECKING:
     pass
 
@@ -111,4 +113,91 @@ def list_of_structs_df() -> pl.DataFrame:
                 [{"name": "C", "qty": 1}],
             ],
         }
+    )
+
+
+# =============================================================================
+# Branching (multi-axis) hierarchy fixtures
+# =============================================================================
+#
+#   country
+#     └── city
+#           ├── street ── building     (the "building" axis)
+#           └── service                (the "service" axis)
+#
+# ``street`` and ``service`` are siblings: both are properties of a city, and
+# neither is a stage of the other's chain.
+
+
+@pytest.fixture
+def branching_spec() -> HierarchySpec:
+    """A hierarchy where ``city`` carries two independent child branches."""
+    return HierarchySpec.from_levels(
+        LevelSpec(name="country", id_fields=["code"]),
+        LevelSpec(name="city", id_fields=["id"], parent="country", parent_keys=["code"]),
+        LevelSpec(name="street", id_fields=["id"], parent="city", parent_keys=["id"]),
+        LevelSpec(name="building", id_fields=["id"], parent="street", parent_keys=["id"]),
+        LevelSpec(name="service", id_fields=["kind"], parent="city", parent_keys=["id"]),
+    )
+
+
+@pytest.fixture
+def branching_packer(branching_spec: HierarchySpec) -> HierarchicalPacker:
+    """A packer over :func:`branching_spec`."""
+    return HierarchicalPacker(branching_spec)
+
+
+@pytest.fixture
+def branching_tables() -> dict[str, pl.DataFrame]:
+    """
+    Normalized per-level tables for the branching hierarchy.
+
+    NYC has two streets and two services; LA and PAR have one of each. This is
+    the shape :meth:`HierarchicalPacker.normalize` emits — level-local columns
+    plus ancestor keys as foreign keys.
+    """
+    return {
+        "country": pl.DataFrame({"country.code": ["US", "FR"], "country.name": ["USA", "France"]}),
+        "city": pl.DataFrame(
+            {
+                "country.code": ["US", "US", "FR"],
+                "country.city.id": ["NYC", "LA", "PAR"],
+                "country.city.population": [8, 4, 2],
+            }
+        ),
+        "street": pl.DataFrame(
+            {
+                "country.code": ["US", "US", "US", "FR"],
+                "country.city.id": ["NYC", "NYC", "LA", "PAR"],
+                "country.city.street.id": ["s1", "s2", "s3", "s4"],
+                "country.city.street.length": [100, 200, 300, 400],
+            }
+        ),
+        "building": pl.DataFrame(
+            {
+                "country.code": ["US", "US", "US", "FR"],
+                "country.city.id": ["NYC", "NYC", "LA", "PAR"],
+                "country.city.street.id": ["s1", "s2", "s3", "s4"],
+                "country.city.street.building.id": ["b1", "b2", "b3", "b4"],
+                "country.city.street.building.floors": [10, 20, 30, 40],
+            }
+        ),
+        "service": pl.DataFrame(
+            {
+                "country.code": ["US", "US", "US", "FR"],
+                "country.city.id": ["NYC", "NYC", "LA", "PAR"],
+                "country.city.service.kind": ["police", "fire", "water", "medical"],
+                "country.city.service.budget": [100, 200, 300, 400],
+            }
+        ),
+    }
+
+
+@pytest.fixture
+def branching_nested(
+    branching_packer: HierarchicalPacker, branching_tables: dict[str, pl.DataFrame]
+) -> pl.DataFrame:
+    """The branching hierarchy fully packed into a single nested column."""
+    return branching_packer.denormalize(  # type: ignore[return-value]
+        branching_tables, target_level="country"
     )

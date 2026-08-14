@@ -270,7 +270,11 @@ view.with_columns(
 | `.collect_nested()` | `pl.DataFrame` | Nested reconstruction, executed |
 | `.sink_parquet(dest, *, pattern="{level}", **kwargs)` | `None` | Streams one file per level |
 
-`level` defaults to the finest level in the view.
+`level` defaults to the finest level in the view. In a
+[branching hierarchy](../concepts/hierarchical-data.md#multiple-branches-per-level)
+each branch has its own finest level, so `.to_flat()` / `.collect()` require an
+explicit one; `.to_flat(level)` then joins only that level's axis, leaving
+sibling branches out rather than crossing them in.
 
 !!! tip "Prefer `.tables()` where it suffices"
     Most questions are answered entirely from one level's table. `.to_flat()`
@@ -303,6 +307,14 @@ operation actually restricted:
 - **Upward** (`empty_parents="prune"`): parents that lost every child disappear.
 
 An unfiltered view resolves to its scans with no joins added.
+
+Where the hierarchy branches the two cascades feed each other, so they alternate
+until nothing new is restricted: filtering `service` prunes cities upward, and
+those pruned cities must then prune `street` downward — a branch the first
+downward pass never touched. Each edge is semi-joined at most once per direction,
+so this costs nothing extra; a chain settles after the first round. Pruning is
+per branch: a city with no surviving streets disappears even if its services
+survived, matching `pack` along the street axis.
 
 ## Example
 

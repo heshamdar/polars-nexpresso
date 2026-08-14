@@ -7,6 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-14
+
+### Added
+
+- **Branching hierarchies — a level can carry several independent child
+  branches.** `HierarchySpec` modelled a single chain: `levels[i + 1]` was "the
+  child" of `levels[i]`, and the whole packer plus `HierarchyView` were built on
+  that index arithmetic. It could not express a level with two children, so a
+  hierarchy like
+
+  ```
+  country > city > street > building
+  country > city > service          (police, fire, water, medical)
+  ```
+
+  needed two packers over two copies of the data, or `service` forced into the
+  street chain where it does not belong.
+
+  `LevelSpec` gains a `parent` field. Naming it makes the spec a tree:
+
+  ```python
+  spec = HierarchySpec.from_levels(
+      LevelSpec(name="country",  id_fields=["code"]),
+      LevelSpec(name="city",     id_fields=["id"],   parent="country", parent_keys=["code"]),
+      LevelSpec(name="street",   id_fields=["id"],   parent="city",    parent_keys=["city_id"]),
+      LevelSpec(name="building", id_fields=["id"],   parent="street",  parent_keys=["street_id"]),
+      LevelSpec(name="service",  id_fields=["kind"], parent="city",    parent_keys=["city_id"]),
+  )
+  ```
+
+  A level's ancestors remain a unique chain even in a tree, so column paths
+  (`country.city.service.kind`), key propagation and cross-level attribute
+  traversal are unchanged. What changes is that "the child" becomes "the
+  children" and iteration becomes topological.
+
+  Each root → level chain is an **axis**. A flat frame holds one granularity, so
+  `pack` and `unpack` traverse the axis their target level names and leave
+  sibling branches packed as `List[Struct]` columns, replicated onto each row —
+  exploding both branches would cross every street with every service. Nothing
+  is dropped, so re-packing either frame reproduces the original:
+
+  ```python
+  packer.unpack(nested, "building")   # street axis; country.city.service stays nested
+  packer.unpack(nested, "service")    # service axis; country.city.street stays nested
+  ```
+
+  Normalized storage needs no special case: every level is its own table, and a
+  parent simply receives one `List[Struct]` column per branch when
+  `denormalize` reassembles it.
+
+  `HierarchyView` routes across branches too. `to_flat(level)` joins only that
+  level's axis; `promote` and `any_child_satisfies` work on any branch; and the
+  consistency cascades now alternate to a fixpoint, so filtering `service`
+  prunes cities *and* the streets under them. An expression spanning two
+  branches is rejected with a message naming both, rather than silently answered
+  with a cross join.
+
+  **Existing specs are unaffected.** When no level declares `parent`, the spec is
+  read as a linear chain in declaration order exactly as before. `parent` is
+  all-or-nothing: if any non-root level declares it, every non-root level must —
+  inferring the rest from declaration order is precisely how `service` would get
+  silently attached to `building`.
+
+- New hierarchy navigation, on `HierarchySpec` — `parent_of`, `children_of`,
+  `ancestors_of`, `descendants_of`, `axis_of`, `is_ancestor_of`, `root`,
+  `leaves`, `topological_levels`, `reverse_topological_levels` — and on
+  `HierarchicalPacker` — `leaf_levels`, `axes`, `get_axis`, `get_child_levels`.
+- `infer_current_level` takes an optional `axis=` to measure row granularity
+  along one branch, and now reports it as the deepest level whose own columns
+  are still flat.
+
+### Fixed
+
+- `HierarchyView` tested "is an ancestor" by comparing positions in the level
+  list, and `attribute_expr` compared level indices. Both accepted a level on a
+  *sibling* branch, which would have fanned a frame out to an unrelated
+  granularity or emitted an expression referencing a struct field that does not
+  exist. Both now test the actual ancestor relation.
+- `split_levels` deduplicated coarser levels with `unique(keep="any")` and no
+  `maintain_order`. The surviving row order becomes that level's order inside
+  its parent's child list when the tables are denormalized again, and Polars is
+  free to reorder — 1.41 and 1.43 disagreed. Under `preserve_child_order` (the
+  default) the dedup is now stable.
+- `_pack_column_order` grouped carried columns by level; it now walks the tree
+  depth-first, which is the order a flat frame actually holds them in, so
+  `denormalize` reproduces `pack`'s column order for targets below a branch
+  point as well.
+- Packing now emits a level's child branches last, in declaration order, so a
+  struct's field order does not depend on which axis the caller unpacked.
+
+### Changed
+
+- `HierarchicalPacker.leaf_level` and `HierarchySpec.next_level` raise on a
+  branching hierarchy, where they have no single answer, and point at
+  `leaf_levels` / `children_of`. Unbranched specs are unaffected.
+- `get_descendant_levels` returns the whole subtree (every branch), in
+  topological order. Same answer as before for a chain.
+- `describe()` marks every childless level as a leaf, not just the last one, and
+  lists a level's branches when it has more than one.
+
 ## [0.6.0] - 2026-08-11
 
 ### Changed (breaking)
@@ -266,5 +366,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pack uniformity check reduces violation counts inside the engine rather
   than pulling one row per group into Python.
 
+[0.7.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.7.0
 [0.6.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.6.0
 [0.5.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.5.0
