@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-14
+
+### Changed (breaking)
+
+- **`HierarchyView` is a grain accessor, not a mirror of the Polars API.** It had
+  grown six routed operations — `filter`, `with_columns`, `select`, `drop`,
+  `promote`, `any_child_satisfies` — each resolving expressions to whichever
+  level could evaluate them, and each with its own rules. That is where the
+  rough edges were: `select` took strings but not expressions, `with_columns`
+  refused any descendant input, `filter` refused an aggregating ancestor-key
+  predicate, and `promote` refused a non-immediate child while
+  `any_child_satisfies` skipped levels happily.
+
+  Polars already has an expression API. The view now hands you a frame and gets
+  out of the way:
+
+  ```python
+  view.level("sale").group_by("region.id").agg(pl.col(AMOUNT).sum())
+  ```
+
+  `level(g)` joins the root → `g` axis and returns a `pl.LazyFrame`, which has
+  exactly one granularity — so the ambiguity the routing existed to resolve
+  never arises. Joining the whole axis costs almost nothing you do not read:
+  projection pushdown reduces an unused ancestor level to its key columns, and a
+  predicate on an ancestor attribute is evaluated inside that level's own scan,
+  before the join. `tests/test_view_level_access.py` asserts both against real
+  Parquet plans.
+
+  | Removed | Replacement |
+  |---|---|
+  | `view.select(...)` / `.with_columns(...)` / `.drop(...)` | `view.level(g).select(...)` / `.with_columns(...)` / `.drop(...)` |
+  | `view.promote("amt", from_level="sale", to_level="region", agg="sum")` | `view.level("sale").group_by(view.key_columns("region")).agg(pl.col(AMOUNT).sum())` |
+  | `view.any_child_satisfies(p, at_level="region", child_level="sale")` | `view.level("region").join(view.level("sale").filter(p).select(keys).unique(), on=keys, how="semi")` |
+  | `view.to_flat(g)` / `view.collect(g)` | `view.level(g)` / `view.level(g).collect()` |
+  | `view.to_nested(l)` / `view.collect_nested(l)` | `view.nested(l)` / `view.nested(l).collect()` |
+  | `view.schema` | `view.level(g).collect_schema()` or `view.nested().collect_schema()` |
+  | `view.explain(g)` | `view.level(g).explain()` |
+
+  The replacements are not merely equivalent — the roll-up and the semi-join
+  both work across skipped levels, which `promote` refused and
+  `packer.any_child_satisfies` still does, because `normalize` replicates *every*
+  ancestor id into a level's table rather than only the immediate parent's.
+
+  `view.any_child_satisfies(p, ...)` is **not** `view.filter(p)`: the semi-join
+  restricts only the parent, while `filter` also restricts the children and
+  prunes parents left childless.
+
+- **`filter` stays, and is the only operation that does.** Restricting a
+  normalized hierarchy implies restrictions on the other levels — orphaned
+  children removed, childless parents pruned under `empty_parents="prune"` —
+  which is what keeps `filter → nested` and `filter → sink_parquet` correct
+  without ever materializing parent columns per child row. No flat frame can
+  reproduce that.
+
+- **`view.schema` and `view.explain` are gone** rather than renamed. Every
+  granularity has a different schema and a different plan, so neither is well
+  posed for "the view"; ask the frame you mean.
+
+- **`level()` raises where `to_flat` fell back to a cross join.** A level sharing
+  no key columns with its parent silently multiplying rows is never the intent.
+
+### Added
+
+- **`HierarchyView.level(at_level=None)`** — a flat `LazyFrame` with one row per
+  `at_level` entity and every ancestor column in scope. Only the target's axis is
+  joined; sibling branches are left out rather than crossed in.
+- **`HierarchyView.nested(at_level=None)`** — the packed `List[Struct]` shape,
+  lazily. Replaces `to_nested`, and `collect_nested` is now `.nested().collect()`.
+- **`HierarchyView.key_columns(level)`** — ancestor foreign keys then own ids.
+  Public because user code needs it now: a roll-up is
+  `level(child).group_by(view.key_columns(parent)).agg(...)`.
+
+### Performance
+
+- **Existence queries are ~7.6× faster** (71.0 ms → 9.3 ms at 2M leaf rows). The
+  removed `any_child_satisfies` filtered a scratch copy of the child table and
+  discarded it; the semi-join it is replaced by does not. `cross_level_predicate`
+  also improves (82.4 → 57.4 ms). No query regressed — measured base-vs-head on
+  the same machine with `benchmarks/bench_storage.py --scale large`.
+- Documented when to prefer `tables()[g]` over `level(g)`: a roll-up keyed only
+  on ancestor **keys** needs no join, because `normalize` already put them on the
+  child table. Grouping `level(g)` instead joins the axis for nothing and costs
+  ~2.3× (31.0 ms → 76.0 ms).
+
+### Fixed
+
+- **An aggregating predicate over an ancestor key is no longer refused.**
+  `view.filter(pl.col("region.id").count() > 10)` raised `ValueError`; it now
+  evaluates at the level that *owns* the column, so the count is the number of
+  regions rather than the number of sales they flatten to. Broadcasting a
+  predicate to every carrier is demoted to what it always was — a pushdown
+  shortcut for row-wise predicates — and the `_is_row_wise` probe now fails
+  *closed*, since correctness comes from routing and the downward cascade rather
+  than from the probe's verdict.
+
 ## [0.8.0] - 2026-08-14
 
 ### Changed (breaking)
@@ -477,6 +572,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pack uniformity check reduces violation counts inside the engine rather
   than pulling one row per group into Python.
 
+[0.9.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.9.0
 [0.8.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.8.0
 [0.7.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.7.0
 [0.6.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.6.0

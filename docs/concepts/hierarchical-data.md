@@ -224,17 +224,26 @@ Nothing is lost, so re-packing either frame reproduces the original nested one.
 | `denormalize` | A parent gets one `List[Struct]` column per branch |
 | `promote_attribute`, `any_child_satisfies` | Work on any branch; `from_level` must be an immediate child of `to_level` |
 | `attribute_expr` | `from_level` must be a descendant of `to_level`; a sibling is rejected |
-| `HierarchyView.to_flat` | Joins one axis; needs an explicit level when the tree has several leaves |
+| `HierarchyView.level` | Joins one axis; needs an explicit level when the tree has several leaves |
 | `HierarchyView.filter` | Restrictions cascade across branches — filtering services prunes cities, and those cities prune streets |
 | `leaf_level` | Raises when there are several leaves; use `leaf_levels` |
 | `next_level` | Raises when a level has several children; use `children_of` |
 
-An expression spanning two branches is rejected rather than silently answered
-with a cross join. Aggregate one branch onto the shared ancestor first:
+Two branches never appear on the same frame, so an expression spanning them is
+not something you can write by accident — `level("street")` simply has no
+service columns on it. Roll one branch onto the shared ancestor first, then join
+it onto the other branch's frame:
 
 ```python
-by_city = view.promote("budget", from_level="service", to_level="city", agg="sum")
-by_city.filter(pl.col("country.city.street.length") > pl.col("country.city.budget"))
+keys = view.key_columns("city")
+by_city = (
+    view.level("service")
+    .group_by(keys)
+    .agg(pl.col("country.city.service.budget").sum().alias("budget"))
+)
+view.level("street").join(by_city, on=keys, how="left").filter(
+    pl.col("country.city.street.length") > pl.col("budget")
+)
 ```
 
 ## Building from Database Tables

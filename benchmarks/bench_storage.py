@@ -151,10 +151,8 @@ def write_layouts(
 
 QueryFn = Callable[[Layouts, HierarchicalPacker], Any]
 
-_AMOUNT_IN_LISTS = (
-    pl.col("region")
-    .struct.field("store")
-    .list.eval(pl.element().struct.field("sale").list.eval(pl.element().struct.field("amount")))
+_AMOUNT_IN_LISTS = pl.col("region.store").list.eval(
+    pl.element().struct.field("sale").list.eval(pl.element().struct.field("amount"))
 )
 
 
@@ -165,6 +163,15 @@ def _nested_leaf(layouts: Layouts, packer: HierarchicalPacker) -> pl.LazyFrame:
 
 def _view(layouts: Layouts, packer: HierarchicalPacker) -> HierarchyView:
     return HierarchyView.scan_parquet(layouts.view_dir, packer)
+
+
+def _rollup(view: HierarchyView, child: str, parent: str) -> pl.LazyFrame:
+    """Total ``AMOUNT`` per ``parent``, grouped on the child's own table."""
+    return (
+        view.tables()[child]
+        .group_by(view.key_columns(parent))
+        .agg(pl.col(AMOUNT).sum().alias("total"))
+    )
 
 
 QUERIES: dict[str, dict[str, Any]] = {
@@ -269,10 +276,12 @@ QUERIES: dict[str, dict[str, Any]] = {
         .select(pl.col("total").sum())
         .collect()
         .item(),
-        "view": lambda lay, p: _view(lay, p)
-        .promote("amount", from_level="sale", to_level="store", agg="sum", alias="total")
-        .tables()["store"]
-        .select(pl.col("region.store.total").sum())
+        # The roll-up needs no ancestor *attribute*, only the parent key -- which
+        # normalize() already put on the child table. Grouping tables()["sale"]
+        # therefore skips the axis join that level("sale") would perform; going
+        # through level() here costs 2.3x for nothing.
+        "view": lambda lay, p: _rollup(_view(lay, p), "sale", "store")
+        .select(pl.col("total").sum())
         .collect()
         .item(),
     },
@@ -289,9 +298,9 @@ QUERIES: dict[str, dict[str, Any]] = {
         .collect()
         .item(),
         "view": lambda lay, p: _view(lay, p)
-        .any_child_satisfies(pl.col(AMOUNT) > 990, at_level="store", child_level="sale")
-        .tables()["store"]
-        .select(pl.len())
+        .level("sale")
+        .filter(pl.col(AMOUNT) > 990)
+        .select(pl.col(STORE_ID).n_unique())
         .collect()
         .item(),
     },
@@ -318,7 +327,7 @@ QUERIES: dict[str, dict[str, Any]] = {
         "description": "Produce the packed List[Struct] shape (the boundary case)",
         "nested": lambda lay, p: pl.scan_parquet(lay.nested).collect().height,
         "flat": lambda lay, p: p.pack(pl.scan_parquet(lay.flat), "region").collect().height,
-        "view": lambda lay, p: _view(lay, p).collect_nested().height,
+        "view": lambda lay, p: _view(lay, p).nested().collect().height,
     },
     "filtered_nested": {
         "description": "Filter on a leaf, then hand back the packed shape",
@@ -330,7 +339,7 @@ QUERIES: dict[str, dict[str, Any]] = {
         )
         .collect()
         .height,
-        "view": lambda lay, p: _view(lay, p).filter(pl.col(AMOUNT) > 990).collect_nested().height,
+        "view": lambda lay, p: _view(lay, p).filter(pl.col(AMOUNT) > 990).nested().collect().height,
     },
 }
 

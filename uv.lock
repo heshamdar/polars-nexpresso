@@ -1702,7 +1702,7 @@ wheels = [
 
 [[package]]
 name = "polars-nexpresso"
-version = "0.8.0"
+version = "0.9.0"
 source = { editable = "." }
 dependencies = [
     { name = "packaging" },

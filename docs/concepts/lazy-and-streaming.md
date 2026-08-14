@@ -22,6 +22,7 @@ moves no data.
 | `build_from_tables` | ✅ | No |
 | `promote_attribute`, `enrich`, `attribute_expr` | ✅ | No |
 | `any_child_satisfies`, `all_children_satisfy` | ✅ | No |
+| `HierarchyView.level` / `.nested` / `.tables` / `.filter` | ✅ (returns `LazyFrame`) | No |
 | `validate` | — | **Yes** — one `collect()`, by definition |
 | `pack_streaming` | ✅ (returns `LazyFrame`) | Sinks to Parquet when `defer=False` |
 

@@ -155,8 +155,11 @@ def build_view(flat: pl.DataFrame, packer: HierarchicalPacker, warehouse: Path) 
     view = HierarchyView.scan_parquet(warehouse, packer)
     print(f"\n{view!r}")
     print("\nEach level is a real top-level Parquet table — its own row groups,")
-    print("statistics and sort order — but the view still presents a nested schema:")
-    print(f"  region.store: {view.schema['region.store']}")
+    print("statistics and sort order. Ask the view for a granularity and it hands")
+    print("back an ordinary LazyFrame joined down to it:\n")
+    for level in view.levels:
+        frame = view.level(level)
+        print(f"  view.level({level!r}):{'':<4} {len(frame.collect_schema().names())} columns")
     return view
 
 
@@ -168,98 +171,114 @@ def build_view(flat: pl.DataFrame, packer: HierarchicalPacker, warehouse: Path) 
 def demonstrate_cross_level(view: HierarchyView) -> None:
     header("PART 3: Cross-level expressions — parent, grandparent, all at once")
 
-    print("\n(a) Leaf x PARENT attribute — the expression Part 1 could not write:")
-    net = view.with_columns(
-        (pl.col(AMOUNT) * (1 - pl.col(DISCOUNT))).alias("region.store.sale.net")
-    )
-    print(span(net.collect("sale")).select(STORE_ID, DISCOUNT, AMOUNT, "region.store.sale.net"))
+    sales = view.level("sale")
+    print("\nview.level('sale') is a LazyFrame with every ancestor column in scope,")
+    print("so the expression Part 1 could not write is just an expression.\n")
+
+    print("(a) Leaf x PARENT attribute:")
+    net = sales.with_columns((pl.col(AMOUNT) * (1 - pl.col(DISCOUNT))).alias("net"))
+    print(span(net.collect()).select(STORE_ID, DISCOUNT, AMOUNT, "net"))
 
     print("\n(b) Leaf x GRANDPARENT attribute — two levels up, same syntax:")
-    taxed = view.with_columns((pl.col(AMOUNT) * pl.col(TAX)).alias("region.store.sale.tax"))
-    print(span(taxed.collect("sale")).select(REGION_ID, TAX, AMOUNT, "region.store.sale.tax"))
+    taxed = sales.with_columns((pl.col(AMOUNT) * pl.col(TAX)).alias("tax"))
+    print(span(taxed.collect()).select(REGION_ID, TAX, AMOUNT, "tax"))
 
     print("\n(c) All three levels in ONE expression:")
-    final = view.with_columns(
-        (pl.col(AMOUNT) * (1 - pl.col(DISCOUNT)) * (1 + pl.col(TAX))).alias(
-            "region.store.sale.final"
-        )
+    final = sales.with_columns(
+        (pl.col(AMOUNT) * (1 - pl.col(DISCOUNT)) * (1 + pl.col(TAX))).alias("final")
     )
-    print(span(final.collect("sale")).select(TAX, DISCOUNT, AMOUNT, "region.store.sale.final"))
-    print("\nThe view resolves each column to its owning level, joins in whatever")
-    print("the deepest level is missing, evaluates, and drops the borrowed columns.")
+    print(span(final.collect()).select(TAX, DISCOUNT, AMOUNT, "final"))
+
+    print("\nNo routing rules to learn: it is polars, on a frame that has one")
+    print("granularity. The join to get there is pruned to the columns actually")
+    print("used — asking for the whole axis costs nothing you do not read.")
 
 
 # =============================================================================
-# Part 4: Aggregating down and pushing back up
+# Part 4: Rolling up to a parent
 # =============================================================================
 
 
 def demonstrate_rollup_and_share(view: HierarchyView) -> None:
-    header("PART 4: Roll up to a parent, then reference it from the child")
+    header("PART 4: Rolling up to a parent, and reading the result back down")
 
-    print("\n'What share of its store's revenue is each sale?' — a child->parent")
-    print("aggregate, then read back down at child granularity:\n")
-    share = view.promote(
-        "amount", from_level="sale", to_level="store", agg="sum", alias="revenue"
-    ).with_columns(
-        (pl.col(AMOUNT) / pl.col("region.store.revenue")).alias("region.store.sale.share")
+    print("\nA roll-up is a group_by on the parent's key columns. view.key_columns()")
+    print(f"spells them for you — for 'store' that is {view.key_columns('store')}:\n")
+    revenue = (
+        view.level("sale")
+        .group_by(view.key_columns("store"))
+        .agg(pl.col(AMOUNT).sum().alias("revenue"))
     )
+    print(revenue.collect().sort(STORE_ID).head(4))
+
+    print("\n'What share of its store's revenue is each sale?' — join it back:\n")
+    share = (
+        view.level("sale")
+        .join(revenue, on=view.key_columns("store"), how="left")
+        .with_columns((pl.col(AMOUNT) / pl.col("revenue")).alias("share"))
+    )
+    print(span(share.collect()).select(STORE_ID, AMOUNT, "revenue", "share"))
+
+    print("\nOr skip the join entirely with a window over the parent key, which")
+    print("normalize() already put on the child table:\n")
+    windowed = view.level("sale").with_columns(
+        (pl.col(AMOUNT) / pl.col(AMOUNT).sum().over(STORE_ID)).alias("share")
+    )
+    print(span(windowed.collect()).select(STORE_ID, AMOUNT, "share"))
+
+    print("\nRolling straight to the region needs no intermediate hop — every")
+    print("level's table carries all of its ancestor keys, not just its parent's:\n")
     print(
-        span(share.collect("sale")).select(
-            STORE_ID, AMOUNT, "region.store.revenue", "region.store.sale.share"
-        )
-    )
-
-    print("\nThe same question via a window over the parent key — no join at all,")
-    print("because normalize() puts the parent key on the child table:\n")
-    windowed = view.with_columns(
-        (pl.col(AMOUNT) / pl.col(AMOUNT).sum().over(STORE_ID)).alias("region.store.sale.share2")
-    )
-    print(span(windowed.collect("sale")).select(STORE_ID, AMOUNT, "region.store.sale.share2"))
-
-    print("\nMulti-level rollup chain — sale -> store -> region:")
-    chained = view.promote(
-        "amount", from_level="sale", to_level="store", agg="sum", alias="revenue"
-    ).promote("revenue", from_level="store", to_level="region", agg="sum", alias="revenue")
-    print(
-        chained.collect("region").select(REGION_ID, "region.name", "region.revenue").sort(REGION_ID)
+        view.level("sale")
+        .group_by(view.key_columns("region"))
+        .agg(pl.col(AMOUNT).sum().alias("revenue"), pl.len().alias("sales"))
+        .collect()
+        .sort(REGION_ID)
     )
 
 
 # =============================================================================
-# Part 5: Filtering against other levels
+# Part 5: Filtering
 # =============================================================================
 
 
 def demonstrate_filtering(view: HierarchyView) -> None:
-    header("PART 5: Filtering across levels")
+    header("PART 5: Filtering — two different questions")
 
-    total = view.collect("sale").height
+    total = view.level("sale").collect().height
 
-    print("\n(a) Leaf rows compared to a PARENT-level aggregate")
-    print("    'sales above their own store's average':")
-    above = view.promote(
-        "amount", from_level="sale", to_level="store", agg="mean", alias="avg"
-    ).filter(pl.col(AMOUNT) > pl.col("region.store.avg"))
-    print(f"    {above.collect('sale').height} of {total} sales")
-
-    print("\n(b) Leaf rows compared to a GRANDPARENT attribute:")
-    lopsided = view.filter(pl.col(AMOUNT) * pl.col(TAX) > 5.0)
-    print(f"    {lopsided.collect('sale').height} of {total} sales carry over 5.0 of tax")
-
-    print("\n(c) Existence, skipping a level, with a CROSS-LEVEL predicate —")
-    print("    'regions containing a sale that alone owes more than 15 in tax'.")
-    print("    The predicate is evaluated at sale level but reads region.tax_rate:")
-    hot = view.any_child_satisfies(
-        pl.col(AMOUNT) * pl.col(TAX) > 15.0, at_level="region", child_level="sale"
+    print("\n(a) Asking a question about sales: filter the frame.")
+    print("    'sales above their own store average':")
+    above = (
+        view.level("sale")
+        .filter(pl.col(AMOUNT) > pl.col(AMOUNT).mean().over(STORE_ID))
+        .collect()
     )
-    print(f"    regions: {sorted(hot.tables()['region'].collect()[REGION_ID].to_list())}")
-    print("    (a semi-join — no explode, no list construction)")
+    print(f"    {above.height} of {total} sales")
 
-    print("\n(d) Filtering a PARENT attribute restricts the children automatically:")
+    print("\n    'sales carrying over 5.0 of tax' — leaf against grandparent:")
+    lopsided = view.level("sale").filter(pl.col(AMOUNT) * pl.col(TAX) > 5.0).collect()
+    print(f"    {lopsided.height} of {total} sales")
+
+    print("\n(b) Existence — 'regions containing a sale that alone owes over 15")
+    print("    in tax'. A semi-join: no explode, no list construction.")
+    keys = view.key_columns("region")
+    hot = view.level("region").join(
+        view.level("sale").filter(pl.col(AMOUNT) * pl.col(TAX) > 15.0).select(keys).unique(),
+        on=keys,
+        how="semi",
+    )
+    print(f"    regions: {sorted(hot.collect()[REGION_ID].to_list())}")
+
+    print("\n(c) Restricting the HIERARCHY, not a frame: view.filter().")
+    print("    This is the one operation a flat frame cannot express, because")
+    print("    dropping a region has to drop its stores and sales too:\n")
     one_region = view.filter(pl.col("region.name") == "region-1")
-    print(f"    sale rows visible: {one_region.tables()['sale'].collect().height} of {total}")
-    print("    — tables() performs no join, yet returns no orphans.")
+    for level in one_region.levels:
+        kept = one_region.tables()[level].collect().height
+        whole = view.tables()[level].collect().height
+        print(f"      {level:<8} {kept:>4} of {whole:>4} rows")
+    print("\n    tables() performs no join, yet returns no orphans.")
 
 
 # =============================================================================
@@ -270,82 +289,60 @@ def demonstrate_filtering(view: HierarchyView) -> None:
 def demonstrate_conditional_rollup(view: HierarchyView) -> None:
     header("PART 6: Conditional aggregation")
 
-    print("\n'Revenue from bulk sales only (qty >= 3), per store' — mask at the leaf,")
-    print("then promote, so non-matching children contribute zero rather than")
-    print("disappearing from the hierarchy:\n")
-    bulk = (
-        view.with_columns(
-            pl.when(pl.col(QTY) >= 3)
-            .then(pl.col(AMOUNT))
-            .otherwise(0.0)
-            .alias("region.store.sale.bulk")
+    print("\n'Revenue from bulk sales only (qty >= 3), per store' — an ordinary")
+    print("masked aggregate, so non-matching sales contribute zero rather than")
+    print("disappearing from the store:\n")
+    stores = (
+        view.level("sale")
+        .group_by(view.key_columns("store"))
+        .agg(
+            pl.col(AMOUNT).sum().alias("revenue"),
+            pl.when(pl.col(QTY) >= 3).then(pl.col(AMOUNT)).otherwise(0.0).sum().alias("bulk"),
         )
-        .promote("bulk", from_level="sale", to_level="store", agg="sum", alias="bulk_revenue")
-        .promote("amount", from_level="sale", to_level="store", agg="sum", alias="revenue")
+        .with_columns((pl.col("bulk") / pl.col("revenue")).round(3).alias("bulk_pct"))
+        .collect()
+        .sort(STORE_ID)
     )
-    stores = bulk.collect("store").with_columns(
-        (pl.col("region.store.bulk_revenue") / pl.col("region.store.revenue"))
-        .round(3)
-        .alias("bulk_pct")
-    )
-    print(
-        stores.select(
-            STORE_ID, "region.store.revenue", "region.store.bulk_revenue", "bulk_pct"
-        ).sort(STORE_ID)
-    )
+    print(stores.select(STORE_ID, "revenue", "bulk", "bulk_pct"))
 
 
 # =============================================================================
-# Part 7: A full pipeline, ending in the nested shape
+# Part 7: Ending in the nested shape
 # =============================================================================
 
 
-def demonstrate_full_pipeline(view: HierarchyView) -> None:
+def demonstrate_full_pipeline(view: HierarchyView, packer: HierarchicalPacker) -> None:
     header("PART 7: A full pipeline — and back to List[Struct] at the boundary")
 
-    pipeline = (
-        # 1. cross-level price calculation
-        view.with_columns(
-            (pl.col(AMOUNT) * (1 - pl.col(DISCOUNT)) * (1 + pl.col(TAX))).alias(
-                "region.store.sale.final"
-            )
-        )
-        # 2. roll the result up to the store
-        .promote("final", from_level="sale", to_level="store", agg="sum", alias="net_revenue")
-        # 3. rank each sale within its store
-        .with_columns(
-            pl.col("region.store.sale.final")
-            .rank(descending=True)
-            .over(STORE_ID)
-            .alias("region.store.sale.rank")
-        )
-        # 4. keep only each store's top two sales
-        .filter(pl.col("region.store.sale.rank") <= 2)
-        # 5. and only regions that still have a big one
-        .any_child_satisfies(
-            pl.col("region.store.sale.final") > 50, at_level="region", child_level="sale"
-        )
+    print("\nRestrict the hierarchy first — that part stays on the view, so the")
+    print("levels stay normalized and no parent column is ever repeated per sale:")
+    restricted = view.filter(pl.col(AMOUNT) * pl.col(TAX) > 5.0)
+    print(f"  {restricted!r}")
+
+    print("\nNothing has executed yet. Now do the analysis on the flat frame.")
+    print("Note the dotted aliases: a derived column keeps its level's path if")
+    print("you intend to pack the result back, since pack() places columns by")
+    print("path. Name it 'final' and pack() will look for it above the leaf.")
+    final, rank = "region.store.sale.final", "region.store.sale.rank"
+    ranked = (
+        restricted.level("sale")
+        .with_columns((pl.col(AMOUNT) * (1 - pl.col(DISCOUNT)) * (1 + pl.col(TAX))).alias(final))
+        .with_columns(pl.col(final).rank(descending=True).over(STORE_ID).alias(rank))
+        .filter(pl.col(rank) <= 2)
     )
+    print(ranked.collect().select(STORE_ID, AMOUNT, final, rank).sort(STORE_ID, rank).head(6))
 
-    print("\nNothing has executed yet — the whole thing is one deferred plan.")
-    print("\nCheapest terminal (one level, no join, no nesting):")
-    print(
-        pipeline.tables()["sale"]
-        .collect()
-        .select(STORE_ID, AMOUNT, "region.store.sale.final", "region.store.sale.rank")
-        .sort(STORE_ID, "region.store.sale.rank")
-    )
+    print("\nThe packed List[Struct] shape, built only where something needs it.")
+    print("Straight from the view when the derived columns are not wanted:")
+    nested = restricted.nested().collect()
+    print(f"  {nested.height} region row(s); region.store: {nested.schema['region.store']}")
 
-    print("\nFlat, joined to leaf granularity:")
-    flat_result = pipeline.collect("sale")
-    print(f"  {flat_result.height} rows x {flat_result.width} cols")
+    print("\n...or by packing the analysed frame when they are:")
+    packed = packer.pack(ranked.collect(), "region")
+    print(f"  {packed.height} region row(s); region.store: {packed.schema['region.store']}")
 
-    print("\nAnd the packed List[Struct] shape, built only because we asked:")
-    nested = pipeline.collect_nested()
-    print(f"  {nested.height} region row(s)")
-    print(f"  region.store: {nested.schema['region.store']}")
-    print("\nThat last step is the only place nesting is materialized. Everything")
-    print("above it ran against flat Parquet tables with full predicate pushdown.")
+    print("\nEverything above that ran against flat Parquet tables with full")
+    print("projection and predicate pushdown. Nesting is a boundary format.")
 
 
 # =============================================================================
@@ -367,7 +364,7 @@ def main() -> None:
         demonstrate_rollup_and_share(view)
         demonstrate_filtering(view)
         demonstrate_conditional_rollup(view)
-        demonstrate_full_pipeline(view)
+        demonstrate_full_pipeline(view, packer)
 
         print("\n" + "=" * 80)
         print("  ALL EXAMPLES COMPLETED SUCCESSFULLY!")

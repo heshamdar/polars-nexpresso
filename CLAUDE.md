@@ -3,7 +3,7 @@
 This document provides comprehensive guidance for AI assistants working with the polars-nexpresso codebase. It covers architecture, conventions, workflows, and best practices.
 
 **Last Updated:** 2026-08-14
-**Version:** 0.8.0
+**Version:** 0.9.0
 
 ---
 
@@ -52,6 +52,7 @@ polars-nexpresso/
 │   ├── __init__.py                   # Public API exports
 │   ├── expressions.py                # Nested expression builder
 │   ├── hierarchical_packer.py        # Hierarchical data operations
+│   ├── hierarchy_view.py             # Normalized per-level storage; level()/nested()
 │   ├── nexpresso.py                  # Deprecated re-export shim for expressions.py
 │   ├── structuring_utils.py          # Utility functions
 │   └── py.typed                      # PEP 561 marker for type checking
@@ -152,9 +153,9 @@ There is no "everything in one struct column" form.
 
 This holds for `pack`, `unpack`, `pack_streaming`, `unpack_streaming`,
 `normalize(at_level=)`, `denormalize(at_level=)`,
-`build_from_tables(at_level=)`, `enrich(at_level=)`, `HierarchyView.to_flat`,
-and the `to_level=` of `promote_attribute` / `any_child_satisfies` /
-`attribute_expr`.
+`build_from_tables(at_level=)`, `enrich(at_level=)`, `HierarchyView.level`,
+`HierarchyView.nested`, and the `to_level=` of `promote_attribute` /
+`any_child_satisfies` / `attribute_expr`.
 
 #### 4. Type-Generic Operations
 **`FrameT` TypeVar** supports both DataFrame and LazyFrame:
@@ -178,6 +179,7 @@ def pack(self, frame: FrameT, at_level: str) -> FrameT:
 |--------|---------------|
 | `expressions.py` | Nested data transformation via expression building |
 | `hierarchical_packer.py` | Hierarchical data operations (pack/unpack/normalize) |
+| `hierarchy_view.py` | Views over normalized per-level tables; `level(g)` returns a flat `LazyFrame` at `g` granularity |
 | `structuring_utils.py` | Utility functions (schema conversion, unnesting) |
 | `nexpresso.py` | Legacy module (imports from expressions.py) |
 
@@ -198,6 +200,12 @@ from nexpresso import (
     LevelSpec,                     # Level specification
     HierarchyValidationError,      # Custom exception
     PromoteAggregation,            # Type alias for promote_attribute agg modes
+)
+
+# From hierarchy_view.py
+from nexpresso import (
+    HierarchyView,                 # level(g) -> LazyFrame; nested(); tables(); filter()
+    EmptyParentMode,               # "prune" | "keep"
 )
 
 # From structuring_utils.py
