@@ -41,21 +41,27 @@ General-purpose helper for packing/unpacking nested hierarchies in Polars.
 def pack(
     self,
     frame: FrameT,
-    to_level: str,
+    at_level: str,
     *,
     extra_columns: Literal["preserve", "drop", "error"] = "preserve",
     parent_strategy: Literal["aggregate", "split_join"] = "aggregate",
 ) -> FrameT:
 ```
 
-Pack flattened columns down to the specified level.
+Pack so that each row is one `at_level` entity: everything *below* `at_level`
+is folded into nested `List[Struct]` columns, while its own columns and its
+ancestors' stay flat. Packing to a leaf folds nothing, since a leaf-granularity
+frame is already flat.
+
+This is the exact inverse of [`unpack`](#unpack) at the same level, and it makes
+`infer_current_level(pack(df, L)) == L`.
 
 **Parameters:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `frame` | `DataFrame \| LazyFrame` | The frame to pack |
-| `to_level` | `str` | Target level name |
+| `at_level` | `str` | The level each row should represent |
 | `extra_columns` | `Literal["preserve", "drop", "error"]` | How to handle non-hierarchy columns |
 | `parent_strategy` | `Literal["aggregate", "split_join"]` | `"aggregate"` (default) carries root attributes through the `group_by`; `"split_join"` reattaches them via a join, far cheaper when root attributes are heavy relative to child data |
 
@@ -90,22 +96,23 @@ packed = packer.pack(flat_df, "country", parent_strategy="split_join")
 ### unpack
 
 ```python
-def unpack(self, frame: FrameT, to_level: str) -> FrameT:
+def unpack(self, frame: FrameT, at_level: str) -> FrameT:
 ```
 
-Unpack nested structures to the specified level.
+Unpack nested structures until each row is one `at_level` entity — the exact
+inverse of [`pack`](#pack) at the same level.
 
 **Parameters:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `frame` | `DataFrame \| LazyFrame` | The frame to unpack |
-| `to_level` | `str` | Target level name; its **axis** is what gets exploded |
+| `at_level` | `str` | The level each row should represent; its **axis** is what gets exploded |
 
 **Returns:** Same type as input with flattened columns
 
 !!! note "Branching hierarchies"
-    Only the root → `to_level` chain is exploded. Sibling branches hanging off
+    Only the root → `at_level` chain is exploded. Sibling branches hanging off
     that chain stay packed as `List[Struct]` columns, replicated onto each
     emitted row — a flat frame carries one granularity, so exploding a second
     branch alongside the first would cross every child of one with every child
@@ -131,7 +138,7 @@ services  = packer.unpack(nested, "service")    # `country.city.street` stays pa
 def pack_streaming(
     self,
     source: LazyFrame | DataFrame | str | Path,
-    to_level: str,
+    at_level: str,
     *,
     partitions: int = 16,
     tmp_dir: str | Path | None = None,
@@ -153,7 +160,7 @@ the packed output — bounding peak memory to one bucket.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `source` | `DataFrame \| LazyFrame \| str \| Path` | Input at the finest granularity. A path/glob is scanned lazily with `scan_parquet`. |
-| `to_level` | `str` | Target level name |
+| `at_level` | `str` | The level each row of the result should represent |
 | `partitions` | `int` | Target number of root-key buckets. More buckets = lower peak memory and more temporary files. Must be ≥ 1. |
 | `tmp_dir` | `str \| Path \| None` | Directory for intermediate Parquet files. Defaults to a fresh temp directory the caller owns. |
 | `defer` | `bool` | When `True` (default), wraps the work in `pl.defer` so nothing runs until the result is collected. When `False`, sinks eagerly and returns a `scan_parquet` handle (downstream streams straight from disk). |
@@ -204,7 +211,7 @@ top = (
 def unpack_streaming(
     self,
     source: LazyFrame | DataFrame | str | Path,
-    to_level: str,
+    at_level: str,
     *,
     sink_path: str | Path | None = None,
 ) -> LazyFrame:
@@ -220,7 +227,7 @@ the pipeline lazy so it composes with downstream work or sinks straight to disk.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `source` | `DataFrame \| LazyFrame \| str \| Path` | Packed input. A path/glob is scanned lazily. |
-| `to_level` | `str` | Target level name |
+| `at_level` | `str` | The level each row of the result should represent |
 | `sink_path` | `str \| Path \| None` | When given, the result is streamed to this Parquet path via `sink_parquet` and a fresh scan over it is returned. |
 
 **Returns:** A `LazyFrame` over the unpacked result.
@@ -241,12 +248,12 @@ def normalize(
     self,
     frame: FrameT,
     *,
-    root_level: str | None = None,
+    at_level: str | None = None,
 ) -> dict[str, FrameT]:
 ```
 
 Split a frame into separate tables per hierarchy level. Thin wrapper: packs to
-`root_level` and hands the result to [`split_levels`](#split_levels), so the
+`at_level` and hands the result to [`split_levels`](#split_levels), so the
 emitted tables have exactly that method's level-local shape.
 
 **Parameters:**
@@ -254,7 +261,7 @@ emitted tables have exactly that method's level-local shape.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `frame` | `DataFrame \| LazyFrame` | The frame to normalize |
-| `root_level` | `str \| None` | Pack to this level first (default: first level) |
+| `at_level` | `str \| None` | Pack to this level first (default: root) |
 
 **Returns:** Dictionary mapping level names to tables, ordered root → leaf
 
@@ -284,7 +291,7 @@ def denormalize(
     self,
     tables: Mapping[str, DataFrame | LazyFrame],
     *,
-    target_level: str | None = None,
+    at_level: str | None = None,
 ) -> DataFrame | LazyFrame:
 ```
 
@@ -293,15 +300,15 @@ Reconstruct nested structure from per-level tables — the inverse of
 `normalize` / [`split_levels`](#split_levels) emit.
 
 Child levels are attached to their parents as nested list-of-struct columns,
-walking leaf → root, and the root's own columns are then folded into the root
-struct. When `target_level` is finer than the root, the ancestors' attribute
-columns are joined back on afterwards (the upward pass only ever attaches
-descendants).
+walking leaf → root. When `at_level` is finer than the root, the ancestors'
+attribute columns are joined back on afterwards (the upward pass only ever
+attaches descendants). Like [`pack`](#pack), the result has one row per
+`at_level` entity with that level's own columns flat.
 
 **Round-trip guarantee** — for every level `L`:
 
 ```python
-packer.denormalize(packer.normalize(df, root_level=L), target_level=L)
+packer.denormalize(packer.normalize(df, at_level=L), at_level=L)
     == packer.pack(df, L)
 ```
 
@@ -317,12 +324,12 @@ packed columns — exactly what `pack` produces.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `tables` | `Mapping[str, DataFrame \| LazyFrame]` | Level name to table mapping |
-| `target_level` | `str \| None` | Target level (default: root) |
+| `at_level` | `str \| None` | The level each row should represent (default: root) |
 
 **Returns:** Reconstructed frame with nested structures
 
 **Raises:** `HierarchyValidationError` if the root table is absent, a table
-required to reach `target_level` is missing, or a supplied table lacks its own
+required to reach `at_level` is missing, or a supplied table lacks its own
 key columns (those keys are what child tables join on).
 
 **Example:**
@@ -331,9 +338,9 @@ key columns (those keys are what child tables join on).
 tables = packer.normalize(nested_df)
 
 nested = packer.denormalize(tables)   # default: back to the root level
-assert nested.equals(packer.pack(flat_df, "country"))   # single `country` struct
+assert nested.equals(packer.pack(flat_df, "country"))   # one row per country
 
-streets = packer.denormalize(tables, target_level="street")
+streets = packer.denormalize(tables, at_level="street")
 assert streets.equals(packer.pack(flat_df, "street"))
 ```
 
@@ -346,7 +353,7 @@ def build_from_tables(
     self,
     tables: Mapping[str, DataFrame | LazyFrame],
     *,
-    target_level: str | None = None,
+    at_level: str | None = None,
     join_type: Literal["left", "inner"] = "left",
 ) -> DataFrame | LazyFrame:
 ```
@@ -358,10 +365,10 @@ Build nested hierarchy from independent normalized tables.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `tables` | `Mapping[str, DataFrame \| LazyFrame]` | Level name to table mapping |
-| `target_level` | `str \| None` | Pack to this level (default: root) |
+| `at_level` | `str \| None` | The level each row should represent (default: root) |
 | `join_type` | `Literal["left", "inner"]` | How to join tables |
 
-**Returns:** Nested frame packed to target level
+**Returns:** Nested frame at `at_level` granularity
 
 **Example:**
 

@@ -209,12 +209,12 @@ def demonstrate_pack_unpack(nested: pl.DataFrame, packer: HierarchicalPacker):
     print(flat)
 
     print_subsection("Pack to Store Level")
-    print("Products are nested within each store:")
+    print("One row per store, with its products nested:")
     store_level = packer.pack(flat, "store")
     print(store_level)
 
     print_subsection("Pack to Region Level (Coarsest Granularity)")
-    print("Stores (with their products) are nested within each region:")
+    print("One row per region, with its stores (and their products) nested:")
     region_level = packer.pack(flat, "region")
     print(region_level)
 
@@ -252,23 +252,26 @@ def demonstrate_nested_expressions(flat: pl.DataFrame):
     print_subsection("Example 1: Calculate Product Metrics")
     print("Adding profit margin and revenue calculations to each product:\n")
 
+    # Rows are regions, so the region's own columns are flat and only its stores
+    # are nested — the transformation starts from the "region.store" column.
     fields = {
-        "region": {
-            "store": {
-                "product": {
-                    # Calculate new metrics
-                    "revenue": pl.field("price") * pl.field("units_sold"),
-                    "total_cost": pl.field("cost") * pl.field("units_sold"),
-                    "profit": (pl.field("price") - pl.field("cost")) * pl.field("units_sold"),
-                    "margin_pct": (
-                        (pl.field("price") - pl.field("cost")) / pl.field("price") * 100
-                    ).round(1),
-                }
+        "region.store": {
+            "product": {
+                # Calculate new metrics
+                "revenue": pl.field("price") * pl.field("units_sold"),
+                "total_cost": pl.field("cost") * pl.field("units_sold"),
+                "profit": (pl.field("price") - pl.field("cost")) * pl.field("units_sold"),
+                "margin_pct": (
+                    (pl.field("price") - pl.field("cost")) / pl.field("price") * 100
+                ).round(1),
             }
         }
     }
 
-    result = apply_nested_operations(nested, fields, struct_mode="with_fields")
+    # use_with_columns keeps the region's own flat columns alongside the rewrite.
+    result = apply_nested_operations(
+        nested, fields, struct_mode="with_fields", use_with_columns=True
+    )
     print("Result with calculated fields:")
     print(result)
 
@@ -637,8 +640,8 @@ def demonstrate_cross_level_operations():
         }
     )
 
-    # Pack so stores are nested inside each region row.
-    packed = packer.pack(flat_df, "store")
+    # Pack so each row is a region, with its stores nested.
+    packed = packer.pack(flat_df, "region")
 
     print("\nPacked (region-level) frame:")
     print(packed.drop("region.store"))  # hide nested column for readability
@@ -846,9 +849,9 @@ def demonstrate_multiple_branches():
         ),
     }
 
-    nested = packer.denormalize(tables, target_level="country")
+    nested = packer.denormalize(tables, at_level="country")
     print_subsection("Packed: the city struct carries both branches")
-    city_fields = nested.schema["country"].to_schema()["city"].inner.to_schema()
+    city_fields = nested.schema["country.city"].inner.to_schema()
     for name, dtype in city_fields.items():
         print(f"  city.{name}: {dtype}")
 
@@ -864,6 +867,7 @@ def demonstrate_multiple_branches():
     print("\nNothing is dropped, so re-packing either frame reproduces the original:")
     repacked = packer.pack(buildings, "country")
     print(f"  pack(unpack(nested, 'building'), 'country') == nested: {repacked.equals(nested)}")
+    print("  (packing to 'country' gives one row per country, its own columns flat)")
 
     print_subsection("A view routes queries to the right branch")
     view = HierarchyView.from_tables(tables, packer)

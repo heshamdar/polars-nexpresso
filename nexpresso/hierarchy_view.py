@@ -38,6 +38,7 @@ from nexpresso.hierarchical_packer import (
     HierarchicalPacker,
     LevelMetadata,
     PromoteAggregation,
+    _reject_legacy_level_kwarg,
 )
 
 __all__ = ["HierarchyView", "EmptyParentMode"]
@@ -164,8 +165,9 @@ class HierarchyView:
         frame: pl.LazyFrame | pl.DataFrame,
         packer: HierarchicalPacker,
         *,
-        root_level: str | None = None,
+        at_level: str | None = None,
         empty_parents: EmptyParentMode = "prune",
+        **_legacy: Any,
     ) -> HierarchyView:
         """
         Normalize an existing flat or packed frame into a view.
@@ -178,16 +180,19 @@ class HierarchyView:
         Args:
             frame: A flat or packed frame covering the hierarchy.
             packer: The packer describing the hierarchy.
-            root_level: Optional root level to normalize to.
+            at_level: Optional level to pack to before splitting.
             empty_parents: See :class:`HierarchyView`.
 
         Returns:
             A new view over the normalized tables.
+
+        Raises:
+            TypeError: If the pre-0.8.0 ``root_level`` keyword is passed.
         """
+        _reject_legacy_level_kwarg("from_frame", _legacy)
+
         lazy = frame.lazy() if isinstance(frame, pl.DataFrame) else frame
-        return cls(
-            packer.normalize(lazy, root_level=root_level), packer, empty_parents=empty_parents
-        )
+        return cls(packer.normalize(lazy, at_level=at_level), packer, empty_parents=empty_parents)
 
     @classmethod
     def scan_parquet(
@@ -1079,26 +1084,35 @@ class HierarchyView:
         """
         return self.to_flat(level).collect()
 
-    def to_nested(self) -> pl.LazyFrame:
+    def to_nested(self, at_level: str | None = None) -> pl.LazyFrame:
         """
         Reconstruct the packed ``List[Struct]`` shape, lazily.
+
+        Args:
+            at_level: The level each row should represent. Defaults to the root,
+                giving one row per root entity with its descendants nested.
 
         Returns:
             An unexecuted ``LazyFrame`` with the nested schema.
         """
-        return self._packer.denormalize(self._resolved_tables())  # type: ignore[return-value]
+        return self._packer.denormalize(  # type: ignore[return-value]
+            self._resolved_tables(), at_level=at_level
+        )
 
-    def collect_nested(self) -> pl.DataFrame:
+    def collect_nested(self, at_level: str | None = None) -> pl.DataFrame:
         """
         Execute and return the packed ``List[Struct]`` frame.
 
         Only worth calling at the boundary where something actually consumes
         nesting; every query above is cheaper on the flat tables.
 
+        Args:
+            at_level: The level each row should represent. Defaults to the root.
+
         Returns:
             The materialized nested frame.
         """
-        return self.to_nested().collect()
+        return self.to_nested(at_level).collect()
 
     def sink_parquet(
         self,

@@ -25,7 +25,7 @@ from nexpresso.hierarchical_packer import (
 from nexpresso.hierarchy_view import EmptyParentMode, HierarchyView
 from nexpresso.structuring_utils import convert_polars_schema, unnest_all, unnest_rename
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "__version__",

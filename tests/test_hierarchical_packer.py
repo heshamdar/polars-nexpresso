@@ -81,7 +81,7 @@ def _assert_same_rows(left: FrameLike, right: FrameLike):
 
 
 def test_pack_unpack_roundtrip(packer, apartment_level_df):
-    street_level_df = packer.pack(apartment_level_df, "street")
+    street_level_df = packer.pack(apartment_level_df, "city")
     assert "country.city.street" in street_level_df.columns
 
     unpacked_df = packer.unpack(street_level_df, "apartment")
@@ -96,7 +96,7 @@ def test_unpack_handles_fixed_size_array_level(packer, apartment_level_df):
     to ``Array`` (e.g. after a round-trip through a format with fixed-size
     lists). The dtype check must not silently skip the explode.
     """
-    packed = packer.pack(apartment_level_df, "apartment")
+    packed = packer.pack(apartment_level_df, "building")
     col = "country.city.street.building.apartment"
     inner = packed.schema[col].inner
     # Every building in the fixture has exactly one apartment here except 100,
@@ -142,8 +142,8 @@ def test_pack_split_join_matches_aggregate(
 
 def test_pack_split_join_without_root_attrs_falls_back(packer, apartment_level_df):
     # No root-level attributes → split_join is equivalent to the aggregate path.
-    aggregated = packer.pack(apartment_level_df, "street")
-    split_joined = packer.pack(apartment_level_df, "street", parent_strategy="split_join")
+    aggregated = packer.pack(apartment_level_df, "city")
+    split_joined = packer.pack(apartment_level_df, "city", parent_strategy="split_join")
 
     _assert_same_rows(aggregated, split_joined)
 
@@ -184,7 +184,7 @@ def test_pack_handles_missing_country_code_alias(apartment_level_df):
     aliased = HierarchicalPacker(_aliased_hierarchy())
     df_no_country_code = apartment_level_df.drop("country.code")
 
-    packed_df = aliased.pack(df_no_country_code, "street")
+    packed_df = aliased.pack(df_no_country_code, "city")
     assert "country.code" not in packed_df.columns
 
     roundtrip_df = aliased.unpack(packed_df, "apartment")
@@ -204,12 +204,13 @@ def test_pack_to_root_with_synthesized_alias(apartment_level_df):
 
     packed = aliased.pack(df_no_country_code, "country")
 
-    assert packed.columns == ["country"]
-    assert "code" not in packed.schema["country"].to_schema()
+    # The synthesized key is scaffolding for the child group-by and must not
+    # survive into the packed frame.
+    assert packed.columns == ["country.city"]
 
 
 def test_split_levels_outputs_expected_tables(packer, apartment_level_df):
-    city_level_df = packer.pack(apartment_level_df, "city")
+    city_level_df = packer.pack(apartment_level_df, "country")
 
     split_tables = packer.split_levels(city_level_df)
 
@@ -295,8 +296,8 @@ def test_normalize_matches_manual_split(packer, apartment_level_df):
 
 def test_denormalize_reconstructs_nested(packer, apartment_level_df):
     normalized = packer.normalize(apartment_level_df)
-    rebuilt = packer.denormalize(normalized, target_level="apartment")
-    expected = packer.pack(apartment_level_df, "apartment")
+    rebuilt = packer.denormalize(normalized, at_level="building")
+    expected = packer.pack(apartment_level_df, "building")
 
     _assert_same_rows(rebuilt, expected)
 
@@ -308,15 +309,15 @@ def test_denormalize_reconstructs_nested(packer, apartment_level_df):
 
 @pytest.mark.parametrize("level", ["country", "city", "street", "building", "apartment"])
 def test_denormalize_inverts_normalize_at_every_level(packer, apartment_level_df, level):
-    """``denormalize(normalize(df, root_level=L), target_level=L) == pack(df, L)``.
+    """``denormalize(normalize(df, at_level=L), at_level=L) == pack(df, L)``.
 
     The root used to be the exception: the upward pass starts at level 1, so the
     root's own columns were left flat instead of folded into a struct column.
     Column order is asserted too — the ancestor-attribute joins append at the end,
     so without a reorder the frames are merely equivalent, not equal.
     """
-    tables = packer.normalize(apartment_level_df, root_level=level)
-    rebuilt = packer.denormalize(tables, target_level=level)
+    tables = packer.normalize(apartment_level_df, at_level=level)
+    rebuilt = packer.denormalize(tables, at_level=level)
     expected = packer.pack(apartment_level_df, level)
 
     assert list(rebuilt.schema.items()) == list(expected.schema.items())
@@ -328,7 +329,8 @@ def test_denormalize_defaults_invert_normalize_defaults(packer, apartment_level_
     rebuilt = packer.denormalize(packer.normalize(apartment_level_df))
     expected = packer.pack(apartment_level_df, "country")
 
-    assert rebuilt.columns == ["country"] == expected.columns
+    assert rebuilt.columns == ["country.code", "country.city"]
+    assert rebuilt.columns == expected.columns
     assert rebuilt.schema == expected.schema
     _assert_same_rows(rebuilt, expected)
 
@@ -378,7 +380,7 @@ def test_denormalize_round_trip_four_levels():
 
     rebuilt = p.denormalize(p.normalize(flat))
 
-    assert rebuilt.columns == ["a"]
+    assert rebuilt.columns == ["a.id", "a.attr", "a.b"]
     _assert_same_rows(rebuilt, p.pack(flat, "a"))
 
 
@@ -395,7 +397,7 @@ def test_pack_without_preserve_order(apartment_level_df: pl.DataFrame) -> None:
     """Test that packing without order preservation works correctly."""
     relaxed_packer = HierarchicalPacker(TEST_HIERARCHY, preserve_child_order=False)
 
-    street_level = relaxed_packer.pack(apartment_level_df, "street")
+    street_level = relaxed_packer.pack(apartment_level_df, "city")
     assert "__hier_row_id" not in street_level.columns
 
     unpacked = relaxed_packer.unpack(street_level, "apartment")
@@ -487,7 +489,7 @@ class TestSeparatorEscaping:
         )
 
         packed = packer.pack(df, "parent")
-        assert "parent" in packed.columns
+        assert packed.columns == ["parent/id", "parent/child"]
 
         unpacked = packer.unpack(packed, "child")
         _assert_same_rows(unpacked, df)
@@ -622,7 +624,7 @@ class TestFrameTypePreservation:
         self, packer: HierarchicalPacker, apartment_level_df: pl.DataFrame
     ) -> None:
         """Test that pack() returns DataFrame when given DataFrame."""
-        result = packer.pack(apartment_level_df, "street")
+        result = packer.pack(apartment_level_df, "city")
         assert isinstance(result, pl.DataFrame)
 
     def test_pack_preserves_lazyframe_type(
@@ -630,14 +632,14 @@ class TestFrameTypePreservation:
     ) -> None:
         """Test that pack() returns LazyFrame when given LazyFrame."""
         lf = apartment_level_df.lazy()
-        result = packer.pack(lf, "street")
+        result = packer.pack(lf, "city")
         assert isinstance(result, pl.LazyFrame)
 
     def test_unpack_preserves_dataframe_type(
         self, packer: HierarchicalPacker, apartment_level_df: pl.DataFrame
     ) -> None:
         """Test that unpack() returns DataFrame when given DataFrame."""
-        packed = packer.pack(apartment_level_df, "street")
+        packed = packer.pack(apartment_level_df, "city")
         result = packer.unpack(packed, "apartment")
         assert isinstance(result, pl.DataFrame)
 
@@ -645,7 +647,7 @@ class TestFrameTypePreservation:
         self, packer: HierarchicalPacker, apartment_level_df: pl.DataFrame
     ) -> None:
         """Test that unpack() returns LazyFrame when given LazyFrame."""
-        packed = packer.pack(apartment_level_df.lazy(), "street")
+        packed = packer.pack(apartment_level_df.lazy(), "city")
         result = packer.unpack(packed, "apartment")
         assert isinstance(result, pl.LazyFrame)
 
@@ -656,12 +658,12 @@ class TestFrameTypePreservation:
         # Build a lazy plan: scan → unpack to apartment → re-pack to building.
         # Neither step should execute the plan (no .collect()).
         unpacked = packer.unpack(apartment_level_df.lazy(), "apartment")
-        repacked = packer.pack(unpacked, "building")
+        repacked = packer.pack(unpacked, "street")
         # Result must still be a LazyFrame — if validation ran eagerly this would hang/OOM.
         assert isinstance(repacked, pl.LazyFrame)
         # Confirm the result is correct when eventually collected.
         collected = repacked.collect()
-        expected = packer.pack(apartment_level_df, "building")
+        expected = packer.pack(apartment_level_df, "street")
         # Sort by the ancestor key columns that are still flat at building level
         sort_cols = ["country.code", "country.city.street.name"]
         assert_frame_equal(collected.sort(sort_cols), expected.sort(sort_cols))
@@ -673,7 +675,7 @@ class TestFrameTypePreservation:
         packer = HierarchicalPacker(TEST_HIERARCHY, validate_on_pack=True)
         unpacked = packer.unpack(apartment_level_df.lazy(), "apartment")
         # This should not hang even with validate_on_pack=True
-        repacked = packer.pack(unpacked, "street")
+        repacked = packer.pack(unpacked, "city")
         assert isinstance(repacked, pl.LazyFrame)
 
 
@@ -705,7 +707,7 @@ class TestEmptyDataFrames:
 
         packed = packer.pack(df, "parent")
         assert packed.height == 0
-        assert "parent" in packed.columns
+        assert packed.columns == ["parent.id", "parent.child"]
 
     def test_unpack_empty_dataframe(self) -> None:
         """Test that unpacking an empty packed DataFrame works correctly."""
@@ -760,7 +762,7 @@ class TestBuildFromTables:
         result = packer.build_from_tables({"city": city_df, "street": street_df})
 
         assert isinstance(result, pl.DataFrame)
-        assert "city" in result.columns
+        assert "city.street" in result.columns
         assert result.height == 2  # Two cities
 
         # Unpack and verify
@@ -794,7 +796,7 @@ class TestBuildFromTables:
 
         # When target_level is child, we need the child table
         with pytest.raises(HierarchyValidationError, match="Missing table"):
-            packer.build_from_tables({"parent": parent_df}, target_level="child")
+            packer.build_from_tables({"parent": parent_df}, at_level="child")
 
     def test_build_from_tables_missing_parent_keys_raises(self) -> None:
         """Test that missing parent_keys on child level raises an error."""
@@ -1201,7 +1203,7 @@ class TestPromoteAttribute:
 
     def test_from_packed_frame(self, promote_packer, promote_df):
         """Works correctly when input frame is already packed."""
-        packed = promote_packer.pack(promote_df, "city")
+        packed = promote_packer.pack(promote_df, "country")
         result = promote_packer.promote_attribute(
             packed, "population", from_level="city", to_level="country", agg="sum"
         )
@@ -1261,14 +1263,14 @@ class TestAttributeExpr:
 
     def test_same_level_returns_column(self, cl_packer, cl_df):
         """Same-level access returns the attribute as a direct column expr."""
-        packed = cl_packer.pack(cl_df, "city")  # country-level frame
+        packed = cl_packer.pack(cl_df, "country")  # country-level frame
         expr = cl_packer.attribute_expr("name", "country", "country")
         result = sorted(packed.select(expr).to_series().to_list())
         assert result == ["Canada", "United States"]
 
     def test_immediate_child_sum(self, cl_packer, cl_df):
         """Cross-level sum aggregation over immediate child level."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         expr = cl_packer.attribute_expr("population", "city", "country", "sum")
         vals = dict(
             zip(
@@ -1281,7 +1283,7 @@ class TestAttributeExpr:
 
     def test_immediate_child_count(self, cl_packer, cl_df):
         """Cross-level count gives number of child entities."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         expr = cl_packer.attribute_expr("id", "city", "country", "count")
         vals = dict(
             zip(
@@ -1294,7 +1296,7 @@ class TestAttributeExpr:
 
     def test_two_hop_sum(self, cl_packer, cl_df):
         """Sum across two hops (street → country) cascades correctly."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         expr = cl_packer.attribute_expr("length_km", "street", "country", "sum")
         vals = dict(
             zip(
@@ -1309,7 +1311,7 @@ class TestAttributeExpr:
 
     def test_two_hop_count(self, cl_packer, cl_df):
         """Count across two hops gives total number of from_level entities."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         expr = cl_packer.attribute_expr("name", "street", "country", "count")
         vals = dict(
             zip(
@@ -1322,21 +1324,21 @@ class TestAttributeExpr:
 
     def test_used_as_filter(self, cl_packer, cl_df):
         """attribute_expr result can be used directly in filter()."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         expr = cl_packer.attribute_expr("id", "city", "country", "count")
         result = packed.filter(expr > 1)
         assert result.select("country.code").to_series().to_list() == ["US"]
 
     def test_used_as_sort_key(self, cl_packer, cl_df):
         """attribute_expr result can be used as a sort key."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         expr = cl_packer.attribute_expr("population", "city", "country", "sum")
         result = packed.sort(expr, descending=True).select("country.code").to_series().to_list()
         assert result[0] == "US"
 
     def test_expression_arithmetic(self, cl_packer, cl_df):
         """Two attribute_expr results compose naturally with Polars arithmetic."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         city_count = cl_packer.attribute_expr("id", "city", "country", "count")
         total_pop = cl_packer.attribute_expr("population", "city", "country", "sum")
         result = packed.with_columns((total_pop / city_count).alias("avg_pop"))
@@ -1350,7 +1352,7 @@ class TestAttributeExpr:
 
     def test_preserves_lazyframe(self, cl_packer, cl_df):
         """Works on LazyFrame; result is a plain pl.Expr regardless."""
-        packed = cl_packer.pack(cl_df.lazy(), "city")
+        packed = cl_packer.pack(cl_df.lazy(), "country")
         expr = cl_packer.attribute_expr("id", "city", "country", "count")
         result = packed.filter(expr >= 1).collect()
         assert len(result) == 2
@@ -1366,7 +1368,7 @@ class TestEnrich:
 
     def test_single_spec(self, cl_packer, cl_df):
         """enrich with a single LevelAttribute adds the column."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         result = cl_packer.enrich(
             packed,
             LevelAttribute("id", "city", "count", alias="city_count"),
@@ -1384,7 +1386,7 @@ class TestEnrich:
 
     def test_multiple_specs(self, cl_packer, cl_df):
         """enrich adds multiple attribute columns at once."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         result = cl_packer.enrich(
             packed,
             LevelAttribute("id", "city", "count", alias="city_count"),
@@ -1396,7 +1398,7 @@ class TestEnrich:
 
     def test_same_level_spec(self, cl_packer, cl_df):
         """enrich works for same-level attribute access."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         result = cl_packer.enrich(
             packed,
             LevelAttribute("name", "country", "single", alias="cname"),
@@ -1406,7 +1408,7 @@ class TestEnrich:
 
     def test_default_alias(self, cl_packer, cl_df):
         """When alias is None, column name defaults to the attribute name."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         result = cl_packer.enrich(
             packed,
             LevelAttribute("population", "city", "sum"),
@@ -1416,7 +1418,7 @@ class TestEnrich:
 
     def test_preserves_lazyframe(self, cl_packer, cl_df):
         """enrich preserves LazyFrame type."""
-        packed = cl_packer.pack(cl_df.lazy(), "city")
+        packed = cl_packer.pack(cl_df.lazy(), "country")
         result = cl_packer.enrich(
             packed,
             LevelAttribute("id", "city", "count", alias="city_count"),
@@ -1435,7 +1437,7 @@ class TestAnyAllChildSatisfies:
 
     def test_any_child_satisfies_basic(self, cl_packer, cl_df):
         """Filter countries where any city has population > 5M."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         result = cl_packer.any_child_satisfies(
             packed,
             from_level="city",
@@ -1447,7 +1449,7 @@ class TestAnyAllChildSatisfies:
 
     def test_any_child_satisfies_all_pass(self, cl_packer, cl_df):
         """When all entities have qualifying children, all rows are returned."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         result = cl_packer.any_child_satisfies(
             packed,
             from_level="city",
@@ -1458,7 +1460,7 @@ class TestAnyAllChildSatisfies:
 
     def test_any_child_satisfies_none_pass(self, cl_packer, cl_df):
         """When no entities have qualifying children, result is empty."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         result = cl_packer.any_child_satisfies(
             packed,
             from_level="city",
@@ -1469,7 +1471,7 @@ class TestAnyAllChildSatisfies:
 
     def test_all_children_satisfy_basic(self, cl_packer, cl_df):
         """Filter countries where ALL cities have population > 2M."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         result = cl_packer.all_children_satisfy(
             packed,
             from_level="city",
@@ -1483,7 +1485,7 @@ class TestAnyAllChildSatisfies:
 
     def test_all_children_satisfy_partial(self, cl_packer, cl_df):
         """Filter countries where ALL cities have population > 5M."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         result = cl_packer.all_children_satisfy(
             packed,
             from_level="city",
@@ -1496,7 +1498,7 @@ class TestAnyAllChildSatisfies:
 
     def test_non_adjacent_levels_raises(self, cl_packer, cl_df):
         """Skipping a level raises ValueError."""
-        packed = cl_packer.pack(cl_df, "city")
+        packed = cl_packer.pack(cl_df, "country")
         with pytest.raises(ValueError, match="immediate child"):
             cl_packer.any_child_satisfies(
                 packed,
@@ -1507,7 +1509,7 @@ class TestAnyAllChildSatisfies:
 
     def test_preserves_lazyframe(self, cl_packer, cl_df):
         """any_child_satisfies preserves LazyFrame type."""
-        packed = cl_packer.pack(cl_df.lazy(), "city")
+        packed = cl_packer.pack(cl_df.lazy(), "country")
         result = cl_packer.any_child_satisfies(
             packed,
             from_level="city",
@@ -1709,7 +1711,7 @@ class TestUsabilityHelpers:
     # ------------------------------------------------------------------
 
     def test_get_level_fields_packed_short(self, packer, apartment_level_df):
-        packed = packer.pack(apartment_level_df, "city")
+        packed = packer.pack(apartment_level_df, "country")
         fields = packer.get_level_fields("city", packed)
         # city struct fields should be id and name (not street sub-struct)
         assert "id" in fields
@@ -1717,7 +1719,7 @@ class TestUsabilityHelpers:
         assert "street" not in fields
 
     def test_get_level_fields_packed_long(self, packer, apartment_level_df):
-        packed = packer.pack(apartment_level_df, "city")
+        packed = packer.pack(apartment_level_df, "country")
         fields = packer.get_level_fields("city", packed, form="long")
         assert "country.city.id" in fields
         assert "country.city.name" in fields
@@ -1733,12 +1735,12 @@ class TestUsabilityHelpers:
     def test_infer_current_level_packed_to_street(self, packer, apartment_level_df):
         # pack(df, "street") packs street and below into a List[Struct] column,
         # so each row represents a city (the level above the first packed column).
-        packed = packer.pack(apartment_level_df, "street")
+        packed = packer.pack(apartment_level_df, "city")
         assert packer.infer_current_level(packed) == "city"
 
     def test_infer_current_level_packed_to_city(self, packer, apartment_level_df):
         # pack(df, "city") packs city and below, so each row represents a country.
-        packed = packer.pack(apartment_level_df, "city")
+        packed = packer.pack(apartment_level_df, "country")
         assert packer.infer_current_level(packed) == "country"
 
     def test_infer_current_level_packed_to_country(self, packer, apartment_level_df):
@@ -1762,7 +1764,7 @@ class TestUsabilityHelpers:
         assert "apartment" not in level_schema
 
     def test_get_level_schema_packed(self, packer, apartment_level_df):
-        packed = packer.pack(apartment_level_df, "city")
+        packed = packer.pack(apartment_level_df, "country")
         level_schema = packer.get_level_schema("city", packed)
         assert "id" in level_schema
         assert "name" in level_schema
@@ -1858,7 +1860,7 @@ class TestDiscoverLevels:
 
     def test_discover_from_packed_schema(self, packer, apartment_level_df):
         """Discover levels from a packed DataFrame."""
-        packed = packer.pack(apartment_level_df, "city")
+        packed = packer.pack(apartment_level_df, "country")
         levels = HierarchicalPacker.discover_levels(packed)
         names = [lvl.name for lvl in levels]
         assert "country" in names
@@ -1869,7 +1871,7 @@ class TestDiscoverLevels:
 
     def test_discover_packed_levels_marked(self, packer, apartment_level_df):
         """Levels inside packed columns should be marked is_packed=True."""
-        packed = packer.pack(apartment_level_df, "city")
+        packed = packer.pack(apartment_level_df, "country")
         levels = HierarchicalPacker.discover_levels(packed)
         by_name = {lvl.name: lvl for lvl in levels}
         # country is flat, city is a packed List[Struct] column
@@ -1880,7 +1882,7 @@ class TestDiscoverLevels:
 
     def test_discover_from_partially_packed(self, packer, apartment_level_df):
         """Discover levels from partially packed data."""
-        packed = packer.pack(apartment_level_df, "street")
+        packed = packer.pack(apartment_level_df, "city")
         levels = HierarchicalPacker.discover_levels(packed)
         names = [lvl.name for lvl in levels]
         # All 5 levels should still be discoverable
@@ -2004,7 +2006,7 @@ class TestValidateSchema:
 
     def test_compatible_packed_schema(self, packer, apartment_level_df):
         """Packed schema is compatible."""
-        packed = packer.pack(apartment_level_df, "city")
+        packed = packer.pack(apartment_level_df, "country")
         result = packer.validate_schema(packed)
         assert result.is_compatible
         assert result.inferred_level == "country"

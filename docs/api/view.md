@@ -34,7 +34,7 @@ correctly.
 | Method | Purpose |
 |---|---|
 | `HierarchyView.from_tables(tables, packer, *, empty_parents="prune")` | Wrap tables already in `normalize()` shape |
-| `HierarchyView.from_frame(frame, packer, *, root_level=None, empty_parents="prune")` | Normalize an existing flat or packed frame |
+| `HierarchyView.from_frame(frame, packer, *, at_level=None, empty_parents="prune")` | Normalize an existing flat or packed frame |
 | `HierarchyView.scan_parquet(source, packer, *, pattern="{level}", empty_parents="prune", **scan_kwargs)` | Scan one Parquet dataset per level from a directory |
 
 ```python

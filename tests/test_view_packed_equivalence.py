@@ -117,7 +117,7 @@ def assert_nested_equal(got: pl.DataFrame, want: pl.DataFrame, label: str = "") 
     assert (
         got.schema == want.schema
     ), f"{label} schema mismatch:\n  got : {got.schema}\n  want: {want.schema}"
-    assert_frame_equal(got.sort(ROOT), want.sort(ROOT))
+    assert_frame_equal(got.sort(REGION_ID), want.sort(REGION_ID))
 
 
 # =============================================================================
@@ -217,7 +217,7 @@ CASES: list[Case] = [
         "transform_leaf_in_place",
         lambda df: df.with_columns((pl.col(AMOUNT) * 2).alias(AMOUNT)),
         lambda v: v.with_columns((pl.col(AMOUNT) * 2).alias(AMOUNT)),
-        eval_fields={"region": {"store": {"sale": {"amount": lambda x: x * 2}}}},
+        eval_fields={"region.store": {"sale": {"amount": lambda x: x * 2}}},
     ),
     Case(
         "transform_leaf_new_column",
@@ -228,13 +228,13 @@ CASES: list[Case] = [
         "transform_parent_in_place",
         lambda df: df.with_columns((pl.col(DISCOUNT) * 100).alias(DISCOUNT)),
         lambda v: v.with_columns((pl.col(DISCOUNT) * 100).alias(DISCOUNT)),
-        eval_fields={"region": {"store": {"discount": lambda x: x * 100}}},
+        eval_fields={"region.store": {"discount": lambda x: x * 100}},
     ),
     Case(
         "transform_root_in_place",
         lambda df: df.with_columns(pl.col(REGION_NAME).str.to_uppercase().alias(REGION_NAME)),
         lambda v: v.with_columns(pl.col(REGION_NAME).str.to_uppercase().alias(REGION_NAME)),
-        eval_fields={"region": {"name": lambda x: x.str.to_uppercase()}},
+        eval_fields={"region.name": lambda x: x.str.to_uppercase()},
     ),
     Case(
         "transform_cross_level_parent",
@@ -263,7 +263,7 @@ CASES: list[Case] = [
         "transform_null_fill",
         lambda df: df.with_columns(pl.col(AMOUNT).fill_null(0.0).alias(AMOUNT)),
         lambda v: v.with_columns(pl.col(AMOUNT).fill_null(0.0).alias(AMOUNT)),
-        eval_fields={"region": {"store": {"sale": {"amount": lambda x: x.fill_null(0.0)}}}},
+        eval_fields={"region.store": {"sale": {"amount": lambda x: x.fill_null(0.0)}}},
     ),
     Case(
         "transform_conditional",
@@ -440,7 +440,9 @@ def test_view_matches_nested_eval(
     operation. Both must land on identical nested frames.
     """
     packed = packer.pack(flat, ROOT)
-    want = apply_nested_operations(packed, case.eval_fields, struct_mode=case.eval_mode)
+    want = apply_nested_operations(
+        packed, case.eval_fields, struct_mode=case.eval_mode, use_with_columns=True
+    )
     got = case.view_op(view).collect_nested()
     assert_nested_equal(got, want, case.name)
 
@@ -474,7 +476,7 @@ class TestPromoteEquivalence:
             "amount", from_level="sale", to_level="store", agg="sum", alias="revenue"
         )
         nested = promoted.collect_nested()
-        store_struct = nested.schema[ROOT].to_schema()["store"].inner  # type: ignore[union-attr]
+        store_struct = nested.schema["region.store"].inner  # type: ignore[union-attr]
         assert "revenue" in store_struct.to_schema()
 
     def test_promote_to_root(
@@ -524,10 +526,9 @@ class TestExistentialEquivalence:
         packer: HierarchicalPacker,
     ):
         """The packer requires an immediate child, so compare store <- sale."""
-        # Store granularity = store columns flat, sale still nested. That is
-        # what unpack(packed, "store") produces; pack(flat, "store") would nest
-        # the store level itself into its parent.
-        at_store = packer.unpack(packer.pack(flat, ROOT), "store")
+        # Store granularity: store columns flat, sale still nested — which is
+        # exactly what packing to "store" now means.
+        at_store = packer.pack(flat, "store")
         want = packer.any_child_satisfies(
             at_store, from_level="sale", to_level="store", condition=element_condition
         )
@@ -647,14 +648,14 @@ class TestTwoLevelHierarchy:
         want = packer.pack(flat, "country")
         got = view.collect_nested()
         assert got.schema == want.schema
-        assert_frame_equal(got.sort("country"), want.sort("country"))
+        assert_frame_equal(got.sort("country.code"), want.sort("country.code"))
 
     def test_filter(self, flat: pl.DataFrame, packer: HierarchicalPacker):
         predicate = pl.col("country.city.pop") > 2.5
         view = HierarchyView.from_frame(flat, packer)
         want = packer.pack(flat.filter(predicate), "country")
         got = view.filter(predicate).collect_nested()
-        assert_frame_equal(got.sort("country"), want.sort("country"))
+        assert_frame_equal(got.sort("country.code"), want.sort("country.code"))
 
     def test_cross_level_transform(self, flat: pl.DataFrame, packer: HierarchicalPacker):
         expr = (pl.col("country.city.pop") * 2).alias("country.city.doubled")
@@ -662,7 +663,7 @@ class TestTwoLevelHierarchy:
         want = packer.pack(flat.with_columns(expr), "country")
         got = view.with_columns(expr).collect_nested()
         assert got.schema == want.schema
-        assert_frame_equal(got.sort("country"), want.sort("country"))
+        assert_frame_equal(got.sort("country.code"), want.sort("country.code"))
 
 
 class TestFourLevelHierarchy:
@@ -697,13 +698,13 @@ class TestFourLevelHierarchy:
         want = packer.pack(flat, "a")
         got = HierarchyView.from_frame(flat, packer).collect_nested()
         assert got.schema == want.schema
-        assert_frame_equal(got.sort("a"), want.sort("a"))
+        assert_frame_equal(got.sort("a.id"), want.sort("a.id"))
 
     def test_leaf_filter(self, flat: pl.DataFrame, packer: HierarchicalPacker):
         predicate = pl.col("a.b.c.d.value") > 20
         want = packer.pack(flat.filter(predicate), "a")
         got = HierarchyView.from_frame(flat, packer).filter(predicate).collect_nested()
-        assert_frame_equal(got.sort("a"), want.sort("a"))
+        assert_frame_equal(got.sort("a.id"), want.sort("a.id"))
 
     def test_three_hop_ancestor_reference(self, flat: pl.DataFrame, packer: HierarchicalPacker):
         """Leaf 'd' reading root 'a' — three levels up."""
@@ -711,13 +712,13 @@ class TestFourLevelHierarchy:
         want = packer.pack(flat.with_columns(expr), "a")
         got = HierarchyView.from_frame(flat, packer).with_columns(expr).collect_nested()
         assert got.schema == want.schema
-        assert_frame_equal(got.sort("a"), want.sort("a"))
+        assert_frame_equal(got.sort("a.id"), want.sort("a.id"))
 
     def test_three_hop_ancestor_filter(self, flat: pl.DataFrame, packer: HierarchicalPacker):
         predicate = pl.col("a.b.c.d.value") > pl.col("a.rate") * 100
         want = packer.pack(flat.filter(predicate), "a")
         got = HierarchyView.from_frame(flat, packer).filter(predicate).collect_nested()
-        assert_frame_equal(got.sort("a"), want.sort("a"))
+        assert_frame_equal(got.sort("a.id"), want.sort("a.id"))
 
 
 # =============================================================================
@@ -733,7 +734,7 @@ class TestRoundTripLaws:
         packed = packer.pack(flat, ROOT)
         got = HierarchyView.from_frame(packed, packer).collect_nested()
         assert got.schema == packed.schema
-        assert_frame_equal(got.sort(ROOT), packed.sort(ROOT))
+        assert_frame_equal(got.sort(REGION_ID), packed.sort(REGION_ID))
 
     def test_parquet_round_trip_is_lossless(
         self, flat: pl.DataFrame, view: HierarchyView, packer: HierarchicalPacker, tmp_path
@@ -742,7 +743,7 @@ class TestRoundTripLaws:
         got = HierarchyView.scan_parquet(tmp_path, packer).collect_nested()
         want = packer.pack(flat, ROOT)
         assert got.schema == want.schema
-        assert_frame_equal(got.sort(ROOT), want.sort(ROOT))
+        assert_frame_equal(got.sort(REGION_ID), want.sort(REGION_ID))
 
     @pytest.mark.parametrize(
         ("level", "key", "still_nested"),
@@ -782,7 +783,7 @@ class TestRoundTripLaws:
     def test_lazy_and_eager_input_agree(self, flat: pl.DataFrame, packer: HierarchicalPacker):
         eager = HierarchyView.from_frame(flat, packer).collect_nested()
         lazy = HierarchyView.from_frame(flat.lazy(), packer).collect_nested()
-        assert_frame_equal(eager.sort(ROOT), lazy.sort(ROOT))
+        assert_frame_equal(eager.sort(REGION_ID), lazy.sort(REGION_ID))
 
     def test_dangling_child_is_not_silently_dropped_by_augmentation(
         self, flat: pl.DataFrame, packer: HierarchicalPacker
@@ -823,4 +824,4 @@ class TestRoundTripLaws:
         """collect_nested() is exactly denormalize(tables())."""
         filtered = view.filter(pl.col(AMOUNT) > 30)
         via_tables = packer.denormalize(filtered.tables()).collect()  # type: ignore[union-attr]
-        assert_frame_equal(via_tables.sort(ROOT), filtered.collect_nested().sort(ROOT))
+        assert_frame_equal(via_tables.sort(REGION_ID), filtered.collect_nested().sort(REGION_ID))

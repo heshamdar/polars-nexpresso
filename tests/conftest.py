@@ -199,5 +199,5 @@ def branching_nested(
 ) -> pl.DataFrame:
     """The branching hierarchy fully packed into a single nested column."""
     return branching_packer.denormalize(  # type: ignore[return-value]
-        branching_tables, target_level="country"
+        branching_tables, at_level="country"
     )

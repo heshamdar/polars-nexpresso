@@ -218,7 +218,7 @@ class TestPack:
     def test_city_struct_carries_both_branches(
         self, branching_packer: HierarchicalPacker, branching_nested: pl.DataFrame
     ):
-        city_fields = branching_nested.schema["country"].to_schema()["city"].inner.to_schema()
+        city_fields = branching_nested.schema["country.city"].inner.to_schema()
         assert "street" in city_fields
         assert "service" in city_fields
         assert isinstance(city_fields["street"], pl.List)
@@ -236,7 +236,7 @@ class TestPack:
         self, branching_packer: HierarchicalPacker, branching_nested: pl.DataFrame
     ):
         flat = branching_packer.unpack(branching_nested, "building")
-        packed = branching_packer.pack(flat, "building")
+        packed = branching_packer.pack(flat, "street")
         # Rows are at street granularity; the service branch is still there.
         assert "country.city.service" in packed.columns
         assert isinstance(packed.schema["country.city.street.building"], pl.List)
@@ -307,7 +307,7 @@ class TestNormalizedRoundTrip:
         """
         flat = branching_packer.unpack(branching_nested, axis)
         got = branching_packer.denormalize(
-            branching_packer.normalize(flat, root_level=level), target_level=level
+            branching_packer.normalize(flat, at_level=level), at_level=level
         )
         want = branching_packer.pack(flat, level)
         assert got.columns == want.columns
@@ -320,7 +320,7 @@ class TestNormalizedRoundTrip:
         A target under ``street`` must still carry ``city``'s service branch —
         ``pack`` does, so the inverse has to as well.
         """
-        result = branching_packer.denormalize(branching_tables, target_level="street")
+        result = branching_packer.denormalize(branching_tables, at_level="street")
         assert "country.city.service" in result.columns
         assert isinstance(result.schema["country.city.service"], pl.List)
 
@@ -329,7 +329,7 @@ class TestNormalizedRoundTrip:
     ):
         """A branch off the target's axis is optional."""
         without_service = {k: v for k, v in branching_tables.items() if k != "service"}
-        result = branching_packer.denormalize(without_service, target_level="building")
+        result = branching_packer.denormalize(without_service, at_level="building")
         assert "country.city.service" not in result.columns
 
     def test_denormalize_requires_the_target_axis(
@@ -337,7 +337,7 @@ class TestNormalizedRoundTrip:
     ):
         without_street = {k: v for k, v in branching_tables.items() if k != "street"}
         with pytest.raises(Exception, match="Missing table for .*'street'"):
-            branching_packer.denormalize(without_street, target_level="building")
+            branching_packer.denormalize(without_street, at_level="building")
 
 
 class TestBuildFromTables:
@@ -360,8 +360,8 @@ class TestBuildFromTables:
             ),
             LevelSpec(name="service", id_fields=["kind"], parent="city", parent_keys=["city_id"]),
         )
-        result = HierarchicalPacker(spec).build_from_tables(tables, target_level="country")
-        city = result.schema["country"].to_schema()["city"].inner.to_schema()  # type: ignore[union-attr]
+        result = HierarchicalPacker(spec).build_from_tables(tables, at_level="country")
+        city = result.schema["country.city"].inner.to_schema()  # type: ignore[union-attr]
         assert "street" in city
         assert "service" in city
 
@@ -377,7 +377,7 @@ class TestBuildFromTables:
             LevelSpec(name="street", id_fields=["id"], parent="city", parent_keys=["city_id"]),
             LevelSpec(name="service", id_fields=["kind"], parent="city", parent_keys=["city_id"]),
         )
-        result = HierarchicalPacker(spec).build_from_tables(tables, target_level="city")
+        result = HierarchicalPacker(spec).build_from_tables(tables, at_level="city")
         assert result.height == 1  # type: ignore[union-attr]
 
 
@@ -387,9 +387,7 @@ class TestCrossLevelAttributes:
     def test_promote_from_the_second_branch(
         self, branching_packer: HierarchicalPacker, branching_nested: pl.DataFrame
     ):
-        packed = branching_packer.pack(
-            branching_packer.unpack(branching_nested, "service"), "service"
-        )
+        packed = branching_packer.pack(branching_packer.unpack(branching_nested, "service"), "city")
         result = branching_packer.promote_attribute(
             packed,
             "budget",
@@ -410,7 +408,7 @@ class TestCrossLevelAttributes:
         self, branching_packer: HierarchicalPacker, branching_nested: pl.DataFrame
     ):
         packed = branching_packer.pack(
-            branching_packer.unpack(branching_nested, "building"), "city"
+            branching_packer.unpack(branching_nested, "building"), "country"
         )
         expr = branching_packer.attribute_expr("budget", "service", "country", "sum")
         # Rows are at country granularity: US = 100+200+300, FR = 400.
@@ -519,7 +517,7 @@ class TestBranchingView:
         branching_packer: HierarchicalPacker,
         branching_tables: dict[str, pl.DataFrame],
     ):
-        direct = branching_packer.denormalize(branching_tables, target_level="country")
+        direct = branching_packer.denormalize(branching_tables, at_level="country")
         assert_frame_equal(
             view.collect_nested(),
             direct,  # type: ignore[arg-type]

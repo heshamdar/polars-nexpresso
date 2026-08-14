@@ -124,7 +124,7 @@ class TestNonHierarchyColumns:
 
         packed = packer.pack(df, "parent", extra_columns="drop")
         assert "extra_col" not in packed.columns
-        assert "parent" in packed.columns
+        assert packed.columns == ["parent.id", "parent.name"]
 
     def test_extra_columns_preserve_mode_with_uniform_values(self) -> None:
         """Test that extra_columns='preserve' keeps uniform extra columns."""
@@ -197,7 +197,7 @@ class TestNonHierarchyColumns:
 
         # Should not raise even with extra_columns="error"
         packed = packer.pack(df, "parent", extra_columns="error")
-        assert "parent" in packed.columns
+        assert packed.columns == ["parent.id", "parent.name"]
 
 
 # =============================================================================
@@ -262,7 +262,9 @@ class TestDeeplyNestedHierarchies:
         packed = packer.pack(six_level_data, "continent")
 
         assert packed.height == 1
-        assert "continent" in packed.columns
+        # Rows are continent entities: its own columns stay flat, its child nests.
+        assert "continent.country" in packed.columns
+        assert packed["continent.code"].to_list() == ["NA"]
 
     def test_pack_unpack_roundtrip_deep(
         self, six_level_spec: HierarchySpec, six_level_data: pl.DataFrame
@@ -281,11 +283,10 @@ class TestDeeplyNestedHierarchies:
         """Test packing to middle level and unpacking to deeper level."""
         packer = HierarchicalPacker(six_level_spec)
 
-        # Pack to region level (level 2) - aggregates to country level
-        # Since there's only 1 country (US), this gives 1 row with regions nested
+        # Pack to region level: one row per region, with cities and below nested.
         region_level = packer.pack(six_level_data, "region")
-        assert region_level.height == 1  # 1 country with nested regions
-        assert "continent.country.region" in region_level.columns
+        assert region_level.height == 2  # 2 regions (west, east)
+        assert "continent.country.region.city" in region_level.columns
 
         # Unpack to region level to get 2 rows (west, east)
         unpacked_regions = packer.unpack(region_level, "region")
@@ -295,10 +296,12 @@ class TestDeeplyNestedHierarchies:
         street_level = packer.unpack(region_level, "street")
         assert street_level.height == 3  # Original 3 streets
 
-        # Column order may differ after pack/unpack, but data should be the same
+        # Column order may differ after pack/unpack, and packing groups without
+        # maintaining top-level row order, so compare order-insensitively.
         assert_frame_equal(
             street_level.select(sorted(street_level.columns)),
             six_level_data.select(sorted(six_level_data.columns)),
+            check_row_order=False,
         )
 
 
@@ -466,7 +469,8 @@ class TestMixedNestedStructures:
 
         packed = packer.pack(df, "order")
         assert packed.height == 1
-        assert "order" in packed.columns
+        # A plain list attribute rides along beside the nested child column.
+        assert packed.columns == ["order.id", "order.customer_tags", "order.item"]
 
         unpacked = packer.unpack(packed, "item")
         assert "order.customer_tags" in unpacked.columns
@@ -496,19 +500,17 @@ class TestMixedNestedStructures:
 
         # Apply transformations on the packed data
         fields = {
-            "store": {
-                "id": None,
-                "name": None,
-                "product": {
-                    "sku": None,
-                    "price": None,
-                    "cost": None,
-                    "profit": pl.field("price") - pl.field("cost"),
-                },
+            "store.product": {
+                "sku": None,
+                "price": None,
+                "cost": None,
+                "profit": pl.field("price") - pl.field("cost"),
             }
         }
 
-        result = apply_nested_operations(packed, fields, struct_mode="with_fields")
+        result = apply_nested_operations(
+            packed, fields, struct_mode="with_fields", use_with_columns=True
+        )
 
         # Unpack to verify
         unpacked = packer.unpack(result, "product")
@@ -567,9 +569,11 @@ class TestBoundaryCases:
             }
         )
 
+        # A single-level hierarchy has nothing below the root to fold, so packing
+        # to it is a no-op — the frame is already at entity granularity.
         packed = packer.pack(df, "entity")
         assert packed.height == 2
-        assert "entity" in packed.columns
+        assert packed.columns == ["entity.id", "entity.name"]
 
     def test_wide_hierarchy_many_columns_per_level(self) -> None:
         """Test hierarchy with many columns per level."""

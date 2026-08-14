@@ -118,6 +118,57 @@ def _split_path_static(
     return components
 
 
+# Level parameters renamed in 0.8.0, mapped to their replacement. The rename went
+# with an inversion of meaning, so a silently-accepted old keyword would quietly
+# return a frame at the wrong granularity — worth refusing loudly instead.
+_RENAMED_LEVEL_KWARGS = {
+    "to_level": "at_level",
+    "root_level": "at_level",
+    "target_level": "at_level",
+}
+
+# Stands in for a required argument so that a caller passing only the old keyword
+# reaches the migration message below instead of Python's bare "missing 1
+# required positional argument".
+_MISSING_LEVEL: Any = object()
+
+
+def _reject_legacy_level_kwarg(
+    method: str, kwargs: Mapping[str, object], at_level: object = None
+) -> None:
+    """
+    Raise a migration ``TypeError`` for a pre-0.8.0 level keyword.
+
+    Args:
+        method: Name of the method that was called, for the message.
+        kwargs: The caught ``**_legacy`` mapping. Empty in the normal case.
+        at_level: The value the caller passed for the new parameter, when it is
+            required. Left as ``None`` by methods whose level is optional.
+
+    Raises:
+        TypeError: If ``kwargs`` is non-empty, or if a required ``at_level`` was
+            omitted. Renamed level parameters get a migration message; any other
+            keyword gets the usual unexpected-keyword error, since swallowing
+            typos would be worse than the rename.
+    """
+    if kwargs:
+        name = next(iter(kwargs))
+        replacement = _RENAMED_LEVEL_KWARGS.get(name)
+        if replacement is None:
+            raise TypeError(f"{method}() got an unexpected keyword argument '{name}'")
+
+        raise TypeError(
+            f"{method}() parameter '{name}' was renamed to '{replacement}' in 0.8.0, "
+            "and its meaning changed: it now names the level each ROW represents, "
+            "not the level that gets nested. Rewrite "
+            f'{method}(..., {name}="<level>") as '
+            f'{method}(..., {replacement}="<parent of that level>").'
+        )
+
+    if at_level is _MISSING_LEVEL:
+        raise TypeError(f"{method}() missing 1 required positional argument: 'at_level'")
+
+
 __all__ = [
     "LevelSpec",
     "LevelAttribute",
@@ -1408,18 +1459,34 @@ class HierarchicalPacker:
     def pack(
         self,
         frame: FrameT,
-        to_level: str,
+        at_level: str = _MISSING_LEVEL,
         *,
         extra_columns: ExtraColumnsMode = "preserve",
         parent_strategy: ParentStrategy = "aggregate",
+        **_legacy: Any,
     ) -> FrameT:
         """
-        Pack flattened columns down to ``to_level`` so that rows represent the
-        requested granularity.
+        Pack so that each row is one ``at_level`` entity.
+
+        Every level *below* ``at_level`` is folded into nested
+        ``List[Struct]`` columns; ``at_level``'s own columns stay flat. This is
+        the exact inverse of :meth:`unpack`, which explodes down to the same
+        granularity::
+
+            packer.pack(flat, "city")       # one row per city
+            packer.unpack(nested, "city")   # one row per city
+
+        and it makes :meth:`infer_current_level` a true inverse::
+
+            packer.infer_current_level(packer.pack(df, level)) == level
+
+        Packing to a leaf level folds nothing: a leaf-granularity frame is
+        already flat.
 
         Args:
             frame: The DataFrame or LazyFrame to pack.
-            to_level: The target level name to pack down to.
+            at_level: The level each row should represent. Everything below it
+                is nested; its own columns and its ancestors' stay flat.
             extra_columns: How to handle columns that don't belong to the hierarchy:
                 - ``"preserve"``: Keep extra columns if they have uniform values
                   within each group (default). Raises error if values differ.
@@ -1458,8 +1525,10 @@ class HierarchicalPacker:
             the whole dataset. Use :meth:`pack_streaming` for inputs that do not
             fit in memory.
         """
+        _reject_legacy_level_kwarg("pack", _legacy, at_level)
+
         if parent_strategy == "split_join":
-            return self._pack_split_join(frame, to_level, extra_columns=extra_columns)
+            return self._pack_split_join(frame, at_level, extra_columns=extra_columns)
 
         lf, added_cols, schema = self._prepare_frame(frame)
 
@@ -1480,26 +1549,31 @@ class HierarchicalPacker:
         # Validation requires eager .collect(); skip it when frame is lazy to preserve lazy semantics.
         effective_validate = self.validate_on_pack and isinstance(frame, pl.DataFrame)
 
-        # Fold children before their parents so that every descendant is already
-        # a List[Struct] column by the time its parent's struct is built. In a
-        # branching hierarchy this folds *all* of a level's branches into it —
-        # they share the level's prefix, so ``_pack_single_level`` collects them
-        # together. Branches absent from ``frame`` contribute no columns and are
-        # skipped there at no cost.
-        subtree = [to_level, *self.spec.descendants_of(to_level)]
-        for level_idx in [self.spec.index_of(name) for name in reversed(subtree)]:
-            if level_idx == 0 and added_cols:
-                # Alias columns are scaffolding for the child levels' group keys.
-                # Drop them before the root fold, or they end up inside the root
-                # struct and the post-loop drop can no longer find them.
-                lf = lf.drop(*added_cols, strict=False)
-                schema = lf.collect_schema()
-            lf, schema = self._pack_single_level(lf, level_idx, schema, validate=effective_validate)
+        # Fold everything strictly below ``at_level``, children before parents so
+        # that every descendant is already a List[Struct] column by the time its
+        # parent's struct is built. ``at_level`` itself is never folded — that is
+        # what leaves its rows at the requested granularity. In a branching
+        # hierarchy a level's branches all share its prefix, so
+        # ``_pack_single_level`` collects them together; branches absent from
+        # ``frame`` contribute no columns and are skipped there at no cost.
+        for name in self._fold_order(at_level):
+            lf, schema = self._pack_single_level(
+                lf, self.spec.index_of(name), schema, validate=effective_validate
+            )
 
         if added_cols:
             lf = lf.drop(*added_cols, strict=False)
 
         lf = self._drop_internal_columns(lf)
+
+        # Settle on one canonical column order. Left alone, the order depends on
+        # how the input happened to be laid out: a branch already packed in
+        # ``frame`` is carried through in its old position, while a branch folded
+        # here is appended. Packing the same data along two different axes would
+        # then give two different column orders, and ``denormalize`` — which
+        # assembles from per-level tables and has no input order to inherit —
+        # could not match either. Projection is cheap; ambiguity is not.
+        lf = lf.select(self._pack_column_order(lf.collect_schema(), at_level))
         return self._match_frame_type(lf, frame)
 
     def _root_attribute_columns(self, schema: pl.Schema) -> list[str]:
@@ -1523,11 +1597,14 @@ class HierarchicalPacker:
         return attrs
 
     def _pack_split_join(
-        self, frame: FrameT, to_level: str, *, extra_columns: ExtraColumnsMode
+        self, frame: FrameT, at_level: str, *, extra_columns: ExtraColumnsMode
     ) -> FrameT:
         """
         Pack while reattaching root-level attributes via a join instead of carrying
         them through the aggregation. See :meth:`pack` (``parent_strategy``).
+
+        The root's columns are never folded, so its attributes always come back
+        as plain columns and a single row join covers every target level.
         """
         lf, _added, schema = self._prepare_frame(frame)
         root = self._levels_meta[0]
@@ -1536,39 +1613,26 @@ class HierarchicalPacker:
 
         # Nothing to split off → fall back to the standard aggregation pack.
         if not root_keys or not attr_cols:
-            return self.pack(frame, to_level, extra_columns=extra_columns)
+            return self.pack(frame, at_level, extra_columns=extra_columns)
 
         dim = lf.select([*root_keys, *attr_cols]).unique(subset=root_keys)
         structural = lf.drop(*attr_cols)
-        packed = self._to_lazy(self.pack(structural, to_level, extra_columns=extra_columns))
-
-        if to_level != root.name:
-            # The root stays flat at the top, so a plain row join reattaches it.
-            result = packed.join(dim, on=root_keys, how="left")
-        else:
-            # Packing to the root collapses each entity into a single struct column;
-            # reattach the attributes as struct fields.
-            struct_col = root.path
-            prefix = root.prefix
-            key_exprs = [
-                pl.col(struct_col).struct.field(col[len(prefix) :]).alias(col) for col in root_keys
-            ]
-            field_exprs = [pl.col(col).alias(col[len(prefix) :]) for col in attr_cols]
-            result = (
-                packed.with_columns(key_exprs)
-                .join(dim, on=root_keys, how="left")
-                .with_columns(pl.col(struct_col).struct.with_fields(field_exprs))
-                .drop([*root_keys, *attr_cols])
-            )
+        packed = self._to_lazy(self.pack(structural, at_level, extra_columns=extra_columns))
+        # The join appends the root attributes; put them back where the plain
+        # aggregation pack leaves them, so the two strategies stay interchangeable.
+        result = packed.join(dim, on=root_keys, how="left")
+        result = result.select(self._pack_column_order(result.collect_schema(), at_level))
 
         return self._match_frame_type(result, frame)
 
-    def unpack(self, frame: FrameT, to_level: str) -> FrameT:
+    def unpack(self, frame: FrameT, at_level: str = _MISSING_LEVEL, **_legacy: Any) -> FrameT:
         """
-        Unpack nested list-of-struct columns until ``to_level`` is reached,
-        mirroring :func:`explode` + :func:`unnest` per level.
+        Unpack nested list-of-struct columns until each row is one ``at_level``
+        entity, mirroring :func:`explode` + :func:`unnest` per level.
 
-        Only the **axis** leading to ``to_level`` — the root → ``to_level`` chain
+        The exact inverse of :meth:`pack` at the same level.
+
+        Only the **axis** leading to ``at_level`` — the root → ``at_level`` chain
         — is exploded. Sibling branches hanging off that chain stay packed as
         ``List[Struct]`` columns, replicated onto each emitted row. A flat frame
         can only carry one granularity, so exploding a second branch alongside
@@ -1581,7 +1645,7 @@ class HierarchicalPacker:
 
         Args:
             frame: The DataFrame or LazyFrame to unpack.
-            to_level: The target level name to unpack to. Its axis is the chain
+            at_level: The level each row should represent. Its axis is the chain
                 that gets exploded.
 
         Returns:
@@ -1589,11 +1653,14 @@ class HierarchicalPacker:
 
         Raises:
             KeyError: If the level is not found in the hierarchy.
+            TypeError: If the pre-0.8.0 ``to_level`` keyword is passed.
         """
+        _reject_legacy_level_kwarg("unpack", _legacy, at_level)
+
         lf = self._to_lazy(frame)
         schema = lf.collect_schema()
 
-        for name in self.spec.axis_of(to_level):
+        for name in self.spec.axis_of(at_level):
             level = self._levels_meta[self.spec.index_of(name)]
             if level.path not in schema:
                 continue
@@ -1605,13 +1672,14 @@ class HierarchicalPacker:
     def pack_streaming(
         self,
         source: pl.LazyFrame | pl.DataFrame | str | Path,
-        to_level: str,
+        at_level: str = _MISSING_LEVEL,
         *,
         partitions: int = 16,
         tmp_dir: str | Path | None = None,
         defer: bool = True,
         extra_columns: ExtraColumnsMode = "preserve",
         partition_strategy: PartitionStrategy = "balanced",
+        **_legacy: Any,
     ) -> pl.LazyFrame:
         """
         Memory-bounded :meth:`pack` for datasets too large to pack in one shot.
@@ -1640,7 +1708,7 @@ class HierarchicalPacker:
         Args:
             source: Input at the finest granularity. May be a DataFrame, a
                 LazyFrame, or a path/glob to Parquet file(s) (scanned lazily).
-            to_level: The target level name to pack down to.
+            at_level: The level each row of the result should represent.
             partitions: Target number of root-key buckets. More buckets means
                 lower peak memory and more temporary files. Must be >= 1; ``1``
                 skips bucketing entirely. Under ``"balanced"`` this is a target
@@ -1690,6 +1758,8 @@ class HierarchicalPacker:
         if partitions < 1:
             raise ValueError(f"partitions must be >= 1, got {partitions}.")
 
+        _reject_legacy_level_kwarg("pack_streaming", _legacy, at_level)
+
         if partition_strategy not in ("balanced", "hash"):
             raise ValueError(
                 f"Invalid partition_strategy: {partition_strategy!r}. "
@@ -1713,7 +1783,7 @@ class HierarchicalPacker:
         # Expected output schema is needed up-front for pl.defer; collecting a
         # LazyFrame schema is cheap (metadata only, no data movement).
         expected_schema = self.pack(
-            source_lf, to_level, extra_columns=extra_columns
+            source_lf, at_level, extra_columns=extra_columns
         ).collect_schema()
 
         out_dir = (
@@ -1725,7 +1795,7 @@ class HierarchicalPacker:
         sort_output = partition_strategy == "balanced"
 
         def _pack_bucket(bucket_source: pl.LazyFrame, index: int) -> None:
-            packed = self.pack(bucket_source, to_level, extra_columns=extra_columns)
+            packed = self.pack(bucket_source, at_level, extra_columns=extra_columns)
             if sort_output:
                 # Buckets are contiguous ascending key ranges, so sorting within
                 # each one makes the concatenation globally sorted. The bucket is
@@ -1891,9 +1961,10 @@ class HierarchicalPacker:
     def unpack_streaming(
         self,
         source: pl.LazyFrame | pl.DataFrame | str | Path,
-        to_level: str,
+        at_level: str = _MISSING_LEVEL,
         *,
         sink_path: str | Path | None = None,
+        **_legacy: Any,
     ) -> pl.LazyFrame:
         """
         Streaming-friendly :meth:`unpack` returning a :class:`polars.LazyFrame`.
@@ -1907,7 +1978,7 @@ class HierarchicalPacker:
         Args:
             source: Packed input. A DataFrame, LazyFrame, or path/glob to Parquet
                 file(s) (scanned lazily).
-            to_level: The target level name to unpack to.
+            at_level: The level each row of the result should represent.
             sink_path: Optional Parquet path. When given, the unpacked result is
                 streamed to it via ``sink_parquet`` and a fresh scan over that
                 file is returned (true disk-to-disk, nothing materialized).
@@ -1915,11 +1986,13 @@ class HierarchicalPacker:
         Returns:
             A LazyFrame over the unpacked result.
         """
+        _reject_legacy_level_kwarg("unpack_streaming", _legacy, at_level)
+
         source_lf = (
             pl.scan_parquet(source) if isinstance(source, (str, Path)) else self._to_lazy(source)
         )
 
-        unpacked = self.unpack(source_lf, to_level)
+        unpacked = self.unpack(source_lf, at_level)
 
         if sink_path is not None:
             unpacked.sink_parquet(sink_path)
@@ -2084,10 +2157,12 @@ class HierarchicalPacker:
             return dict(zip(names, collected))  # type: ignore[return-value]
         return outputs  # type: ignore[return-value]
 
-    def normalize(self, frame: FrameT, *, root_level: str | None = None) -> dict[str, FrameT]:
+    def normalize(
+        self, frame: FrameT, *, at_level: str | None = None, **_legacy: Any
+    ) -> dict[str, FrameT]:
         """
-        Convenience wrapper that packs to the root level and splits into
-        normalized per-level tables.
+        Convenience wrapper that packs to ``at_level`` and splits into normalized
+        per-level tables.
 
         The emitted tables have :meth:`split_levels`' level-local shape: each
         level's own columns plus its ancestors' key columns as foreign keys, with
@@ -2095,13 +2170,20 @@ class HierarchicalPacker:
 
         Args:
             frame: The DataFrame or LazyFrame to normalize.
-            root_level: Optional root level to pack to (defaults to first level).
+            at_level: Level to pack to first (defaults to the root). Only affects
+                how much work the pack does; the emitted tables are the same
+                either way.
 
         Returns:
             Dictionary mapping level names to their respective normalized tables,
             ordered root → leaf.
+
+        Raises:
+            TypeError: If the pre-0.8.0 ``root_level`` keyword is passed.
         """
-        target = root_level or self._levels_meta[0].name
+        _reject_legacy_level_kwarg("normalize", _legacy)
+
+        target = at_level or self._levels_meta[0].name
         packed = self.pack(frame, target)
         return self.split_levels(packed)
 
@@ -2109,7 +2191,8 @@ class HierarchicalPacker:
         self,
         tables: Mapping[str, pl.LazyFrame | pl.DataFrame],
         *,
-        target_level: str | None = None,
+        at_level: str | None = None,
+        **_legacy: Any,
     ) -> pl.LazyFrame | pl.DataFrame:
         """
         Reconstruct nested columns by progressively attaching child tables to
@@ -2119,35 +2202,39 @@ class HierarchicalPacker:
         This is a true inverse of :meth:`normalize` — for every level ``L``::
 
             packer.denormalize(
-                packer.normalize(df, root_level=L), target_level=L
+                packer.normalize(df, at_level=L), at_level=L
             ) == packer.pack(df, L)
 
-        Child levels are attached leaf → root as list-of-struct columns, the
-        root's own columns are folded into the root struct, and when
-        ``target_level`` is finer than the root the ancestors' attribute columns
-        are joined back on (the upward pass only ever attaches descendants).
+        Child levels are attached leaf → root as list-of-struct columns, and when
+        ``at_level`` is finer than the root the ancestors' attribute columns are
+        joined back on (the upward pass only ever attaches descendants). Like
+        :meth:`pack`, the result has one row per ``at_level`` entity with that
+        level's own columns flat.
 
         Args:
             tables: Mapping of level name to table, as produced by
                 :meth:`normalize` / :meth:`split_levels`.
-            target_level: Optional target level (defaults to root).
+            at_level: The level each row should represent (defaults to root).
 
         Returns:
             Denormalized frame with nested structures. Matches the type of the
-            table supplied for ``target_level``.
+            table supplied for ``at_level``.
 
         Raises:
             HierarchyValidationError: If ``tables`` is empty, the root table is
-                absent, a table needed to reach ``target_level`` is missing, or a
+                absent, a table needed to reach ``at_level`` is missing, or a
                 supplied table lacks its own key columns.
+            TypeError: If the pre-0.8.0 ``target_level`` keyword is passed.
         """
+        _reject_legacy_level_kwarg("denormalize", _legacy)
+
         if not tables:
             raise HierarchyValidationError(
                 "Expected at least one table to denormalize.",
                 details={"tables_provided": 0},
             )
 
-        target_name = target_level or self._levels_meta[0].name
+        target_name = at_level or self._levels_meta[0].name
         target_idx = self.spec.index_of(target_name)
 
         root_name = self._levels_meta[0].name
@@ -2246,8 +2333,12 @@ class HierarchicalPacker:
                 child_struct_frame, on=join_keys, how="left"
             )
 
-        target_name = self._levels_meta[target_idx].name
-        result = prepared_tables.get(target_name)
+        # The target's rows must be at *its own* granularity, so take the form it
+        # had before its own fold: branches attached, own columns still flat. The
+        # root is never folded by the loop, so its ``prepared_tables`` entry is
+        # already in that form.
+        branch_tables.setdefault(root_name, prepared_tables[root_name])
+        result = branch_tables.get(target_name)
         if result is None:
             raise HierarchyValidationError(
                 f"Missing table for level '{target_name}'.",
@@ -2256,38 +2347,23 @@ class HierarchicalPacker:
 
         # The upward pass only ever attaches *descendants*, so a target below the
         # root carries just its own columns plus its ancestors' key columns. Join
-        # the ancestors' attributes back on so the result matches ``pack(flat,
-        # target_level)``: tables from :meth:`split_levels` are normalized and no
-        # longer duplicate coarser attributes into finer tables.
+        # the ancestors' attributes back on so the result matches
+        # ``pack(flat, at_level)``: tables from :meth:`split_levels` are
+        # normalized and no longer duplicate coarser attributes into finer tables.
         if target_idx > 0:
-            # The root is never folded by the loop above, so it is already in its
-            # branches-attached form.
-            branch_tables.setdefault(root_name, prepared_tables[root_name])
             result = self._attach_ancestor_attributes(
-                result, target_idx, source_tables, branch_tables
+                result, target_name, source_tables, branch_tables
             )
 
-        # Alias scaffolding goes first so the root fold below cannot bake it into
-        # the struct.
         added_aliases = alias_map.get(target_name, ())
         if added_aliases:
             result = result.drop(*added_aliases, strict=False)
 
-        if target_idx > 0:
-            # The joins above append ancestor attributes at the end. Restore the
-            # column order ``pack`` produces so the two are equal, not merely
-            # equivalent.
-            result = result.select(self._pack_column_order(result.collect_schema(), target_idx))
+        # The joins above append ancestor attributes at the end, and the upward
+        # pass appends each branch as it is folded. Restore the column order
+        # ``pack`` produces so the two are equal, not merely equivalent.
+        result = result.select(self._pack_column_order(result.collect_schema(), target_name))
 
-        if target_idx == 0:
-            # The upward pass starts at level 1, so the root's own columns are
-            # still flat. ``pack`` folds them into a single struct column — do the
-            # same so ``denormalize`` inverts ``normalize`` exactly. Level 0 has no
-            # ancestor keys, so this is a plain struct build with no group_by.
-            result, _ = self._pack_single_level(result, 0, result.collect_schema(), validate=False)
-
-        # After ``_pack_single_level``: it re-adds ROW_ID_COLUMN via ``_with_row_id``
-        # and leaves it top-level (the root has no group keys), so clean up last.
         result = self._drop_internal_columns(result)
 
         # Match output type to the target table's input type
@@ -2296,24 +2372,31 @@ class HierarchicalPacker:
             return result.collect()
         return result
 
-    def _pack_column_order(self, schema: pl.Schema, target_idx: int) -> list[str]:
+    def _pack_column_order(self, schema: pl.Schema, at_level: str) -> list[str]:
         """
-        Column order that :meth:`pack` produces for ``target_idx`` granularity.
+        Column order that :meth:`pack` produces for ``at_level`` granularity.
 
-        ``pack`` ends each level in a ``group_by(...).agg(...)``, which emits the
-        group keys first, then the carried-through columns, then the nested child
-        struct. Reproducing that lets :meth:`denormalize` return a frame equal to
-        ``pack``'s, not just one with the same contents.
+        The canonical order is a depth-first walk of the tree: each level's own
+        columns, then its children in declaration order. That is the order a flat
+        frame naturally holds, so :meth:`unpack` already produces it, and pinning
+        :meth:`pack` and :meth:`denormalize` to the same walk means all three
+        agree column-for-column at a given granularity.
+
+        It deliberately does *not* mirror ``group_by``'s habit of emitting its
+        keys first. Hoisting them would make a packed frame's layout depend on
+        which level happened to fold last, and would leave ``pack(df, L)`` and
+        ``unpack(nested, L)`` — two routes to one granularity — disagreeing on
+        column order for no reason a caller could predict.
 
         Args:
             schema: Schema of the assembled frame.
-            target_idx: Index of the target level.
+            at_level: The level each row represents.
 
         Returns:
-            Column names in pack order. Any column that does not belong to the
-            hierarchy keeps its relative position at the end.
+            Column names in canonical order. Any column that does not belong to
+            the hierarchy keeps its relative position at the end.
         """
-        target = self._levels_meta[target_idx]
+        target = self._levels_meta[self.spec.index_of(at_level)]
         present = list(schema.names())
         remaining = set(present)
 
@@ -2324,15 +2407,8 @@ class HierarchicalPacker:
                 remaining.discard(col)
                 ordered.append(col)
 
-        # 1. Group keys: every ancestor key, root → parent.
-        for key in target.ancestor_keys:
-            take(key)
-
-        # 2. Carried columns in the order a flat frame holds them: a depth-first
-        #    walk of the tree, each level's own columns followed by its children
-        #    in declaration order. Descending the axis recurses; a child off the
-        #    axis is a packed column and is emitted in place. That reproduces
-        #    ``pack``'s ordering, which just carries the input schema through.
+        # Descending the target's axis recurses; a child off the axis is a packed
+        # column and is emitted in place.
         axis = self.spec.axis_of(target.name)
         axis_position = {name: i for i, name in enumerate(axis)}
 
@@ -2388,14 +2464,14 @@ class HierarchicalPacker:
     def _attach_ancestor_attributes(
         self,
         result: pl.LazyFrame,
-        target_idx: int,
+        at_level: str,
         source_tables: Mapping[str, pl.LazyFrame],
         nested_tables: Mapping[str, pl.LazyFrame],
     ) -> pl.LazyFrame:
         """
         Join each ancestor level's own attributes and off-axis branches onto ``result``.
 
-        ``result`` is at ``target_idx`` granularity and already carries every
+        ``result`` is at ``at_level`` granularity and already carries every
         ancestor *key* column, which is what the joins key on.
 
         Two kinds of column come down. An ancestor's plain **attributes** are
@@ -2408,7 +2484,7 @@ class HierarchicalPacker:
 
         Args:
             result: Frame at the target level's granularity.
-            target_idx: Index of the target level.
+            at_level: The level each row represents.
             source_tables: Per-level tables as provided by the caller.
             nested_tables: Per-level tables after children were folded into
                 their parents.
@@ -2418,10 +2494,9 @@ class HierarchicalPacker:
         """
         result_schema = result.collect_schema()
 
-        target_name = self._levels_meta[target_idx].name
-        axis = set(self.spec.axis_of(target_name))
+        axis = set(self.spec.axis_of(at_level))
 
-        for name in self.spec.ancestors_of(target_name):
+        for name in self.spec.ancestors_of(at_level):
             anc = self._levels_meta[self.spec.index_of(name)]
             anc_lf = source_tables.get(anc.name)
             if anc_lf is None:
@@ -2473,8 +2548,9 @@ class HierarchicalPacker:
         self,
         tables: Mapping[str, pl.LazyFrame | pl.DataFrame],
         *,
-        target_level: str | None = None,
+        at_level: str | None = None,
         join_type: Literal["left", "inner"] = "left",
+        **_legacy: Any,
     ) -> pl.LazyFrame | pl.DataFrame:
         """
         Build nested hierarchy from independent normalized tables.
@@ -2487,14 +2563,16 @@ class HierarchicalPacker:
             tables: Mapping of level_name -> table. Each table should have:
                 - Its own columns (no prefix required)
                 - parent_keys columns for joining to parent level (if not root)
-            target_level: Pack to this level (default: root level).
+            at_level: The level each row of the result should represent
+                (default: root level).
             join_type: How to join child tables to parents ("left" or "inner").
 
         Returns:
-            Nested frame packed to the target level.
+            Nested frame at ``at_level`` granularity.
 
         Raises:
             HierarchyValidationError: If required tables or columns are missing.
+            TypeError: If the pre-0.8.0 ``target_level`` keyword is passed.
 
         Example:
             >>> city_df = pl.DataFrame({"id": ["NYC"], "name": ["New York"]})
@@ -2508,13 +2586,15 @@ class HierarchicalPacker:
             >>> packer = HierarchicalPacker(spec)
             >>> result = packer.build_from_tables({"city": city_df, "street": street_df})
         """
+        _reject_legacy_level_kwarg("build_from_tables", _legacy)
+
         if not tables:
             raise HierarchyValidationError(
                 "Expected at least one table to build from.",
                 details={"tables_provided": 0},
             )
 
-        target_name = target_level or self._levels_meta[0].name
+        target_name = at_level or self._levels_meta[0].name
 
         # Check that we have all required levels
         # The target's own axis must be complete; branches off it are optional and
@@ -3284,8 +3364,9 @@ class HierarchicalPacker:
         from_meta = self._levels_meta[self.spec.index_of(from_level)]
         to_meta = self._levels_meta[self.spec.index_of(to_level)]
 
-        # Pack so from_level becomes a list-of-struct column.
-        packed_lf = self._to_lazy(self.pack(frame, from_level))
+        # Pack to the target granularity, which leaves from_level as a
+        # list-of-struct column on each to_level row.
+        packed_lf = self._to_lazy(self.pack(frame, to_level))
 
         # Validate the attribute exists inside the nested struct.
         self._validate_list_struct_field(
@@ -3633,6 +3714,35 @@ class HierarchicalPacker:
                     extra_cols.append(col)
 
         return extra_cols
+
+    def _fold_order(self, at_level: str) -> list[str]:
+        """
+        The order :meth:`pack` folds ``at_level``'s descendants in.
+
+        A post-order walk: every level appears after its own descendants (so a
+        child is already a ``List[Struct]`` when its parent folds), and siblings
+        follow declaration order. Sibling order is free for correctness — the
+        branches are independent — but it fixes where each branch's column lands,
+        since each fold appends its new column at the end. Declaration order is
+        the one users can predict, and it is what
+        :meth:`_pack_column_order` and :meth:`_pack_single_level` both assume.
+
+        Args:
+            at_level: The level being packed to. It is not itself included.
+
+        Returns:
+            Descendant level names in fold order. Empty for a leaf.
+        """
+        order: list[str] = []
+
+        def visit(name: str) -> None:
+            for child in self.spec.children_of(name):
+                visit(child)
+            order.append(name)
+
+        for child in self.spec.children_of(at_level):
+            visit(child)
+        return order
 
     def _is_at_granularity(self, meta: LevelMetadata, schema: pl.Schema) -> bool:
         """
