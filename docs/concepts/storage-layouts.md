@@ -101,27 +101,46 @@ From `benchmarks/bench_storage.py`, 2M leaf rows, best of 3 (ms):
 
 | Query | nested | flat | view | speedup |
 |---|---|---|---|---|
-| `root_key_filter` | 361.5 | **2.3** | 5.8 | 157.8× |
-| `leaf_projection` | 336.1 | 4.0 | **3.8** | 87.5× |
-| `leaf_filter` | 426.5 | 3.6 | **3.5** | 122.6× |
-| `ancestor_attribute_filter` | 347.4 | **1.8** | 21.7 | 195.7× |
-| `rollup_to_parent` | 526.8 | **17.3** | 27.2 | 30.5× |
-| `existence` | 397.8 | **3.6** | 45.2 | 111.0× |
-| `cross_level_predicate` | 450.6 | 7.0 | **6.6** | 68.6× |
-| `materialize_nested` | 351.4 | **178.0** | 282.9 | 2.0× |
-| `filtered_nested` | 474.5 | **40.7** | 45.6 | 11.7× |
+| `root_key_filter` | 496.9 | **3.5** | 7.6 | 140.5× |
+| `leaf_projection` | 465.2 | 5.4 | **4.6** | 101.1× |
+| `leaf_filter` | 601.7 | **5.5** | 17.2 | 108.9× |
+| `ancestor_attribute_filter` | 430.7 | **2.1** | 35.6 | 201.7× |
+| `rollup_to_parent` | 692.3 | **26.1** | 31.0 | 26.5× |
+| `existence` | 589.0 | **4.6** | 9.3 | 126.9× |
+| `cross_level_predicate` | 568.7 | **8.1** | 57.4 | 70.0× |
+| `materialize_nested` | 474.5 | 387.5 | **299.3** | 1.6× |
+| `filtered_nested` | 595.9 | **38.3** | 55.9 | 15.6× |
 
-Two results deserve comment:
+Three results deserve comment:
 
 - **`materialize_nested`** is the case nesting should win — and it does not.
-  Reading the flat file and packing it (178 ms) beats reading the *already
-  packed* file (351 ms). The pre-packed file has to decode every leaf through
-  repetition/definition levels; the flat file streams nine plain columns and
-  groups them.
-- **`existence` and `ancestor_attribute_filter`** are where the normalized
-  view pays for itself in reverse: answering them needs a semi-join that the
-  flat layout gets for free by having every column on every row. This is the
-  honest cost of normalization.
+  Reading the *already packed* file is the slowest of the three, because it has
+  to decode every leaf through repetition/definition levels, while the other two
+  stream plain columns and group them.
+- **`ancestor_attribute_filter`** is where the normalized view pays for itself in
+  reverse: answering it needs a semi-join that the flat layout gets for free by
+  having every column on every row. This is the honest cost of normalization.
+- **`rollup_to_parent` and `existence`** are where the *idiom* decides the cost,
+  not the layout — see below.
+
+### `level()` or `tables()`?
+
+`level(g)` joins the whole root → `g` axis. The planner prunes ancestors you do
+not read down to their key columns, so that is nearly free — but "nearly free"
+is not "free", and a query that needs no ancestor column at all should not ask
+for the join in the first place. `normalize()` puts every ancestor **key** on
+the child table, so a roll-up keyed on the parent needs nothing else:
+
+```python
+# 31 ms — group the child's own table
+view.tables()["sale"].group_by(view.key_columns("store")).agg(...)
+
+# 76 ms — same answer, but joins region and store first for no reason
+view.level("sale").group_by(view.key_columns("store")).agg(...)
+```
+
+The rule is simple: reach for `level(g)` when the expression mentions an
+ancestor **attribute**, and `tables()[g]` when it only mentions keys.
 
 Run it yourself:
 
@@ -184,22 +203,27 @@ view = HierarchyView.scan_parquet("warehouse/", packer)
 
 hot = view.filter(pl.col("region.store.sale.amount") > 990)
 
-hot.tables()["sale"]     # cheapest: no join, no nesting
-hot.collect("sale")      # flat, joined to leaf granularity
-hot.collect_nested()     # the packed List[Struct] shape
+hot.tables()["sale"]        # cheapest: no join, no nesting
+hot.level("sale")           # a LazyFrame at leaf granularity — plain Polars from here
+hot.nested().collect()      # the packed List[Struct] shape
 ```
 
-### How operations are routed
+### What the view does, and what Polars does
 
-| Operation | What happens underneath |
+The view has two jobs: hand you a frame at the granularity you name, and
+restrict the hierarchy consistently. Everything else is ordinary Polars on the
+frame it returned.
+
+| You write | What happens underneath |
 |---|---|
+| `level(g)` | Joins the root → `g` axis; the planner prunes ancestors you do not read down to their key columns |
+| `level(g).with_columns(...)` | Nothing special — the ancestor columns are already on the frame |
+| `level(child).group_by(view.key_columns(parent)).agg(...)` | A roll-up, at any depth: every level's table carries all of its ancestor keys |
+| `level(parent).join(matching, how="semi")` | Existence, without explode or list construction |
 | `filter` on a leaf attribute | Applied to that level's table |
 | `filter` on an ancestor **key** | Applied to *every* table carrying it — sound transitive pushdown, so the deepest scan skips row groups with no join |
 | `filter` on an ancestor **attribute** | Applied to the ancestor, then propagated by semi-join |
 | `filter` spanning levels | Evaluated at the deepest level, ancestor columns joined in and dropped again |
-| `with_columns` | Lands on the level of its deepest input |
-| `promote` | `group_by` on the child, joined onto the parent — never builds `List[Struct]` |
-| `any_child_satisfies` | A semi-join |
 
 The ancestor-key case is worth understanding, because it is free performance.
 `normalize()` replicates ancestor **keys** into descendant tables as foreign
@@ -217,7 +241,7 @@ answers. `HierarchyView` defaults to matching `pack()`:
 
 ```python
 # 4 regions x 5 stores x 6 sales; the predicate matches in only 7 stores
-view.filter(pl.col("region.store.sale.amount") > 15).collect_nested()
+view.filter(pl.col("region.store.sale.amount") > 15).nested().collect()
 ```
 
 | `empty_parents` | Regions | Stores retained |

@@ -1,27 +1,32 @@
 # HierarchyView API Reference
 
-`HierarchyView` presents a collection of normalized per-level tables *as if*
-they were a single nested frame. It exists because `List[Struct]` is a good
-in-memory shape and a poor storage shape — see
+`HierarchyView` stores a hierarchy as one flat table per level and hands you the
+right frame for whatever granularity you are working at. It exists because
+`List[Struct]` is a good in-memory shape and a poor storage shape — see
 [Storage Layouts](../concepts/storage-layouts.md) for the measurements.
 
-Every operation returns a **new** view; the underlying frames are never
-mutated. Nothing executes until a terminal method is called.
-
-## Classes
-
-### HierarchyView
-
 ```python
-class HierarchyView:
-    def __init__(
-        self,
-        tables: Mapping[str, pl.LazyFrame | pl.DataFrame],
-        packer: HierarchicalPacker,
-        *,
-        empty_parents: EmptyParentMode = "prune",
-    ) -> None: ...
+view = HierarchyView.scan_parquet("warehouse/", packer)
+view.level("sale").filter(pl.col("region.store.sale.amount") > 990)
 ```
+
+[`level()`](#level) joins the root → `sale` axis and returns an ordinary
+`pl.LazyFrame`, so everything after it is plain Polars. There is no expression
+API to learn and no question of which granularity an expression means, because
+a frame has exactly one.
+
+## The surface
+
+The view is deliberately small. Three methods get data out, one restricts the
+hierarchy, the rest is introspection.
+
+| Method | Returns | What it is for |
+|---|---|---|
+| [`.level(at_level=None)`](#level) | `pl.LazyFrame` | Work at one granularity — the main entry point |
+| [`.nested(at_level=None)`](#nested) | `pl.LazyFrame` | The packed `List[Struct]` shape, at the boundary |
+| [`.tables()`](#tables) | `dict[str, pl.LazyFrame]` | The per-level plans, no join at all |
+| [`.filter(*predicates)`](#filter) | `HierarchyView` | Restrict the hierarchy consistently |
+| `.sink_parquet(dest, *, pattern="{level}", **kwargs)` | `None` | Stream one file per level |
 
 Columns are addressed by their full dotted path (`"region.store.sale.amount"`),
 exactly as in a flat/unpacked frame, regardless of which physical table holds
@@ -46,141 +51,145 @@ view = HierarchyView.scan_parquet("warehouse/", packer)
 `scan_parquet` accepts either `region.parquet` or a `region/` directory of
 parts for each level, and forwards `**scan_kwargs` to `pl.scan_parquet`.
 
+## level
+
+```python
+def level(self, at_level: str | None = None) -> pl.LazyFrame: ...
+```
+
+A flat frame with one row per `at_level` entity and every ancestor column in
+scope. `at_level` defaults to the finest level in the view.
+
+```python
+view.level("sale").group_by("region.id").agg(pl.col(AMOUNT).sum())
+view.level("store").select("region.name", "region.store.discount")
+```
+
+### Asking for the whole axis is close to free
+
+`level()` joins every ancestor unconditionally and does not need to be told
+which columns you intend to read, because the query planner prunes what you
+ignore. Selecting only sale columns from `level("sale")` plans as:
+
+```text
+Parquet SCAN [region.parquet]   PROJECT 1/2 COLUMNS      <- key only
+Parquet SCAN [store.parquet]    PROJECT 2/4 COLUMNS      <- keys only
+Parquet SCAN [sale.parquet]     PROJECT 4/5 COLUMNS
+```
+
+An unused ancestor level contributes its key columns and nothing else, and a
+predicate on an ancestor *attribute* is evaluated inside that level's own scan,
+before the join:
+
+```text
+Parquet SCAN [region.parquet]
+PROJECT */2 COLUMNS
+SELECTION: [(col("region.name")) == ("east")]
+```
+
+This is the property the design rests on, so it is asserted in
+`tests/test_view_level_access.py` rather than assumed.
+
+### Branches
+
+Only the levels on `at_level`'s **axis** are joined. Sibling branches are left
+out rather than crossed in — a flat frame has one granularity, and joining two
+branches would pair every street with every service. In a
+[branching hierarchy](../concepts/hierarchical-data.md#multiple-branches-per-level)
+each branch has its own finest level, so `at_level` must be named explicitly.
+
+## nested
+
+```python
+def nested(self, at_level: str | None = None) -> pl.LazyFrame: ...
+```
+
+Reconstructs the packed `List[Struct]` shape. `at_level` names the granularity
+of the rows — it defaults to the root, giving one row per root entity with its
+descendants nested.
+
+```python
+view.nested().collect()          # one row per region
+view.nested("store").collect()   # one row per store
+```
+
+Worth calling only at the boundary where something actually consumes nesting;
+every query above it is cheaper on the flat frames `level()` returns.
+
+## tables
+
+```python
+def tables(self) -> dict[str, pl.LazyFrame]: ...
+```
+
+The per-level plans with cross-level consistency applied, root → leaf. The
+cheapest entry point: no join and no nesting. Use it to edit one level in place
+and rebuild:
+
+```python
+tables = dict(view.tables())
+tables["sale"] = tables["sale"].with_columns(expr)
+view = HierarchyView.from_tables(tables, packer)
+```
+
+## filter
+
+```python
+def filter(self, *predicates: pl.Expr) -> HierarchyView: ...
+```
+
+The one operation that is *not* available on the frame `level()` returns,
+because restricting a normalized hierarchy implies restrictions on the other
+levels: a child whose parent was filtered away is orphaned, and under
+`empty_parents="prune"` a parent left with no children disappears. That is what
+keeps `filter → nested` and `filter → sink_parquet` correct without ever
+materializing parent columns per child row.
+
+| Predicate references | Routing |
+|---|---|
+| One level's columns | Applied to that level's table |
+| An ancestor **key**, row-wise | Applied to *every* table carrying it (sound transitive pushdown; the deepest scan skips row groups with no join) |
+| An ancestor **key**, aggregating | Applied once, at the level that owns the column |
+| An ancestor **attribute** | Applied to the ancestor, propagated by semi-join |
+| Columns across levels | Evaluated at the deepest level, ancestor columns joined in and dropped again |
+
+An aggregate is evaluated at the granularity of the level that owns its columns,
+so `pl.col("region.id").count()` is the number of regions — not the number of
+sales they flatten to. Broadcasting to every carrier is a pushdown shortcut and
+is skipped for such a predicate, since each level holds a replicated key at a
+different granularity.
+
+```python
+view.filter(pl.col("region.store.sale.amount") > 990)
+view.filter(pl.col("region.id") == 3)              # pushed to every level
+view.filter(pl.col("region.id").count() > 10)      # at the region level
+```
+
+Use `level(g).filter(...)` instead when you are asking a question *about* `g`
+rows and want a frame back; use `view.filter(...)` when you want a smaller
+hierarchy back.
+
 ## Introspection
 
 | Member | Returns |
 |---|---|
 | `.levels` | Level names present, root → leaf |
 | `.columns` | Every addressable column, as dotted paths |
-| `.schema` | The **nested** `pl.Schema` the view presents (moves no data) |
 | `.level_of(column)` | The level that owns `column` |
-| `.explain(level=None)` | Query plan for the flat join to `level`, or for the nested reconstruction |
+| `.key_columns(level)` | Ancestor foreign keys then own ids — what to join and group on |
 
-## Operations
+There is no `.schema`: every granularity has a different one. Ask the frame you
+mean, `view.level(g).collect_schema()` or `view.nested().collect_schema()`; both
+read plan metadata only and move no data. Likewise `view.level(g).explain()`
+rather than a view-level `explain`.
 
-All return a new `HierarchyView`.
+## Recipes
 
-### filter
+Everything below is plain Polars on `level()`. The old view methods that did
+these are gone; these are the replacements, and each is covered by a test in
+`tests/test_view_packed_equivalence.py`.
 
-```python
-def filter(self, *predicates: pl.Expr) -> HierarchyView: ...
-```
-
-Routes each predicate to the level(s) that can evaluate it — you never write a
-join.
-
-| Predicate references | Routing |
-|---|---|
-| One level's columns | Applied to that level's table |
-| An ancestor **key**, row-wise | Applied to *every* table carrying it (sound transitive pushdown; the deepest scan skips row groups with no join) |
-| An ancestor **key**, aggregating | **Rejected** — see the note below |
-| An ancestor **attribute** | Applied to the ancestor, propagated by semi-join |
-| Columns across levels | Evaluated at the deepest level, ancestor columns joined in and dropped again |
-
-!!! warning "Aggregating predicates over an ancestor key are refused"
-    Broadcasting is valid only for **row-wise** predicates. Each level holds an
-    ancestor key at a different granularity, so an aggregate over one —
-    `count`, `sum`, `mean`, `quantile`, a window — means something different per
-    level, and intersecting those results is meaningless.
-
-    ```python
-    view.filter(pl.col("region.id").count() > 10)   # ValueError
-    ```
-
-    Apply such a predicate to one level's table via `tables()` instead.
-
-### with_columns
-
-```python
-def with_columns(self, *exprs: pl.Expr, **named_exprs: pl.Expr) -> HierarchyView: ...
-```
-
-Adds or replaces columns, routed by the **output** column's path — a column
-named `"region.store.sale.net"` lands on the `sale` table regardless of which
-levels its inputs came from. Ancestor inputs are joined in and dropped again.
-
-The keyword form spells the destination explicitly and is usually clearer than
-an `.alias()` chain, since the path is the important part:
-
-```python
-view.with_columns(**{
-    "region.store.sale.net": pl.col("region.store.sale.amount") * (1 - pl.col("region.store.discount")),
-})
-```
-
-Computing an *ancestor*-level column from descendant input is refused — that is
-an aggregation, so use [`promote`](#promote):
-
-```python
-view.with_columns(pl.col("region.store.sale.amount").sum().alias("region.total"))
-# ValueError: ... Use promote() to aggregate a child attribute upward.
-```
-
-### select
-
-```python
-def select(self, *columns: str) -> HierarchyView: ...
-```
-
-Keeps only the named columns. Key columns are always retained regardless of
-whether they are listed — without them the levels cannot be joined or nested.
-Projection is what makes per-level Parquet scans cheap, so this is usually the
-better way to express intent than `drop`.
-
-```python
-view.select("region.name", "region.store.sale.amount")
-```
-
-### drop
-
-```python
-def drop(self, *columns: str, strict: bool = True) -> HierarchyView: ...
-```
-
-Drops columns from whichever level carries them. Refuses key columns — they are
-the join structure of the view. A column absent from every level raises;
-pass `strict=False` for best-effort dropping.
-
-### promote
-
-```python
-def promote(
-    self,
-    attribute: str,
-    *,
-    from_level: str,
-    to_level: str,
-    agg: PromoteAggregation = "list",
-    alias: str | None = None,
-) -> HierarchyView: ...
-```
-
-The relational counterpart of
-[`promote_attribute`](packer.md): a `group_by` on the child table joined onto
-the parent. Never builds an intermediate `List[Struct]`. `from_level` must be
-the immediate child of `to_level`.
-
-Aggregations come from `HierarchicalPacker.GROUP_AGGREGATIONS`, the group-by
-counterpart of the list aggregations `promote_attribute` uses, so the two agree
-on null handling (`set` and `single` drop nulls; `count` is 0 — not null — for a
-parent with no surviving children).
-
-### any_child_satisfies
-
-```python
-def any_child_satisfies(
-    self,
-    predicate: pl.Expr,
-    *,
-    at_level: str,
-    child_level: str,
-) -> HierarchyView: ...
-```
-
-Keeps only `at_level` rows having at least one matching descendant — a
-semi-join. `child_level` may skip levels.
-
-## Cross-level references
+### Cross-level expressions
 
 Inside `list.eval` Polars forbids named columns outright:
 
@@ -188,98 +197,102 @@ Inside `list.eval` Polars forbids named columns outright:
 ComputeError: named columns are not allowed in `eval` functions; consider using `element`
 ```
 
-So a leaf value can never be combined with a parent attribute in a packed
-frame — there is no outer scope to reach into. On a view this is an ordinary
-expression, because underneath it is a join:
+So a leaf value can never be combined with a parent attribute in a packed frame
+— there is no outer scope to reach into. On `level()` it is one expression,
+because underneath it is a join:
 
 ```python
-# leaf x parent
-view.with_columns(
-    (pl.col("region.store.sale.amount") * (1 - pl.col("region.store.discount")))
-    .alias("region.store.sale.net")
-)
-
-# leaf x grandparent, and all three levels at once
-view.with_columns(
+view.level("sale").with_columns(
     (
         pl.col("region.store.sale.amount")
-        * (1 - pl.col("region.store.discount"))
-        * (1 + pl.col("region.tax_rate"))
-    ).alias("region.store.sale.final")
+        * (1 - pl.col("region.store.discount"))     # parent
+        * (1 + pl.col("region.tax_rate"))           # grandparent
+    ).alias("final")
 )
 ```
 
-`filter` and `any_child_satisfies` accept cross-level predicates on the same
-terms — the ancestor columns are joined in for the evaluation and dropped
-again, so the target level keeps its own schema.
+### Rolling up to an ancestor
+
+A `group_by` on the ancestor's key columns. `normalize()` replicates *every*
+ancestor id into a level's table, not just the immediate parent's, so this works
+at any depth with no intermediate hop:
 
 ```python
-# 'regions containing a sale that alone owes more than 15 in tax'
-view.any_child_satisfies(
-    pl.col("region.store.sale.amount") * pl.col("region.tax_rate") > 15.0,
-    at_level="region",
-    child_level="sale",
+view.tables()["sale"].group_by(view.key_columns("region")).agg(
+    pl.col("region.store.sale.amount").sum().alias("revenue")
 )
 ```
+
+Note `tables()["sale"]`, not `level("sale")`. The keys are already on the child
+table, so this roll-up needs no join at all — going through `level()` here
+measures ~2.3× slower for the same answer. Use `level(g)` when the expression
+mentions an ancestor *attribute*, `tables()[g]` when it only mentions keys.
 
 ### Referencing a parent aggregate from the child
 
-Two steps, both cheap: roll up with `promote`, then read the result back down.
+Join the roll-up back, or — when the aggregate is over the immediate parent —
+use a window over the parent key, which needs no join at all:
 
 ```python
-view.promote("amount", from_level="sale", to_level="store", agg="sum", alias="revenue")
-    .with_columns(
-        (pl.col("region.store.sale.amount") / pl.col("region.store.revenue"))
-        .alias("region.store.sale.share")
-    )
-```
-
-When the aggregate is over the immediate parent, a window over the parent key
-is cheaper still and needs no join at all — `normalize()` puts the parent key
-on the child table:
-
-```python
-view.with_columns(
-    (pl.col("region.store.sale.amount") / pl.col("region.store.sale.amount").sum().over("region.store.id"))
-    .alias("region.store.sale.share")
+view.level("sale").with_columns(
+    (
+        pl.col("region.store.sale.amount")
+        / pl.col("region.store.sale.amount").sum().over("region.store.id")
+    ).alias("share")
 )
 ```
 
 ### Conditional aggregation
 
-Mask at the leaf, then promote, so non-matching children contribute zero
-instead of disappearing from the hierarchy:
+An ordinary masked aggregate, so non-matching children contribute zero rather
+than disappearing from the parent:
 
 ```python
-view.with_columns(
+view.level("sale").group_by(view.key_columns("store")).agg(
+    pl.col("region.store.sale.amount").sum().alias("revenue"),
     pl.when(pl.col("region.store.sale.qty") >= 3)
     .then(pl.col("region.store.sale.amount"))
     .otherwise(0.0)
-    .alias("region.store.sale.bulk")
-).promote("bulk", from_level="sale", to_level="store", agg="sum", alias="bulk_revenue")
+    .sum()
+    .alias("bulk_revenue"),
+)
 ```
 
-## Terminal methods
+### Existence — "parents with at least one matching child"
 
-| Method | Returns | Cost |
-|---|---|---|
-| `.tables()` | `dict[str, pl.LazyFrame]` | Cheapest — no join, no nesting |
-| `.to_flat(level=None)` | `pl.LazyFrame` | The join you would otherwise write |
-| `.collect(level=None)` | `pl.DataFrame` | `to_flat` executed |
-| `.to_nested()` | `pl.LazyFrame` | Nested reconstruction, lazy |
-| `.collect_nested()` | `pl.DataFrame` | Nested reconstruction, executed |
-| `.sink_parquet(dest, *, pattern="{level}", **kwargs)` | `None` | Streams one file per level |
+A semi-join: no explode, no list construction, and the child scan still gets its
+own predicate pushdown. Unlike `packer.any_child_satisfies` it may skip levels.
 
-`level` defaults to the finest level in the view. In a
-[branching hierarchy](../concepts/hierarchical-data.md#multiple-branches-per-level)
-each branch has its own finest level, so `.to_flat()` / `.collect()` require an
-explicit one; `.to_flat(level)` then joins only that level's axis, leaving
-sibling branches out rather than crossing them in.
+```python
+keys = view.key_columns("region")
+matching = view.level("sale").filter(pl.col(AMOUNT) > 990).select(keys).unique()
+view.level("region").join(matching, on=keys, how="semi")
+```
 
-!!! tip "Prefer `.tables()` where it suffices"
-    Most questions are answered entirely from one level's table. `.to_flat()`
-    and `.collect_nested()` exist for the boundary where something genuinely
-    needs the joined or nested shape.
+This is **not** the same as `view.filter(pl.col(AMOUNT) > 990)`, which also
+restricts the sales themselves and prunes regions left with none.
+
+### Getting a derived column into the nested shape
+
+Two routes. If the column is local to one level, edit that table and rebuild —
+nothing is ever widened to another granularity:
+
+```python
+tables = dict(view.tables())
+tables["sale"] = tables["sale"].with_columns(expr)
+HierarchyView.from_tables(tables, packer).nested().collect()
+```
+
+If it is cross-level, compute it on `level()` and pack the result. Name derived
+columns with their full dotted path, since `pack()` places columns by path — a
+column called `net` is taken to belong above the leaf:
+
+```python
+packer.pack(
+    view.level("sale").with_columns(expr.alias("region.store.sale.net")).collect(),
+    "region",
+)
+```
 
 ## Types
 
@@ -316,6 +329,12 @@ so this costs nothing extra; a chain settles after the first round. Pruning is
 per branch: a city with no surviving streets disappears even if its services
 survived, matching `pack` along the street axis.
 
+Note that `tables()` reflects storage as it is, while `level(g)` is a frame at
+`g` granularity *with ancestor columns on it*. Where referential integrity is
+broken — a sale pointing at a store that is not there — the orphan is a row in
+`tables()["sale"]` and absent from `level("sale")`, because the axis join is an
+inner one.
+
 ## Example
 
 ```python
@@ -330,16 +349,16 @@ spec = HierarchySpec.from_levels(
 packer = HierarchicalPacker(spec)
 view = HierarchyView.scan_parquet("warehouse/", packer)
 
-report = (
-    view.filter(pl.col("region.store.sale.amount") > 990)
-    .promote("amount", from_level="sale", to_level="store", agg="sum", alias="hot_total")
-    .any_child_satisfies(
-        pl.col("region.store.sale.qty") > 10, at_level="region", child_level="sale"
-    )
-)
+# Restrict the hierarchy once; the levels stay normalized.
+hot = view.filter(pl.col("region.store.sale.amount") > 990)
 
-report.tables()["store"].collect()   # no join, no nesting
-report.collect_nested()              # packed List[Struct], only if needed
+# Then it is polars, at whatever granularity the question is about.
+hot.level("sale").group_by(view.key_columns("store")).agg(
+    pl.col("region.store.sale.amount").sum().alias("total")
+).collect()
+
+hot.tables()["store"].collect()   # no join, no nesting
+hot.nested().collect()            # packed List[Struct], only if needed
 ```
 
 ## See also

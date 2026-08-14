@@ -869,12 +869,18 @@ def demonstrate_multiple_branches():
     print(f"  pack(unpack(nested, 'building'), 'country') == nested: {repacked.equals(nested)}")
     print("  (packing to 'country' gives one row per country, its own columns flat)")
 
-    print_subsection("A view routes queries to the right branch")
+    print_subsection("A view gives you a frame per branch")
     view = HierarchyView.from_tables(tables, packer)
-    rich = view.promote(
-        "budget", from_level="service", to_level="city", agg="sum", alias="total_budget"
+    print("level('service') carries the service axis only:")
+    print(f"  {view.level('service').collect_schema().names()}")
+
+    print("\nRolling a branch onto the shared ancestor is a group_by on its keys:")
+    totals = (
+        view.level("service")
+        .group_by(view.key_columns("city"))
+        .agg(pl.col("country.city.service.budget").sum().alias("total_budget"))
     )
-    print(rich.tables()["city"].collect())
+    print(totals.collect().sort("country.city.id"))
 
     # Filtering one branch cascades through the shared ancestor into the other.
     funded = view.filter(pl.col("country.city.service.budget") >= 300)

@@ -112,12 +112,12 @@ Query normalized per-level storage through a nested interface.
 
 | Feature | Description |
 |---------|-------------|
-| **Nested interface, flat storage** | Address columns by dotted path; the view routes to the owning table |
+| **A frame per granularity** | `view.level("sale")` returns a `LazyFrame`; everything after it is plain Polars |
 | **Cross-level expressions** | Combine leaf, parent and grandparent columns in one expression — impossible inside `list.eval` |
-| **No hand-written joins** | Cross-level operations join automatically, only when needed |
+| **No hand-written joins** | `level()` joins the axis, and the planner prunes what you do not read |
 | **Transitive key pushdown** | Ancestor-key predicates reach the deepest scan with no join |
-| **Deferred consistency** | Filtering one level restricts the others, applied once at materialization |
-| **Nest only at the boundary** | `collect_nested()` when a consumer genuinely needs `List[Struct]` |
+| **Deferred consistency** | `filter` restricts the whole hierarchy, applied once at materialization |
+| **Nest only at the boundary** | `nested()` when a consumer genuinely needs `List[Struct]` |
 
 ## Core Concepts
 
@@ -174,7 +174,7 @@ packer.unpack(nested, "service")    # service axis; `country.city.street` stays 
 ```
 
 Nothing is dropped and nothing is cross-joined, so re-packing either frame
-reproduces the original. `HierarchyView` follows the same rule: `to_flat(level)`
+reproduces the original. `HierarchyView` follows the same rule: `level(g)`
 joins one axis, and a filter on one branch cascades to the other through their
 shared ancestor. See
 [Hierarchical Data](https://heshamdar.github.io/polars-nexpresso/concepts/hierarchical-data/#multiple-branches-per-level).
@@ -398,9 +398,9 @@ HierarchyView.from_frame(flat_df, packer).sink_parquet("warehouse/")
 view = HierarchyView.scan_parquet("warehouse/", packer)
 
 hot = view.filter(pl.col("region.store.sale.amount") > 990)
-hot.tables()["sale"]     # cheapest: no join, no nesting
-hot.collect("sale")      # flat, joined to leaf granularity
-hot.collect_nested()     # the packed List[Struct] shape
+hot.tables()["sale"]        # cheapest: no join, no nesting
+hot.level("sale")           # a LazyFrame at leaf granularity — plain Polars from here
+hot.nested().collect()      # the packed List[Struct] shape
 ```
 
 It also unlocks something `list.eval` cannot express at all — Polars rejects
@@ -408,12 +408,12 @@ named columns inside an eval context, so a leaf value can never be combined with
 a parent attribute in a packed frame. On a view it is just an expression:
 
 ```python
-view.with_columns(
+view.level("sale").with_columns(
     (
         pl.col("region.store.sale.amount")
         * (1 - pl.col("region.store.discount"))   # parent
         * (1 + pl.col("region.tax_rate"))         # grandparent
-    ).alias("region.store.sale.final")
+    ).alias("final")
 )
 ```
 
