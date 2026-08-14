@@ -77,25 +77,30 @@ class TestEndToEndWorkflows:
         nested = packer.build_from_tables({"region": regions, "store": stores, "product": products})
 
         assert nested.height == 2  # 2 regions
-        assert "region" in nested.columns
+        # Rows are region entities, so the region's own columns are flat and only
+        # its descendants are nested.
+        assert "region.store" in nested.columns
+        assert sorted(nested["region.id"].to_list()) == ["east", "west"]
 
         # Step 3: Transform nested data with calculations
         # with_fields mode: only specify fields to add/modify - existing fields preserved
         fields = {
-            "region": {
-                "store": {
-                    "product": {
-                        "revenue": pl.field("price") * pl.field("units_sold"),
-                        "profit": (pl.field("price") - pl.field("cost")) * pl.field("units_sold"),
-                        "margin_pct": (
-                            (pl.field("price") - pl.field("cost")) / pl.field("price") * 100
-                        ).round(1),
-                    },
+            "region.store": {
+                "product": {
+                    "revenue": pl.field("price") * pl.field("units_sold"),
+                    "profit": (pl.field("price") - pl.field("cost")) * pl.field("units_sold"),
+                    "margin_pct": (
+                        (pl.field("price") - pl.field("cost")) / pl.field("price") * 100
+                    ).round(1),
                 },
             }
         }
 
-        result = apply_nested_operations(nested, fields, struct_mode="with_fields")
+        # use_with_columns keeps the region's own flat columns, which a bare
+        # select would drop now that they sit beside the nested store column.
+        result = apply_nested_operations(
+            nested, fields, struct_mode="with_fields", use_with_columns=True
+        )
 
         # Step 4: Verify calculations by unpacking
         flat = packer.unpack(result, "product")
@@ -328,18 +333,18 @@ class TestExpressionBuilderIntegration:
         packed = packer.pack(df, "category")
 
         # Generate expressions for transformation
+        # Packing to "category" leaves the category's own columns flat and nests
+        # only its products, so each field is addressed by its full path.
         exprs = generate_nested_exprs(
             {
-                "category": {
-                    "id": None,
-                    "name": lambda x: x.str.to_uppercase(),
-                    "product": {
-                        "sku": None,
-                        "name": None,
-                        "price": None,
-                        "price_with_tax": pl.field("price") * 1.08,
-                    },
-                }
+                "category.id": None,
+                "category.name": lambda x: x.str.to_uppercase(),
+                "category.product": {
+                    "sku": None,
+                    "name": None,
+                    "price": None,
+                    "price_with_tax": pl.field("price") * 1.08,
+                },
             },
             packed.schema,
             struct_mode="with_fields",
@@ -348,9 +353,8 @@ class TestExpressionBuilderIntegration:
         result = packed.select(exprs)
 
         # Verify
-        category = result["category"][0]
-        assert category["name"] == "ELECTRONICS"
-        products = category["product"]
+        assert result["category.name"][0] == "ELECTRONICS"
+        products = result["category.product"][0]
         assert products[0]["price_with_tax"] == 1080.0
 
     def test_multiple_transformations_same_data(self) -> None:

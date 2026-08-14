@@ -56,6 +56,14 @@ The benefit of a nested structure is that multiple granularities can be represen
 
 ## Key Operations
 
+The level argument always names **the granularity of the resulting rows**, in
+both directions. `pack` and `unpack` are exact inverses at the same level:
+
+```python
+packer.pack(flat_df, "city")       # one row per city
+packer.unpack(nested_df, "city")   # one row per city
+```
+
 ### Pack - Aggregate to Coarser Granularity
 
 ```python
@@ -63,11 +71,17 @@ The benefit of a nested structure is that multiple granularities can be represen
 country_level = packer.pack(flat_df, "country")
 ```
 
-Packing:
+Packing folds every level *below* the target into nested `List[Struct]` columns
+and leaves the target's own columns flat:
 
-1. Groups rows by parent keys
+1. Groups rows by the target's keys
 2. Collects child records into lists
 3. Creates nested struct columns
+
+So `pack(df, "country")` gives `country.code`, `country.name` and a nested
+`country.city` — one row per country, with the country's own fields as ordinary
+columns. Packing to a leaf folds nothing, because a leaf-granularity frame is
+already flat.
 
 ### Unpack - Explode to Finer Granularity
 
@@ -302,7 +316,7 @@ rebuilt = packer.denormalize(tables)
 `denormalize` is a true inverse of `normalize` — for any level `L`:
 
 ```python
-packer.denormalize(packer.normalize(df, root_level=L), target_level=L) == packer.pack(df, L)
+packer.denormalize(packer.normalize(df, at_level=L), at_level=L) == packer.pack(df, L)
 ```
 
 ### The shape of the per-level tables

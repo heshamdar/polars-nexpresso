@@ -55,7 +55,7 @@ def _children_ignoring_order(frame, root: str = "country", child: str = "city") 
     """
     df = frame.collect() if isinstance(frame, pl.LazyFrame) else frame
     return sorted(
-        (row[root]["id"], sorted(c["id"] for c in (row[root][child] or [])))
+        (row[f"{root}.id"], sorted(c["id"] for c in (row[f"{root}.{child}"] or [])))
         for row in df.to_dicts()
     )
 
@@ -118,8 +118,9 @@ def test_pack_recovers_null_parent_attribute_regardless_of_order():
     )
 
     def names(df):
-        inner = df.unnest("country").sort("id")
-        return dict(zip(inner["id"], inner["name"]))
+        # The root's columns are flat at root granularity, so read them directly.
+        inner = df.sort("country.id")
+        return dict(zip(inner["country.id"], inner["country.name"]))
 
     packed = packer.pack(flat, "country")
     shuffled = packer.pack(flat.sample(fraction=1.0, shuffle=True, seed=3), "country")
@@ -131,8 +132,8 @@ def test_preserve_child_order_keeps_child_list_order(packer, flat_df):
     """With preserve_child_order=True (default), child lists follow original order."""
     packed = packer.pack(flat_df, "country")
     by_city = {}
-    for country in packed["country"].to_list():
-        for city in country["city"]:
+    for cities in packed["country.city"].to_list():
+        for city in cities:
             by_city[city["id"]] = [s["id"] for s in city["street"]]
     # city1 has 3 streets inserted as s1_0, s1_1, s1_2 in original order
     assert by_city["city1"] == ["s1_0", "s1_1", "s1_2"]
@@ -159,7 +160,7 @@ def test_order_by_sorts_child_list_inside_agg():
         }
     )
     packed = packer.pack(flat, "country")
-    cities = [c["id"] for c in packed["country"][0]["city"]]
+    cities = [c["id"] for c in packed["country.city"][0]]
     assert cities == ["a", "b", "c"]
 
 
@@ -254,7 +255,7 @@ def test_balanced_output_is_sorted_by_root_key(packer, skewed_df):
         skewed_df, "country", partitions=8, partition_strategy="balanced"
     ).collect()
 
-    ids = out["country"].struct.field("id").to_list()
+    ids = out["country.id"].to_list()
     assert ids == sorted(ids)
     assert _same(out, packer.pack(skewed_df, "country"))
 
@@ -309,7 +310,7 @@ def test_balanced_sorted_with_many_buckets(packer, skewed_df, tmp_path):
     n_parts = len(list(tmp_path.glob("part_*.parquet")))
     assert n_parts >= 10, f"need >= 10 buckets to exercise the ordering, got {n_parts}"
 
-    ids = out["country"].struct.field("id").to_list()
+    ids = out["country.id"].to_list()
     assert ids == sorted(ids)
     assert _same(out, packer.pack(skewed_df, "country"))
 
@@ -480,7 +481,7 @@ def test_pack_streaming_eager_returns_a_real_scan(packer, flat_df, tmp_path):
     assert "PYTHON SCAN" not in plan
     assert "SCAN" in plan
 
-    pushed = out.filter(pl.col("country").struct.field("id") == "C0").explain(optimized=True)
+    pushed = out.filter(pl.col("country.id") == "C0").explain(optimized=True)
     assert "SELECTION" in pushed or "FILTER" in pushed
 
 
@@ -490,7 +491,7 @@ def test_pack_streaming_keeps_entities_whole(packer, flat_df, strategy):
     out = packer.pack_streaming(
         flat_df, "country", partitions=32, partition_strategy=strategy
     ).collect()
-    codes = out["country"].struct.field("id").to_list()
+    codes = out["country.id"].to_list()
     assert sorted(codes) == sorted(set(codes))
     assert len(codes) == packer.pack(flat_df, "country").height
 
@@ -657,7 +658,7 @@ def test_pack_streaming_honours_order_by(tmp_path):
 
     out = p.pack_streaming(df, "country", partitions=2, tmp_dir=tmp_path, defer=False).collect()
 
-    assert [c["id"] for c in out["country"][0]["city"]] == ["a", "b", "c"]
+    assert [c["id"] for c in out["country.city"][0]] == ["a", "b", "c"]
 
 
 @pytest.mark.parametrize("strategy", ["balanced", "hash"])

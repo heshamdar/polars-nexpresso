@@ -112,7 +112,7 @@ def demonstrate_the_problem(flat: pl.DataFrame, packer: HierarchicalPacker) -> N
 
     nested = packer.pack(flat, "region")
     print("\nPacked shape — sale.amount is buried two lists deep:")
-    print(f"  {nested.schema['region']}")
+    print(f"  region.store: {nested.schema['region.store']}")
 
     print("\nGoal: net = sale.amount * (1 - store.discount)")
     print("      i.e. a LEAF value combined with its PARENT's attribute.\n")
@@ -120,14 +120,12 @@ def demonstrate_the_problem(flat: pl.DataFrame, packer: HierarchicalPacker) -> N
     print("Attempt: reference the parent field from inside list.eval")
     try:
         nested.select(
-            pl.col("region")
-            .struct.field("store")
-            .list.eval(
+            pl.col("region.store").list.eval(
                 pl.element()
                 .struct.field("sale")
                 .list.eval(
                     pl.element().struct.field("amount")
-                    * pl.col("region").struct.field("store").struct.field("discount")
+                    * pl.col("region.store").struct.field("discount")
                 )
             )
         )
@@ -158,7 +156,7 @@ def build_view(flat: pl.DataFrame, packer: HierarchicalPacker, warehouse: Path) 
     print(f"\n{view!r}")
     print("\nEach level is a real top-level Parquet table — its own row groups,")
     print("statistics and sort order — but the view still presents a nested schema:")
-    print(f"  {view.schema['region']}")
+    print(f"  region.store: {view.schema['region.store']}")
     return view
 
 
@@ -345,7 +343,7 @@ def demonstrate_full_pipeline(view: HierarchyView) -> None:
     print("\nAnd the packed List[Struct] shape, built only because we asked:")
     nested = pipeline.collect_nested()
     print(f"  {nested.height} region row(s)")
-    print(f"  {nested.schema['region']}")
+    print(f"  region.store: {nested.schema['region.store']}")
     print("\nThat last step is the only place nesting is materialized. Everything")
     print("above it ran against flat Parquet tables with full predicate pushdown.")
 

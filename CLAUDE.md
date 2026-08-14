@@ -2,8 +2,8 @@
 
 This document provides comprehensive guidance for AI assistants working with the polars-nexpresso codebase. It covers architecture, conventions, workflows, and best practices.
 
-**Last Updated:** 2026-08-07
-**Version:** 0.4.0
+**Last Updated:** 2026-08-14
+**Version:** 0.8.0
 
 ---
 
@@ -135,17 +135,38 @@ spec = HierarchySpec.from_levels(
 - Immutable dataclasses with validation in `__post_init__`
 - Composable and reusable
 
-#### 3. Type-Generic Operations
+#### 3. Level Arguments Name Row Granularity
+
+Every operation that takes a level name means **the granularity of the rows it
+produces or expects** — never "the level that gets nested":
+
+```python
+packer.pack(flat, "city")       # one row per city, streets and below nested
+packer.unpack(nested, "city")   # one row per city — the exact inverse
+packer.infer_current_level(packer.pack(df, level)) == level
+```
+
+The root is no lower bound on this: `pack(df, root)` gives one row per root
+entity with the root's own columns **flat** beside the nested child column.
+There is no "everything in one struct column" form.
+
+This holds for `pack`, `unpack`, `pack_streaming`, `unpack_streaming`,
+`normalize(at_level=)`, `denormalize(at_level=)`,
+`build_from_tables(at_level=)`, `enrich(at_level=)`, `HierarchyView.to_flat`,
+and the `to_level=` of `promote_attribute` / `any_child_satisfies` /
+`attribute_expr`.
+
+#### 4. Type-Generic Operations
 **`FrameT` TypeVar** supports both DataFrame and LazyFrame:
 ```python
 FrameT = TypeVar("FrameT", pl.LazyFrame, pl.DataFrame)
 
-def pack(self, frame: FrameT, to_level: str) -> FrameT:
+def pack(self, frame: FrameT, at_level: str) -> FrameT:
     # DataFrame in = DataFrame out
     # LazyFrame in = LazyFrame out
 ```
 
-#### 4. Metadata Caching
+#### 5. Metadata Caching
 **`HierarchicalPacker`** pre-computes metadata in `__init__`:
 - `_levels_meta`: Cached level metadata
 - `_computed_exprs`: Pre-built expressions
@@ -341,7 +362,7 @@ ExtraColumnsMode = Literal["preserve", "drop", "error"]
 **Generic return types:**
 
 ```python
-def pack(self, frame: FrameT, to_level: str) -> FrameT:
+def pack(self, frame: FrameT, at_level: str) -> FrameT:
     """Returns same type as input (DataFrame or LazyFrame)."""
 ```
 
@@ -714,8 +735,8 @@ Before creating a release:
 **Always preserve input frame type:**
 
 ```python
-def pack(self, frame: FrameT, to_level: str) -> FrameT:
-    """Pack to coarser granularity, preserving frame type."""
+def pack(self, frame: FrameT, at_level: str) -> FrameT:
+    """Pack so each row is one at_level entity, preserving frame type."""
     # Convert to lazy for operations
     lazy = self._to_lazy(frame)
 
@@ -1190,10 +1211,11 @@ spec = HierarchySpec.from_levels(
 )
 packer = HierarchicalPacker(spec)
 
-# Pack to coarser level
+# The level argument names the granularity you want, in both directions:
+# one row per region, with its stores nested.
 region_level = packer.pack(store_level, "region")
 
-# Unpack to finer level
+# ...and back: one row per store.
 store_level = packer.unpack(region_level, "store")
 
 # Build from tables

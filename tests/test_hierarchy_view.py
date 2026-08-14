@@ -335,7 +335,7 @@ class TestEmptyParentSemantics:
     ):
         got = view.filter(self.RARE).collect_nested()
         want = packer.pack(flat.filter(self.RARE), "region")
-        assert_frame_equal(got.sort("region"), want.sort("region"), check_dtypes=False)
+        assert_frame_equal(got.sort("region.id"), want.sort("region.id"), check_dtypes=False)
 
     def test_prune_is_the_default(self, view: HierarchyView):
         assert "prune" in repr(view)
@@ -349,7 +349,7 @@ class TestEmptyParentSemantics:
         pruned = HierarchyView.from_frame(flat, packer).filter(self.RARE).collect_nested()
 
         def total_stores(frame: pl.DataFrame) -> int:
-            return frame.select(pl.col("region").struct.field("store").list.len().sum()).item()
+            return frame.select(pl.col("region.store").list.len().sum()).item()
 
         assert total_stores(kept) == N_REGION * N_STORE
         assert total_stores(pruned) < total_stores(kept)
@@ -368,16 +368,16 @@ class TestNestedRoundTrip:
 
     def test_unfiltered(self, view: HierarchyView, flat: pl.DataFrame, packer: HierarchicalPacker):
         assert_frame_equal(
-            view.collect_nested().sort("region"),
-            packer.pack(flat, "region").sort("region"),
+            view.collect_nested().sort("region.id"),
+            packer.pack(flat, "region").sort("region.id"),
             check_dtypes=False,
         )
 
     def test_filtered(self, view: HierarchyView, flat: pl.DataFrame, packer: HierarchicalPacker):
         predicate = pl.col(AMOUNT) > 12
         assert_frame_equal(
-            view.filter(predicate).collect_nested().sort("region"),
-            packer.pack(flat.filter(predicate), "region").sort("region"),
+            view.filter(predicate).collect_nested().sort("region.id"),
+            packer.pack(flat.filter(predicate), "region").sort("region.id"),
             check_dtypes=False,
         )
 
@@ -576,7 +576,7 @@ class TestAliasRouting:
 
     def test_nested_schema_stays_well_formed(self, view: HierarchyView):
         widened = view.with_columns(pl.col("region.store.name").alias("region.store.sale.origin"))
-        store_inner = widened.schema["region"].to_schema()["store"].inner.to_schema()
+        store_inner = widened.schema["region.store"].inner.to_schema()
         assert "sale.origin" not in store_inner
         sale_inner = store_inner["sale"].inner.to_schema()
         assert "origin" in sale_inner
@@ -682,9 +682,7 @@ class TestSelect:
     def test_still_nests(self, view: HierarchyView, packer: HierarchicalPacker):
         nested = view.select("region.name", AMOUNT).collect_nested()
         assert nested.height == N_REGION
-        sale_inner = (
-            nested.schema["region"].to_schema()["store"].inner.to_schema()["sale"].inner.to_schema()
-        )
+        sale_inner = nested.schema["region.store"].inner.to_schema()["sale"].inner.to_schema()
         assert "amount" in sale_inner and "name" not in sale_inner
 
     def test_unknown_column_raises(self, view: HierarchyView):

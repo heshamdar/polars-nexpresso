@@ -39,7 +39,7 @@ def _bucket_expr(root_keys: list[str], partitions: int) -> pl.Expr:
 def pack_filter_rescan(
     packer: HierarchicalPacker,
     source: FrameOrLazy,
-    to_level: str,
+    at_level: str,
     *,
     partitions: int,
     tmp_dir: str | Path,
@@ -56,7 +56,7 @@ def pack_filter_rescan(
     bucket = _bucket_expr(_root_keys(packer), partitions)
 
     for i in range(partitions):
-        part = packer.pack(lazy.filter(bucket == i), to_level)
+        part = packer.pack(lazy.filter(bucket == i), at_level)
         part.sink_parquet(out / f"part_{i:05d}.parquet")
 
     return pl.scan_parquet(str(out / "part_*.parquet"))
@@ -65,7 +65,7 @@ def pack_filter_rescan(
 def pack_single_pass(
     packer: HierarchicalPacker,
     source: FrameOrLazy,
-    to_level: str,
+    at_level: str,
     *,
     partitions: int,
     tmp_dir: str | Path,
@@ -91,7 +91,7 @@ def pack_single_pass(
     for bucket_path in sorted(buckets_dir.glob("__bucket=*")):
         suffix = bucket_path.name.split("=", 1)[1]
         bucket_lf = pl.scan_parquet(str(bucket_path / "*.parquet"))
-        packer.pack(bucket_lf, to_level).sink_parquet(parts_dir / f"part_{suffix}.parquet")
+        packer.pack(bucket_lf, at_level).sink_parquet(parts_dir / f"part_{suffix}.parquet")
 
     return pl.scan_parquet(str(parts_dir / "part_*.parquet"))
 
@@ -99,7 +99,7 @@ def pack_single_pass(
 def pack_split_join(
     packer: HierarchicalPacker,
     source: FrameOrLazy,
-    to_level: str,
+    at_level: str,
 ) -> pl.LazyFrame:
     """
     Split-and-join pack: reattach the root level's heavy attributes via a join
@@ -109,7 +109,7 @@ def pack_split_join(
     (``pack(..., parent_strategy="split_join")``) so the benchmark measures the
     real code path. See :meth:`HierarchicalPacker.pack`.
     """
-    return _to_lazy(packer.pack(_to_lazy(source), to_level, parent_strategy="split_join"))
+    return _to_lazy(packer.pack(_to_lazy(source), at_level, parent_strategy="split_join"))
 
 
 def _canonical_rows(frame: FrameOrLazy) -> list[str]:
@@ -119,7 +119,7 @@ def _canonical_rows(frame: FrameOrLazy) -> list[str]:
 
 
 def assert_strategies_match_pack(
-    packer: HierarchicalPacker, source: FrameOrLazy, to_level: str
+    packer: HierarchicalPacker, source: FrameOrLazy, at_level: str
 ) -> None:
     """
     Assert every experimental strategy reproduces ``pack``'s contents.
@@ -128,15 +128,15 @@ def assert_strategies_match_pack(
     not significant). Raises ``AssertionError`` on the first mismatch.
     """
     lazy = _to_lazy(source)
-    expected = _canonical_rows(packer.pack(lazy, to_level))
+    expected = _canonical_rows(packer.pack(lazy, at_level))
 
     with tempfile.TemporaryDirectory() as d1, tempfile.TemporaryDirectory() as d2:
         variants = {
             "pack_filter_rescan": pack_filter_rescan(
-                packer, lazy, to_level, partitions=4, tmp_dir=d1
+                packer, lazy, at_level, partitions=4, tmp_dir=d1
             ),
-            "pack_single_pass": pack_single_pass(packer, lazy, to_level, partitions=4, tmp_dir=d2),
-            "pack_split_join": pack_split_join(packer, lazy, to_level),
+            "pack_single_pass": pack_single_pass(packer, lazy, at_level, partitions=4, tmp_dir=d2),
+            "pack_split_join": pack_split_join(packer, lazy, at_level),
         }
         for name, variant in variants.items():
             if _canonical_rows(variant) != expected:

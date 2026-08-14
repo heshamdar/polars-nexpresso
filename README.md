@@ -75,8 +75,9 @@ nested = packer.build_from_tables({
     "store": stores_df,
 })
 
-# Navigate between granularities
-flat = packer.unpack(nested, "store")      # Explode to store level
+# Navigate between granularities. The level names the granularity you want,
+# for both directions: one row per store, then one row per region.
+flat = packer.unpack(nested, "store")       # Explode to store level
 packed = packer.pack(flat, "region")        # Aggregate back to region level
 ```
 
@@ -337,14 +338,17 @@ Apply nested operations directly to a DataFrame.
 Main class for hierarchical operations.
 
 **Key Methods:**
-- `pack(frame, to_level, *, extra_columns="preserve", parent_strategy="aggregate")` - Pack to coarser granularity (`parent_strategy="split_join"` reattaches heavy root attributes via a join)
-- `pack_streaming(source, to_level, *, partitions=16, partition_strategy="balanced", ...)` -
+- `pack(frame, at_level, *, extra_columns="preserve", parent_strategy="aggregate")` - Pack so
+  each row is one `at_level` entity, nesting everything below it (`parent_strategy="split_join"`
+  reattaches heavy root attributes via a join)
+- `pack_streaming(source, at_level, *, partitions=16, partition_strategy="balanced", ...)` -
   Memory-bounded pack for large data (`"balanced"` buckets by row count and returns
   root-key-sorted output; `"hash"` is one pass cheaper but balances entities, not rows)
-- `unpack(frame, to_level)` - Unpack to finer granularity
+- `unpack(frame, at_level)` - Unpack so each row is one `at_level` entity — the exact
+  inverse of `pack` at the same level
 - `normalize(frame)` - Split into per-level tables
 - `denormalize(tables)` - Reconstruct from per-level tables; a true inverse of
-  `normalize`, so `denormalize(normalize(df, root_level=L), target_level=L) == pack(df, L)`
+  `normalize`, so `denormalize(normalize(df, at_level=L), at_level=L) == pack(df, L)`
 - `build_from_tables(tables)` - Build hierarchy from normalized tables
 - `validate(frame)` - Check data integrity
 

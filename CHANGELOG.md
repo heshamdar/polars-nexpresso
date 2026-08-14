@@ -7,6 +7,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-14
+
+### Changed (breaking)
+
+- **A level argument now always names the granularity of the resulting rows.**
+  `unpack(df, "city")` returned city rows, but `pack(df, "city")` returned
+  *country* rows — it named the level that got **nested**, landing one level
+  coarser. The two disagreed about the same word, `unpack(pack(df, L), L)` was
+  not a round trip, and `infer_current_level` had to document that it "reports
+  row granularity, which is one level coarser than the argument to `pack`".
+
+  `pack` now folds only the levels *strictly below* its target:
+
+  ```python
+  packer.pack(flat, "building")   # leaf rows    — nothing nested
+  packer.pack(flat, "street")     # street rows  — …street.building nested
+  packer.pack(flat, "city")       # city rows    — the same frame unpack("city") gives
+  packer.pack(flat, "country")    # country rows — country.code flat, country.city nested
+  ```
+
+  which makes this hold for every level, including the leaf:
+
+  ```python
+  packer.infer_current_level(packer.pack(df, L)) == L
+  packer.pack(df, L).equals(packer.unpack(nested, L))
+  ```
+
+  `pack` was the only outlier. `promote_attribute`, `any_child_satisfies`,
+  `all_children_satisfy`, `attribute_expr`, `enrich`, `validate_schema`,
+  `HierarchyView.promote` / `any_child_satisfies` / `to_flat`, and
+  `infer_current_level`'s return value already meant row granularity and are
+  unchanged.
+
+  **Migration.** Shift the level by one, towards the root:
+
+  | Before | After |
+  |---|---|
+  | `pack(df, X)` for non-root `X` | `pack(df, parent_of(X))` |
+  | `pack(df, root)` | `pack(df, root)` — same rows, new shape (see below) |
+  | `pack_streaming(src, X)` | `pack_streaming(src, parent_of(X))` |
+  | `normalize(df, root_level=X)` | `normalize(df, at_level=parent_of(X))` |
+  | `denormalize(t, target_level=X)` | `denormalize(t, at_level=parent_of(X))` |
+  | `build_from_tables(t, target_level=X)` | `build_from_tables(t, at_level=parent_of(X))` |
+
+- **The root is no longer folded into a single struct column.** Previously
+  `pack(df, root)` wrapped the whole hierarchy in one `country` `Struct`; now
+  the root's own fields are ordinary columns beside the nested child column.
+  This is a change of *shape*, not of granularity — both give one row per root
+  entity with the same information:
+
+  ```text
+  before:  country          Struct{code, name, city: List[…]}
+  after:   country.code     String
+           country.name     String
+           country.city     List[Struct{…}]
+  ```
+
+  Everything that landed at root granularity is affected, including
+  `denormalize(tables)`, `HierarchyView.to_nested()` and `collect_nested()`.
+  Field access moves from `df["country"][0]["city"]` to `df["country.city"][0]`,
+  and a nested-expression spec keyed on `{"country": {"city": …}}` becomes
+  `{"country.city": …}` (with `use_with_columns=True`, since a bare `select`
+  would now drop the root's sibling columns). If you need the old wrapper:
+
+  ```python
+  prefix = "country."
+  df.select(
+      pl.struct([pl.col(c).alias(c[len(prefix):]) for c in df.columns]).alias("country")
+  )
+  ```
+
+- **Level parameters renamed to `at_level`**, on `pack`, `unpack`,
+  `pack_streaming`, `unpack_streaming`, `normalize` (was `root_level`),
+  `denormalize` and `build_from_tables` (was `target_level`), and
+  `HierarchyView.from_frame` (was `root_level`). Passing an old keyword raises a
+  `TypeError` naming the replacement *and* the shifted meaning, so a keyword
+  caller cannot silently get a frame at the wrong granularity. Positional
+  callers shift silently — there is no way to detect that, hence the table
+  above.
+
+- **`pack` now emits a canonical column order**: a depth-first walk of the
+  hierarchy, each level's own columns followed by its children in declaration
+  order. Previously the order depended on the input's layout (a branch already
+  packed in the input kept its position, a branch folded during the call was
+  appended) and on `group_by` hoisting its keys to the front. That made
+  `pack(df, L)` and `unpack(nested, L)` — two routes to one granularity —
+  disagree on column order, and left `denormalize`, which assembles from
+  per-level tables and has no input order to inherit, unable to match either.
+  Non-hierarchy columns keep their relative order at the end.
+
+### Added
+
+- `HierarchyView.to_nested()` and `collect_nested()` take an optional
+  `at_level`, so a view can be materialized at any granularity rather than only
+  the root.
+
+### Fixed
+
+- `split_levels` deduplicated coarser levels with `unique(keep="any")` and no
+  `maintain_order`. The surviving row order becomes that level's order inside
+  its parent's child list when the tables are denormalized again, and Polars is
+  free to reorder — 1.41 and 1.43 disagreed. Under `preserve_child_order` (the
+  default) the dedup is now stable.
+
+### Removed
+
+- Three root-only special cases, unreachable once the root is never folded:
+  `pack`'s alias-scaffolding guard, `_pack_split_join`'s struct-field
+  reattachment branch, and `denormalize`'s final root fold. The packer is
+  smaller than it was before this change.
+
 ## [0.7.0] - 2026-08-14
 
 ### Added
@@ -366,6 +477,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pack uniformity check reduces violation counts inside the engine rather
   than pulling one row per group into Python.
 
+[0.8.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.8.0
 [0.7.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.7.0
 [0.6.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.6.0
 [0.5.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.5.0
