@@ -22,7 +22,7 @@ import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import polars as pl
 from polars.expr.expr import Expr
@@ -180,6 +180,16 @@ class LevelSpec:
             level's id_fields. Used when building hierarchies from normalized
             tables via :meth:`HierarchicalPacker.build_from_tables`. Order
             matters: ``parent_keys[i]`` joins to parent's ``id_fields[i]``.
+        parent: Name of this level's parent level. Leave ``None`` for a simple
+            linear chain — :class:`HierarchySpec` then infers each level's
+            parent as the level declared before it. Set it to branch: two levels
+            naming the same ``parent`` are siblings, each rooting its own axis::
+
+                LevelSpec(name="street",  parent="city", ...)
+                LevelSpec(name="service", parent="city", ...)
+
+            It is all-or-nothing across a spec: if any non-root level declares
+            ``parent``, every non-root level must.
     """
 
     name: str
@@ -187,6 +197,7 @@ class LevelSpec:
     required_fields: Sequence[ColumnSelector] | None = None
     order_by: Sequence[pl.Expr] | None = None
     parent_keys: Sequence[str] | None = None
+    parent: str | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +212,8 @@ class LevelMetadata:
     required_columns: tuple[str, ...]
     required_exprs: tuple[pl.Expr, ...]
     order_by: tuple[pl.Expr, ...]
+    parent: str | None = None
+    children: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -282,10 +295,40 @@ class SchemaValidationResult:
 @dataclass(frozen=True)
 class HierarchySpec:
     """
-    Collection of ``LevelSpec`` objects ordered from coarse → fine granularity.
+    Collection of ``LevelSpec`` objects describing a hierarchy tree.
+
+    Levels are declared coarse → fine, parents before children. In the common
+    case the hierarchy is a single chain and each level's parent is simply the
+    level declared before it::
+
+        HierarchySpec.from_levels(
+            LevelSpec(name="country", id_fields=["code"]),
+            LevelSpec(name="city", id_fields=["id"]),
+            LevelSpec(name="street", id_fields=["id"]),
+        )
+
+    A level may instead name its :attr:`LevelSpec.parent` explicitly, which lets
+    one level carry several independent child branches. ``street`` and
+    ``service`` below are siblings — orthogonal properties of a city, not stages
+    of one chain::
+
+        HierarchySpec.from_levels(
+            LevelSpec(name="country", id_fields=["code"]),
+            LevelSpec(name="city", id_fields=["id"], parent="country"),
+            LevelSpec(name="street", id_fields=["id"], parent="city"),
+            LevelSpec(name="building", id_fields=["id"], parent="street"),
+            LevelSpec(name="service", id_fields=["kind"], parent="city"),
+        )
+
+    Each root → level chain is an **axis**. Because a level's ancestors are
+    unique even in a branching tree, column paths
+    (``country.city.service.kind``) and key propagation work identically in both
+    shapes; only iteration over children becomes plural. ``pack`` / ``unpack``
+    act along the axis implied by their target level, leaving sibling branches
+    packed as ``List[Struct]`` columns.
 
     Args:
-        levels: Sequence of LevelSpec objects from root to leaf.
+        levels: Sequence of LevelSpec objects, parents before children.
         key_aliases: **Deprecated.** Mapping of {target_column: source_column}
             used to synthesize a missing key column from another column. Rename
             the column on the frame instead — it is one expression and the
@@ -300,11 +343,22 @@ class HierarchySpec:
     levels: Sequence[LevelSpec]
     key_aliases: Mapping[str, str] = field(default_factory=dict)
 
+    # Resolved tree, derived in __post_init__ (never passed by callers).
+    _parents: dict[str, str | None] = field(
+        init=False, repr=False, compare=False, default_factory=dict
+    )
+    _children: dict[str, tuple[str, ...]] = field(
+        init=False, repr=False, compare=False, default_factory=dict
+    )
+
     def __post_init__(self) -> None:
-        """Validate that level names are unique and warn on deprecated options."""
+        """Validate the level tree and warn on deprecated options."""
         level_names = [lvl.name for lvl in self.levels]
         if len(level_names) != len(set(level_names)):
             raise ValueError("Level names must be unique inside a HierarchySpec.")
+
+        object.__setattr__(self, "_parents", self._resolve_parents())
+        object.__setattr__(self, "_children", self._resolve_children())
 
         if self.key_aliases:
             example_target, example_source = next(iter(self.key_aliases.items()))
@@ -317,6 +371,229 @@ class HierarchySpec:
                 "on them.",
                 DeprecationWarning,
                 stacklevel=3,
+            )
+
+    def _resolve_parents(self) -> dict[str, str | None]:
+        """
+        Resolve each level's parent, inferring a linear chain when none declare one.
+
+        Returns:
+            Mapping of level name → parent name (``None`` for the root).
+
+        Raises:
+            ValueError: If the tree is malformed — a partially declared spec,
+                an unknown or self-referencing parent, several roots, a level
+                declared before its parent, or a cycle.
+        """
+        if not self.levels:
+            return {}
+
+        declared = [lvl for lvl in self.levels[1:] if lvl.parent is not None]
+        if declared and len(declared) != len(self.levels) - 1:
+            missing = [lvl.name for lvl in self.levels[1:] if lvl.parent is None]
+            raise ValueError(
+                f"Level(s) {missing} do not declare a parent while others do. "
+                "Parent declaration is all-or-nothing: either no level sets "
+                "parent= (the hierarchy is then read as a linear chain in "
+                "declaration order) or every non-root level sets it. Inferring "
+                "the rest from declaration order would silently attach a "
+                "branch to whichever level happened to be declared last."
+            )
+
+        if self.levels[0].parent is not None:
+            raise ValueError(
+                f"Root level '{self.levels[0].name}' declares parent "
+                f"'{self.levels[0].parent}' but must not have one. The root is "
+                "the first level declared."
+            )
+
+        parents: dict[str, str | None] = {self.levels[0].name: None}
+
+        if not declared:
+            # Linear chain: each level's parent is the one declared before it.
+            for previous, level in zip(self.levels[:-1], self.levels[1:]):
+                parents[level.name] = previous.name
+            return parents
+
+        known = {lvl.name for lvl in self.levels}
+        seen = {self.levels[0].name}
+
+        for level in self.levels[1:]:
+            parent = level.parent
+            assert parent is not None  # guaranteed by the all-or-nothing check above
+            if parent == level.name:
+                raise ValueError(f"Level '{level.name}' cannot be its own parent.")
+            if parent not in known:
+                raise ValueError(
+                    f"Level '{level.name}' names unknown parent '{parent}'. "
+                    f"Known levels: {sorted(known)}."
+                )
+            if parent not in seen:
+                # Declaring a child before its parent would also admit cycles,
+                # since every parent here is already known to exist.
+                raise ValueError(
+                    f"Level '{level.name}' is declared before its parent "
+                    f"'{parent}'. Declare parents before their children so the "
+                    "hierarchy reads root → leaf."
+                )
+            parents[level.name] = parent
+            seen.add(level.name)
+
+        return parents
+
+    def _resolve_children(self) -> dict[str, tuple[str, ...]]:
+        """Invert the parent map, preserving declaration order among siblings."""
+        children: dict[str, list[str]] = {lvl.name: [] for lvl in self.levels}
+        for level in self.levels:
+            parent = self._parents[level.name]
+            if parent is not None:
+                children[parent].append(level.name)
+        return {name: tuple(kids) for name, kids in children.items()}
+
+    def parent_of(self, level_name: str) -> str | None:
+        """
+        The parent of ``level_name``, or ``None`` if it is the root.
+
+        Args:
+            level_name: The level whose parent to look up.
+
+        Returns:
+            The parent level's name, or ``None`` for the root.
+
+        Raises:
+            KeyError: If the level is not found.
+        """
+        self._require_level(level_name)
+        return self._parents[level_name]
+
+    def children_of(self, level_name: str) -> list[str]:
+        """
+        The immediate children of ``level_name``, in declaration order.
+
+        A chain gives at most one child; a branching level gives several.
+
+        Args:
+            level_name: The level whose children to look up.
+
+        Returns:
+            List of child level names (empty for a leaf).
+
+        Raises:
+            KeyError: If the level is not found.
+        """
+        self._require_level(level_name)
+        return list(self._children[level_name])
+
+    def ancestors_of(self, level_name: str) -> list[str]:
+        """
+        The chain of ancestors above ``level_name``, ordered root → parent.
+
+        Unique even in a branching tree — every level has exactly one path back
+        to the root, which is why column paths and key propagation are
+        unambiguous regardless of hierarchy shape.
+
+        Args:
+            level_name: The level whose ancestors to look up.
+
+        Returns:
+            List of ancestor names, root first. Empty for the root.
+
+        Raises:
+            KeyError: If the level is not found.
+        """
+        self._require_level(level_name)
+        chain: list[str] = []
+        current = self._parents[level_name]
+        while current is not None:
+            chain.append(current)
+            current = self._parents[current]
+        chain.reverse()
+        return chain
+
+    def axis_of(self, level_name: str) -> list[str]:
+        """
+        The root → ``level_name`` chain, inclusive.
+
+        This is the *axis* that :meth:`HierarchicalPacker.pack` and
+        :meth:`HierarchicalPacker.unpack` traverse for a given target level.
+
+        Args:
+            level_name: The level terminating the axis.
+
+        Returns:
+            List of level names from the root down to ``level_name``.
+
+        Raises:
+            KeyError: If the level is not found.
+        """
+        return [*self.ancestors_of(level_name), level_name]
+
+    def descendants_of(self, level_name: str) -> list[str]:
+        """
+        Every level below ``level_name``, in declaration (topological) order.
+
+        Spans all branches of the subtree, not just one axis.
+
+        Args:
+            level_name: The level whose subtree to list.
+
+        Returns:
+            List of descendant names, parents before children. Empty for a leaf.
+
+        Raises:
+            KeyError: If the level is not found.
+        """
+        self._require_level(level_name)
+        subtree = {level_name}
+        found: list[str] = []
+        for level in self.levels:
+            parent = self._parents[level.name]
+            if parent in subtree:
+                subtree.add(level.name)
+                found.append(level.name)
+        return found
+
+    def is_ancestor_of(self, level_name: str, other: str) -> bool:
+        """
+        Whether ``level_name`` lies on the root → ``other`` axis, above ``other``.
+
+        Args:
+            level_name: The candidate ancestor.
+            other: The candidate descendant.
+
+        Returns:
+            ``True`` if ``level_name`` is a strict ancestor of ``other``.
+
+        Raises:
+            KeyError: If either level is not found.
+        """
+        self._require_level(level_name)
+        return level_name in self.ancestors_of(other)
+
+    @property
+    def root(self) -> str:
+        """The name of the single root level."""
+        return self.levels[0].name
+
+    @property
+    def leaves(self) -> list[str]:
+        """Names of every level with no children, in declaration order."""
+        return [lvl.name for lvl in self.levels if not self._children[lvl.name]]
+
+    def topological_levels(self) -> list[str]:
+        """Every level name, parents before children (declaration order)."""
+        return [lvl.name for lvl in self.levels]
+
+    def reverse_topological_levels(self) -> list[str]:
+        """Every level name, children before parents."""
+        return [lvl.name for lvl in reversed(self.levels)]
+
+    def _require_level(self, level_name: str) -> None:
+        """Raise a descriptive KeyError if ``level_name`` is not in the hierarchy."""
+        if level_name not in self._parents:
+            raise KeyError(
+                f"Level '{level_name}' not found in hierarchy. "
+                f"Known levels: {[lvl.name for lvl in self.levels]}."
             )
 
     @classmethod
@@ -341,27 +618,30 @@ class HierarchySpec:
         Raises:
             ValueError: If parent_keys don't match parent's id_fields in count.
         """
-        # Validate parent_keys compatibility
-        for i, level in enumerate(levels):
-            if i == 0:
-                # Root level should not have parent_keys
+        spec = cls(levels=list(levels), key_aliases=key_aliases or {})
+
+        # Validate parent_keys compatibility against the *resolved* parent, which
+        # is the level declared before this one only in an unbranched chain.
+        by_name = spec.levels_by_name
+        for level in levels:
+            parent_name = spec.parent_of(level.name)
+            if parent_name is None:
                 if level.parent_keys:
                     raise ValueError(
                         f"Root level '{level.name}' should not have parent_keys defined."
                     )
-            else:
-                parent = levels[i - 1]
-                if level.parent_keys:
-                    # Get parent's id_fields as strings (just count for validation)
-                    parent_id_count = len(parent.id_fields)
-                    if len(level.parent_keys) != parent_id_count:
-                        raise ValueError(
-                            f"Level '{level.name}' has {len(level.parent_keys)} parent_keys "
-                            f"but parent '{parent.name}' has {parent_id_count} id_fields. "
-                            "These must match."
-                        )
+                continue
+            if not level.parent_keys:
+                continue
+            parent_id_count = len(by_name[parent_name].id_fields)
+            if len(level.parent_keys) != parent_id_count:
+                raise ValueError(
+                    f"Level '{level.name}' has {len(level.parent_keys)} parent_keys "
+                    f"but parent '{parent_name}' has {parent_id_count} id_fields. "
+                    "These must match."
+                )
 
-        return cls(levels=list(levels), key_aliases=key_aliases or {})
+        return spec
 
     @property
     def levels_by_name(self) -> Mapping[str, LevelSpec]:
@@ -400,18 +680,28 @@ class HierarchySpec:
 
     def next_level(self, level_name: str) -> LevelSpec | None:
         """
-        Get the next (child) level after the given level.
+        Get the single child level below the given level.
 
         Args:
             level_name: The name of the current level.
 
         Returns:
-            The next LevelSpec, or None if this is the leaf level.
+            The child LevelSpec, or None if this is a leaf level.
+
+        Raises:
+            ValueError: If the level has several children, where "next" has no
+                single answer. Use :meth:`children_of` instead.
         """
-        idx = self.index_of(level_name)
-        if idx + 1 >= len(self.levels):
+        children = self.children_of(level_name)
+        if not children:
             return None
-        return self.levels[idx + 1]
+        if len(children) > 1:
+            raise ValueError(
+                f"Level '{level_name}' has {len(children)} child branches "
+                f"{children}, so 'the next level' is ambiguous. Use "
+                "children_of() to get them all, or name the branch you mean."
+            )
+        return self.levels_by_name[children[0]]
 
 
 class HierarchicalPacker:
@@ -511,20 +801,91 @@ class HierarchicalPacker:
     @property
     def leaf_level(self) -> str:
         """
-        Return the name of the finest (leaf) level.
+        Return the name of the single finest (leaf) level.
 
         Returns:
             Leaf level name.
+
+        Raises:
+            ValueError: If the hierarchy branches and therefore has several
+                leaves. Use :attr:`leaf_levels` instead.
 
         Examples:
             >>> packer.leaf_level
             'street'
         """
-        return self._levels_meta[-1].name
+        leaves = self.spec.leaves
+        if len(leaves) > 1:
+            raise ValueError(
+                f"Hierarchy has {len(leaves)} leaf levels {leaves}, one per branch, "
+                "so 'the leaf level' is ambiguous. Use leaf_levels, or name the "
+                "branch you mean."
+            )
+        return leaves[0]
+
+    @property
+    def leaf_levels(self) -> list[str]:
+        """
+        Return the name of every leaf level — one per branch of the hierarchy.
+
+        Returns:
+            List of leaf level names in declaration order. A single-element list
+            for an unbranched chain.
+
+        Examples:
+            >>> packer.leaf_levels
+            ['building', 'service']
+        """
+        return self.spec.leaves
+
+    @property
+    def axes(self) -> list[list[str]]:
+        """
+        Return every root → leaf axis in the hierarchy.
+
+        An *axis* is the chain :meth:`pack` and :meth:`unpack` traverse for a
+        given target level. An unbranched hierarchy has exactly one.
+
+        Returns:
+            List of level-name chains, root first, one per leaf level.
+
+        Examples:
+            >>> packer.axes
+            [['country', 'city', 'street', 'building'], ['country', 'city', 'service']]
+        """
+        return [self.spec.axis_of(leaf) for leaf in self.spec.leaves]
+
+    def get_axis(self, level: str) -> list[str]:
+        """
+        Return the root → ``level`` chain, inclusive.
+
+        This is the sequence of levels :meth:`pack` folds and :meth:`unpack`
+        explodes when ``level`` is the target. Branches hanging off it are left
+        packed.
+
+        Args:
+            level: The level terminating the axis.
+
+        Returns:
+            List of level names from the root down to ``level``.
+
+        Raises:
+            KeyError: If ``level`` is not found in the hierarchy.
+
+        Examples:
+            >>> packer.get_axis('building')
+            ['country', 'city', 'street', 'building']
+            >>> packer.get_axis('service')
+            ['country', 'city', 'service']
+        """
+        return self.spec.axis_of(level)
 
     def get_ancestor_levels(self, level: str) -> list[str]:
         """
         Return all ancestor level names above ``level``, ordered root → parent.
+
+        Even in a branching hierarchy a level has exactly one path back to the
+        root, so this chain is always unambiguous.
 
         Args:
             level: The level whose ancestors to retrieve.
@@ -541,30 +902,52 @@ class HierarchicalPacker:
             >>> packer.get_ancestor_levels('country')
             []
         """
-        idx = self.spec.index_of(level)
-        return [m.name for m in self._levels_meta[:idx]]
+        return self.spec.ancestors_of(level)
 
     def get_descendant_levels(self, level: str) -> list[str]:
         """
-        Return all descendant level names below ``level``, ordered child → leaf.
+        Return all descendant level names below ``level``, parents before children.
+
+        Spans every branch of the subtree, not just one axis.
 
         Args:
             level: The level whose descendants to retrieve.
 
         Returns:
-            List of descendant level names. Empty list if ``level`` is the leaf.
+            List of descendant level names. Empty list if ``level`` is a leaf.
 
         Raises:
             KeyError: If ``level`` is not found in the hierarchy.
 
         Examples:
             >>> packer.get_descendant_levels('country')
-            ['city', 'street']
-            >>> packer.get_descendant_levels('street')
+            ['city', 'street', 'building', 'service']
+            >>> packer.get_descendant_levels('building')
             []
         """
-        idx = self.spec.index_of(level)
-        return [m.name for m in self._levels_meta[idx + 1 :]]
+        return self.spec.descendants_of(level)
+
+    def get_child_levels(self, level: str) -> list[str]:
+        """
+        Return the immediate children of ``level``, in declaration order.
+
+        Returns several names where the hierarchy branches, one in a chain, and
+        none at a leaf.
+
+        Args:
+            level: The level whose children to retrieve.
+
+        Returns:
+            List of child level names.
+
+        Raises:
+            KeyError: If ``level`` is not found in the hierarchy.
+
+        Examples:
+            >>> packer.get_child_levels('city')
+            ['street', 'service']
+        """
+        return self.spec.children_of(level)
 
     def get_level_keys(
         self,
@@ -656,7 +1039,7 @@ class HierarchicalPacker:
         meta = self._levels_meta[self.spec.index_of(level)]
 
         # Collect names of immediate child levels to exclude their columns
-        child_level_names = {m.name for m in self._levels_meta[meta.index + 1 :]}
+        child_level_names = set(meta.children)
 
         # ---- Packed case: the level's path is a column in the schema ----
         if meta.path in schema:
@@ -697,13 +1080,13 @@ class HierarchicalPacker:
                 result.append(remainder)
         return result
 
-    def infer_current_level(self, schema_or_frame: SchemaInput) -> str:
+    def infer_current_level(self, schema_or_frame: SchemaInput, *, axis: str | None = None) -> str:
         """
         Infer which hierarchy level each row currently represents.
 
-        Inspects the schema to determine whether the data is fully flat (rows
-        represent the leaf level) or partially packed (rows represent some
-        intermediate or root level).
+        Row granularity is set by the **deepest level whose own columns are
+        still flat**: everything below it has been folded into nested columns,
+        so one row is one entity at that level.
 
         Note that this reports **row granularity**, which is one level coarser
         than the argument to :meth:`pack`: ``pack(frame, "city")`` nests the
@@ -713,49 +1096,63 @@ class HierarchicalPacker:
         Args:
             schema_or_frame: A ``pl.Schema``, ``pl.DataFrame``, or ``pl.LazyFrame``
                 to inspect.
+            axis: Optional level naming the axis to measure along. Only the root
+                → ``axis`` chain is considered, which resolves the ambiguity when
+                a branching hierarchy has flat columns from two branches at once.
 
         Returns:
             The name of the level each row currently represents.
 
         Raises:
+            KeyError: If ``axis`` is not found in the hierarchy.
             ValueError: If the schema does not match any recognisable hierarchy
-                state.
+                state, or if flat columns from two different branches are present
+                and no ``axis`` was given to disambiguate.
 
         Examples:
             >>> packer.infer_current_level(flat_df)
             'apartment'
             >>> packer.infer_current_level(packer.pack(flat_df, 'street'))
             'city'
+            >>> packer.infer_current_level(nested, axis='service')
+            'country'
         """
         schema = self._extract_schema(schema_or_frame)
 
-        for meta in self._levels_meta:
-            if meta.path not in schema:
-                continue
-            dtype = schema[meta.path]
-            if isinstance(dtype, (pl.List, pl.Struct)):
-                # This level is packed as a nested column → rows are at parent level
-                if meta.index == 0:
-                    return meta.name
-                return self._levels_meta[meta.index - 1].name
-
-        # No packed column found — check whether flat leaf-level columns exist
-        leaf_meta = self._levels_meta[-1]
-        has_leaf_cols = leaf_meta.prefix and any(
-            col.startswith(leaf_meta.prefix) for col in schema.keys()
+        candidates = (
+            [self._levels_meta[self.spec.index_of(name)] for name in self.spec.axis_of(axis)]
+            if axis is not None
+            else self._levels_meta
         )
-        if has_leaf_cols:
-            return leaf_meta.name
+        flat = [meta for meta in candidates if self._own_level_columns(meta, schema)]
 
-        # Fall back: look for the deepest level whose flat columns are present
-        for meta in reversed(self._levels_meta):
-            if meta.prefix and any(col.startswith(meta.prefix) for col in schema.keys()):
-                return meta.name
+        if not flat:
+            # Fully packed: the whole hierarchy sits inside the root's column, so
+            # each row is one root entity.
+            root = self._levels_meta[0]
+            if root.path in schema or any(col.startswith(root.prefix) for col in schema.keys()):
+                return root.name
+            raise ValueError(
+                "Cannot infer current level: the schema does not match any recognisable "
+                f"hierarchy state. Schema columns: {list(schema.keys())}"
+            )
 
-        raise ValueError(
-            "Cannot infer current level: the schema does not match any recognisable "
-            f"hierarchy state. Schema columns: {list(schema.keys())}"
-        )
+        # The deepest flat level. In a chain that is simply the last one; when the
+        # hierarchy branches, two flat levels on different branches describe two
+        # different granularities and no single answer is right.
+        deepest = max(flat, key=lambda meta: len(self.spec.ancestors_of(meta.name)))
+        conflicting = [
+            meta.name
+            for meta in flat
+            if meta.name != deepest.name and not self.spec.is_ancestor_of(meta.name, deepest.name)
+        ]
+        if conflicting:
+            raise ValueError(
+                f"Cannot infer current level: levels {[deepest.name, *conflicting]} are all "
+                "flat but lie on different branches, so the frame mixes granularities. "
+                "Pass axis='<level>' to measure along one branch."
+            )
+        return deepest.name
 
     def get_level_schema(
         self,
@@ -785,7 +1182,7 @@ class HierarchicalPacker:
         schema = self._extract_schema(schema_or_frame)
         meta = self._levels_meta[self.spec.index_of(level)]
 
-        child_level_names = {m.name for m in self._levels_meta[meta.index + 1 :]}
+        child_level_names = set(meta.children)
 
         # Packed case
         if meta.path in schema:
@@ -844,13 +1241,16 @@ class HierarchicalPacker:
         lines.append(f"  Levels ({n}):")
         for meta in self._levels_meta:
             tags: list[str] = []
-            if meta.index == 0:
+            if meta.parent is None:
                 tags.append("root")
-            if meta.index == n - 1:
+            if not meta.children:
                 tags.append("leaf")
             tag_str = f"  ({', '.join(tags)})" if tags else ""
             lines.append(f"    {meta.index}. {meta.name}{tag_str}")
             lines.append(f'       Path: "{meta.path}"')
+            if len(meta.children) > 1:
+                # Only worth showing where it is not implied by the ordering.
+                lines.append(f"       Branches: {', '.join(meta.children)}")
             keys_str = (
                 ", ".join(col[len(meta.prefix) :] for col in meta.id_columns)
                 if meta.id_columns
@@ -1080,8 +1480,14 @@ class HierarchicalPacker:
         # Validation requires eager .collect(); skip it when frame is lazy to preserve lazy semantics.
         effective_validate = self.validate_on_pack and isinstance(frame, pl.DataFrame)
 
-        target_idx = self.spec.index_of(to_level)
-        for level_idx in reversed(range(target_idx, len(self._levels_meta))):
+        # Fold children before their parents so that every descendant is already
+        # a List[Struct] column by the time its parent's struct is built. In a
+        # branching hierarchy this folds *all* of a level's branches into it —
+        # they share the level's prefix, so ``_pack_single_level`` collects them
+        # together. Branches absent from ``frame`` contribute no columns and are
+        # skipped there at no cost.
+        subtree = [to_level, *self.spec.descendants_of(to_level)]
+        for level_idx in [self.spec.index_of(name) for name in reversed(subtree)]:
             if level_idx == 0 and added_cols:
                 # Alias columns are scaffolding for the child levels' group keys.
                 # Drop them before the root fold, or they end up inside the root
@@ -1099,17 +1505,17 @@ class HierarchicalPacker:
     def _root_attribute_columns(self, schema: pl.Schema) -> list[str]:
         """
         Columns owned by the root level itself: under the root prefix but not a
-        root id column and not part of any descendant level (or an internal column).
+        root id column and not part of any child branch (or an internal column).
         """
         root = self._levels_meta[0]
-        child = self._levels_meta[1] if len(self._levels_meta) > 1 else None
+        children = [self._levels_meta[self.spec.index_of(name)] for name in root.children]
         id_columns = set(root.id_columns)
 
         attrs: list[str] = []
         for col in schema.keys():
             if not col.startswith(root.prefix) or col in id_columns:
                 continue
-            if child is not None and col.startswith(child.prefix):
+            if any(col.startswith(child.prefix) or col == child.path for child in children):
                 continue
             if col == ROW_ID_COLUMN:
                 continue
@@ -1162,9 +1568,21 @@ class HierarchicalPacker:
         Unpack nested list-of-struct columns until ``to_level`` is reached,
         mirroring :func:`explode` + :func:`unnest` per level.
 
+        Only the **axis** leading to ``to_level`` — the root → ``to_level`` chain
+        — is exploded. Sibling branches hanging off that chain stay packed as
+        ``List[Struct]`` columns, replicated onto each emitted row. A flat frame
+        can only carry one granularity, so exploding a second branch alongside
+        the first would mean a cartesian product of two unrelated child sets;
+        leaving it nested keeps the frame lossless and re-packable instead.
+        Unpack to a level on the other branch to explode that one::
+
+            packer.unpack(nested, "building")  # street axis; service stays packed
+            packer.unpack(nested, "service")   # service axis; street stays packed
+
         Args:
             frame: The DataFrame or LazyFrame to unpack.
-            to_level: The target level name to unpack to.
+            to_level: The target level name to unpack to. Its axis is the chain
+                that gets exploded.
 
         Returns:
             Unpacked frame with flattened columns, same type as input.
@@ -1175,13 +1593,11 @@ class HierarchicalPacker:
         lf = self._to_lazy(frame)
         schema = lf.collect_schema()
 
-        for level in self._levels_meta:
+        for name in self.spec.axis_of(to_level):
+            level = self._levels_meta[self.spec.index_of(name)]
             if level.path not in schema:
                 continue
-
             lf, schema = self._explode_and_unnest(lf, level, schema)
-            if level.name == to_level:
-                break
 
         lf = self._drop_internal_columns(lf)
         return self._match_frame_type(lf, frame)
@@ -1516,18 +1932,17 @@ class HierarchicalPacker:
         Columns in ``schema`` that belong to ``meta`` itself.
 
         A column is owned by a level when it sits under the level's prefix but
-        does **not** belong to any descendant level — i.e. neither the child's
-        packed column (``child.path``) nor anything under the child's prefix.
-        Internal bookkeeping columns are excluded.
+        does **not** belong to any child branch — i.e. neither a child's packed
+        column (``child.path``) nor anything under a child's prefix. Every
+        branch is excluded, so a level with two children keeps only what is
+        genuinely its own. Internal bookkeeping columns are excluded.
         """
-        child = (
-            self._levels_meta[meta.index + 1] if meta.index + 1 < len(self._levels_meta) else None
-        )
+        children = [self._levels_meta[self.spec.index_of(name)] for name in meta.children]
         own: list[str] = []
         for col in schema.keys():
             if col == ROW_ID_COLUMN or not meta.prefix or not col.startswith(meta.prefix):
                 continue
-            if child is not None and (col == child.path or col.startswith(child.prefix)):
+            if any(col == child.path or col.startswith(child.prefix) for child in children):
                 continue
             own.append(col)
         return own
@@ -1556,6 +1971,12 @@ class HierarchicalPacker:
         are emitted too, deduplicated on their key columns, so no attribute is
         silently dropped.
 
+        A branching hierarchy needs no special handling here: every level is its
+        own table regardless of shape, so a ``city`` with both ``street`` and
+        ``service`` children simply emits three tables, each keyed back to
+        ``city``. This is the shape :class:`~nexpresso.HierarchyView` queries,
+        and the one that represents a branching hierarchy without duplication.
+
         Args:
             frame: The packed DataFrame or LazyFrame to split.
 
@@ -1582,23 +2003,39 @@ class HierarchicalPacker:
         lf, added_cols, schema = self._prepare_frame(frame)
 
         outputs: dict[str, pl.LazyFrame] = {}
-        current = lf
         added = set(added_cols)
 
+        # One working frame per level, unpacked to that level's own granularity.
+        # Each level continues from its *parent's* frame, so sibling branches each
+        # explode independently off the shared ancestor plan rather than one
+        # branch inheriting the other's explode. In an unbranched chain this is
+        # exactly the progressive unpack it replaces.
+        frames: dict[str, tuple[pl.LazyFrame, pl.Schema]] = {}
+
         for level in self._levels_meta:
-            unpacked_here = level.path in schema
+            base_lf, base_schema = frames[level.parent] if level.parent else (lf, schema)
+
+            unpacked_here = level.path in base_schema
             if unpacked_here:
-                current = self.unpack(current, level.name)
-                schema = current.collect_schema()
-            elif not any(col.startswith(level.prefix) for col in schema.keys()):
+                current = self.unpack(base_lf, level.name)
+                current_schema = current.collect_schema()
+            else:
+                current, current_schema = base_lf, base_schema
+            frames[level.name] = (current, current_schema)
+
+            if not unpacked_here and not any(
+                col.startswith(level.prefix) for col in current_schema.keys()
+            ):
                 # Neither packed nor flat in this frame — nothing to emit.
                 continue
 
             # Ancestor *keys* only (foreign keys), never ancestor attributes.
             ancestor_keys = [
-                col for col in level.ancestor_keys if col in schema and col not in added
+                col for col in level.ancestor_keys if col in current_schema and col not in added
             ]
-            own_cols = [col for col in self._own_level_columns(level, schema) if col not in added]
+            own_cols = [
+                col for col in self._own_level_columns(level, current_schema) if col not in added
+            ]
             keep = ancestor_keys + own_cols
             if not keep:
                 continue
@@ -1607,21 +2044,33 @@ class HierarchicalPacker:
 
             # Drop rows that only exist because of a null/absent child branch.
             id_subset = [col for col in level.id_columns if col in keep]
-            if level.index + 1 < len(self._levels_meta):
+            if level.children:
                 null_guard = ancestor_keys + id_subset
             else:
                 null_guard = [col for col in level.required_columns if col in keep]
             if null_guard:
                 output_table = output_table.drop_nulls(subset=null_guard)
 
-            if not unpacked_here:
+            if not self._is_at_granularity(level, current_schema):
                 # Rows are at a finer granularity than this level, so the level's
                 # own values repeat; collapse them to one row per entity.
+                #
+                # The surviving row order becomes this level's order inside its
+                # parent's child list when the tables are denormalized again, so
+                # under ``preserve_child_order`` the dedup has to be stable —
+                # ``keep="any"`` without ``maintain_order`` is free to reorder,
+                # and does so differently across Polars versions. Callers who
+                # turned child order off keep the cheaper unordered form.
                 key_subset = ancestor_keys + id_subset
+                unique_kwargs: dict[str, Any] = (
+                    {"keep": "first", "maintain_order": True}
+                    if self.preserve_child_order
+                    else {"keep": "any"}
+                )
                 output_table = (
-                    output_table.unique(subset=key_subset, keep="any")
+                    output_table.unique(subset=key_subset, **unique_kwargs)
                     if key_subset
-                    else output_table.unique(keep="any")
+                    else output_table.unique(**unique_kwargs)
                 )
 
             outputs[level.name] = output_table
@@ -1733,15 +2182,26 @@ class HierarchicalPacker:
         # finer than the root (see below).
         source_tables = dict(prepared_tables)
 
-        # Propagate child structures upward from deepest level.
-        for level_idx in reversed(range(1, len(self._levels_meta))):
-            level = self._levels_meta[level_idx]
-            parent_meta = self._levels_meta[level_idx - 1]
-            parent_name = parent_meta.name
+        # Each level as it stands with its branches attached but before its own
+        # fold — see the snapshot inside the loop.
+        branch_tables: dict[str, pl.LazyFrame] = {}
+
+        # Propagate child structures upward, children before parents. A parent
+        # with several branches accumulates one List[Struct] column per branch
+        # before its own fold, since each iteration joins a single child on.
+        for level in reversed(self._levels_meta[1:]):
+            level_idx = level.index
+            assert level.parent is not None  # non-root levels always have one
+            parent_name = level.parent
 
             child_lf = prepared_tables.get(level.name)
             if child_lf is None:
-                if level_idx <= target_idx:
+                # A level on the target's own axis is required; a level off it
+                # belongs to a branch the caller simply did not supply.
+                on_target_axis = level.name == target_name or self.spec.is_ancestor_of(
+                    level.name, target_name
+                )
+                if on_target_axis:
                     raise HierarchyValidationError(
                         f"Missing table for level '{level.name}'.",
                         level=level.name,
@@ -1756,6 +2216,13 @@ class HierarchicalPacker:
                     level=parent_name,
                     details={"provided_levels": list(tables.keys())},
                 )
+
+            # Children are folded first, so ``child_lf`` already carries this
+            # level's own branches as packed columns. Snapshot it before it is
+            # replaced by its packed form: a target below a branch point needs
+            # its ancestors' *other* branches, and this is the only point at
+            # which they exist as top-level columns.
+            branch_tables[level.name] = child_lf
 
             child_schema = child_lf.collect_schema()
             # Never validate here: the uniformity check runs an eager ``collect()``,
@@ -1793,7 +2260,12 @@ class HierarchicalPacker:
         # target_level)``: tables from :meth:`split_levels` are normalized and no
         # longer duplicate coarser attributes into finer tables.
         if target_idx > 0:
-            result = self._attach_ancestor_attributes(result, target_idx, source_tables)
+            # The root is never folded by the loop above, so it is already in its
+            # branches-attached form.
+            branch_tables.setdefault(root_name, prepared_tables[root_name])
+            result = self._attach_ancestor_attributes(
+                result, target_idx, source_tables, branch_tables
+            )
 
         # Alias scaffolding goes first so the root fold below cannot bake it into
         # the struct.
@@ -1842,9 +2314,6 @@ class HierarchicalPacker:
             hierarchy keeps its relative position at the end.
         """
         target = self._levels_meta[target_idx]
-        child = (
-            self._levels_meta[target_idx + 1] if target_idx + 1 < len(self._levels_meta) else None
-        )
         present = list(schema.names())
         remaining = set(present)
 
@@ -1859,14 +2328,25 @@ class HierarchicalPacker:
         for key in target.ancestor_keys:
             take(key)
 
-        # 2. Carried columns, grouped by level root → target, in schema order.
-        for meta in self._levels_meta[: target_idx + 1]:
+        # 2. Carried columns in the order a flat frame holds them: a depth-first
+        #    walk of the tree, each level's own columns followed by its children
+        #    in declaration order. Descending the axis recurses; a child off the
+        #    axis is a packed column and is emitted in place. That reproduces
+        #    ``pack``'s ordering, which just carries the input schema through.
+        axis = self.spec.axis_of(target.name)
+        axis_position = {name: i for i, name in enumerate(axis)}
+
+        def walk(name: str) -> None:
+            meta = self._levels_meta[self.spec.index_of(name)]
             for col in self._own_level_columns(meta, schema):
                 take(col)
+            for child in meta.children:
+                if axis_position.get(child) == axis_position[name] + 1:
+                    walk(child)
+                else:
+                    take(self._levels_meta[self.spec.index_of(child)].path)
 
-        # 3. The nested child struct column last.
-        if child is not None:
-            take(child.path)
+        walk(axis[0])
 
         # Anything left (extra non-hierarchy columns) keeps its original order.
         ordered.extend(col for col in present if col in remaining)
@@ -1910,24 +2390,39 @@ class HierarchicalPacker:
         result: pl.LazyFrame,
         target_idx: int,
         source_tables: Mapping[str, pl.LazyFrame],
+        nested_tables: Mapping[str, pl.LazyFrame],
     ) -> pl.LazyFrame:
         """
-        Join each ancestor level's own attribute columns onto ``result``.
+        Join each ancestor level's own attributes and off-axis branches onto ``result``.
 
         ``result`` is at ``target_idx`` granularity and already carries every
         ancestor *key* column, which is what the joins key on.
+
+        Two kinds of column come down. An ancestor's plain **attributes** are
+        read from the caller's tables. An ancestor's **off-axis branches** —
+        children that are not on the target's axis, such as ``service`` when
+        the target is ``building`` — are read from the post-upward-pass tables,
+        where they already exist as packed ``List[Struct]`` columns. Without
+        them the result would silently lose a whole branch that :meth:`pack`
+        carries along.
 
         Args:
             result: Frame at the target level's granularity.
             target_idx: Index of the target level.
             source_tables: Per-level tables as provided by the caller.
+            nested_tables: Per-level tables after children were folded into
+                their parents.
 
         Returns:
-            ``result`` widened with the ancestors' attribute columns.
+            ``result`` widened with the ancestors' attribute and branch columns.
         """
         result_schema = result.collect_schema()
 
-        for anc in self._levels_meta[:target_idx]:
+        target_name = self._levels_meta[target_idx].name
+        axis = set(self.spec.axis_of(target_name))
+
+        for name in self.spec.ancestors_of(target_name):
+            anc = self._levels_meta[self.spec.index_of(name)]
             anc_lf = source_tables.get(anc.name)
             if anc_lf is None:
                 continue
@@ -1946,10 +2441,30 @@ class HierarchicalPacker:
                 for col in self._own_level_columns(anc, anc_schema)
                 if col not in join_keys and col not in result_schema
             ]
-            if not attrs:
+            if attrs:
+                result = result.join(anc_lf.select([*join_keys, *attrs]), on=join_keys, how="left")
+                result_schema = result.collect_schema()
+
+            branch_lf = nested_tables.get(anc.name)
+            if branch_lf is None:
+                continue
+            branch_schema = branch_lf.collect_schema()
+            branches = [
+                self._levels_meta[self.spec.index_of(child)].path
+                for child in anc.children
+                if child not in axis
+            ]
+            branches = [
+                col for col in branches if col in branch_schema and col not in result_schema
+            ]
+            if not branches:
+                continue
+            if not all(key in branch_schema for key in join_keys):
                 continue
 
-            result = result.join(anc_lf.select([*join_keys, *attrs]), on=join_keys, how="left")
+            result = result.join(
+                branch_lf.select([*join_keys, *branches]), on=join_keys, how="left"
+            )
             result_schema = result.collect_schema()
 
         return result
@@ -2000,16 +2515,15 @@ class HierarchicalPacker:
             )
 
         target_name = target_level or self._levels_meta[0].name
-        target_idx = self.spec.index_of(target_name)
 
         # Check that we have all required levels
-        for i, meta in enumerate(self._levels_meta):
-            if i > target_idx:
-                break
-            if meta.name not in tables:
+        # The target's own axis must be complete; branches off it are optional and
+        # simply do not appear in the result when their table is not supplied.
+        for name in self.spec.axis_of(target_name):
+            if name not in tables:
                 raise HierarchyValidationError(
-                    f"Missing table for level '{meta.name}'.",
-                    level=meta.name,
+                    f"Missing table for level '{name}'.",
+                    level=name,
                     details={"provided_levels": list(tables.keys())},
                 )
 
@@ -2031,17 +2545,18 @@ class HierarchicalPacker:
             lf = self._prepare_level_table_internal(lf, meta.name, level_idx)
             prepared_tables[meta.name] = lf
 
-        # Join tables from leaf to root
-        # Start from deepest level and work up
-        for level_idx in reversed(range(1, len(self._levels_meta))):
-            level = self._levels_meta[level_idx]
+        # Join tables children-first so a parent has every branch attached before
+        # it is itself joined onto its own parent.
+        for level in reversed(self._levels_meta[1:]):
+            level_idx = level.index
             level_spec = self.spec.levels[level_idx]
 
             if level.name not in prepared_tables:
                 continue
 
-            parent_meta = self._levels_meta[level_idx - 1]
-            parent_name = parent_meta.name
+            assert level.parent is not None  # non-root levels always have one
+            parent_name = level.parent
+            parent_meta = self._levels_meta[self.spec.index_of(parent_name)]
 
             if parent_name not in prepared_tables:
                 continue
@@ -2480,35 +2995,44 @@ class HierarchicalPacker:
 
         Raises:
             KeyError: If either level is not found.
-            ValueError: If ``from_level`` is coarser than ``to_level``.
+            ValueError: If ``from_level`` is neither ``to_level`` nor one of its
+                descendants — including a level on a sibling branch, which is
+                not reachable by descending through ``to_level``'s nested
+                columns.
 
         Examples:
             >>> packed = packer.pack(flat_df, "city")
             >>> expr = packer.attribute_expr("id", "city", "country", "count")
             >>> packed.filter(expr > 10)
         """
-        from_idx = self.spec.index_of(from_level)
-        to_idx = self.spec.index_of(to_level)
-
-        if from_idx < to_idx:
-            raise ValueError(
-                f"from_level '{from_level}' (index {from_idx}) must be at the same or finer "
-                f"granularity as to_level '{to_level}' (index {to_idx}). "
-                "Attributes cannot be derived from a coarser level."
-            )
-
-        to_meta = self._levels_meta[to_idx]
+        to_meta = self._levels_meta[self.spec.index_of(to_level)]
 
         # Same-level: the attribute is already a direct scalar column.
-        if from_idx == to_idx:
+        if from_level == to_level:
             return pl.col(f"{to_meta.prefix}{self._escape_field(attribute)}")
 
+        if not self.spec.is_ancestor_of(to_level, from_level):
+            reason = (
+                "it is coarser"
+                if self.spec.is_ancestor_of(from_level, to_level)
+                else "it sits on a different branch"
+            )
+            raise ValueError(
+                f"from_level '{from_level}' must be '{to_level}' or one of its "
+                f"descendants, but {reason}. Attributes can only be derived by "
+                f"descending into '{to_level}'; its descendants are "
+                f"{self.spec.descendants_of(to_level)}."
+            )
+
         # Cross-level: build the expression by navigating the nested structure
-        # from the innermost level (from_level) outward to to_level.
+        # from the innermost level (from_level) outward to to_level. The route is
+        # the segment of from_level's axis below to_level — unique even when the
+        # hierarchy branches, since a level has only one path back to the root.
         #
         # traverse[0] = immediate child of to_level (outermost nested column)
-        # traverse[-1] = from_idx (from_level, innermost)
-        traverse = list(range(to_idx + 1, from_idx + 1))
+        # traverse[-1] = from_level (innermost)
+        axis = self.spec.axis_of(from_level)
+        traverse = [self.spec.index_of(name) for name in axis[axis.index(to_level) + 1 :]]
         n_hops = len(traverse)
 
         final_agg = self._LIST_AGGREGATIONS[agg]
@@ -2634,15 +3158,8 @@ class HierarchicalPacker:
             ...     condition=pl.element().struct.field("population") > 1_000_000,
             ... )
         """
-        from_idx = self.spec.index_of(from_level)
-        to_idx = self.spec.index_of(to_level)
-        if from_idx != to_idx + 1:
-            raise ValueError(
-                f"from_level '{from_level}' must be the immediate child of "
-                f"to_level '{to_level}' for existential predicates. "
-                f"Got indices {from_idx} and {to_idx}."
-            )
-        from_meta = self._levels_meta[from_idx]
+        self._require_immediate_child(from_level, to_level, "existential predicates")
+        from_meta = self._levels_meta[self.spec.index_of(from_level)]
         mask = pl.col(from_meta.path).list.eval(condition.cast(pl.UInt8)).list.sum() > 0
         lf = self._to_lazy(frame).filter(mask)
         return self._match_frame_type(lf, frame)
@@ -2706,15 +3223,8 @@ class HierarchicalPacker:
             ...     condition=pl.element().struct.field("population") > 10_000,
             ... )
         """
-        from_idx = self.spec.index_of(from_level)
-        to_idx = self.spec.index_of(to_level)
-        if from_idx != to_idx + 1:
-            raise ValueError(
-                f"from_level '{from_level}' must be the immediate child of "
-                f"to_level '{to_level}' for existential predicates. "
-                f"Got indices {from_idx} and {to_idx}."
-            )
-        from_meta = self._levels_meta[from_idx]
+        self._require_immediate_child(from_level, to_level, "existential predicates")
+        from_meta = self._levels_meta[self.spec.index_of(from_level)]
         child_col = pl.col(from_meta.path)
         evaluated = child_col.list.eval(condition.cast(pl.UInt8))
         # A null child list yields null on both sides, and `filter` drops null
@@ -2769,16 +3279,10 @@ class HierarchicalPacker:
             ...     from_level="city", to_level="country", agg="sum",
             ... )
         """
-        from_idx = self.spec.index_of(from_level)
-        to_idx = self.spec.index_of(to_level)
-        if from_idx != to_idx + 1:
-            raise ValueError(
-                f"from_level '{from_level}' must be the immediate child of "
-                f"to_level '{to_level}'. Got indices {from_idx} and {to_idx}."
-            )
+        self._require_immediate_child(from_level, to_level, "attribute promotion")
 
-        from_meta = self._levels_meta[from_idx]
-        to_meta = self._levels_meta[to_idx]
+        from_meta = self._levels_meta[self.spec.index_of(from_level)]
+        to_meta = self._levels_meta[self.spec.index_of(to_level)]
 
         # Pack so from_level becomes a list-of-struct column.
         packed_lf = self._to_lazy(self.pack(frame, from_level))
@@ -3130,6 +3634,59 @@ class HierarchicalPacker:
 
         return extra_cols
 
+    def _is_at_granularity(self, meta: LevelMetadata, schema: pl.Schema) -> bool:
+        """
+        Whether a frame with ``schema`` holds exactly one row per ``meta`` entity.
+
+        It does when every level off ``meta``'s own axis is packed away: any
+        off-axis level still carrying flat columns fans the frame out below
+        ``meta``, making its values repeat. That covers both a **descendant**
+        (streets flat in a frame we are reading at city level) and a **sibling
+        branch** (streets flat while reading the service level) — the second is
+        why this cannot simply ask whether the level was just exploded.
+
+        Args:
+            meta: The level whose granularity is in question.
+            schema: Schema of the working frame.
+
+        Returns:
+            ``True`` if rows are one-per-entity at ``meta``.
+        """
+        axis = set(self.spec.axis_of(meta.name))
+        for other in self._levels_meta:
+            if other.name in axis:
+                continue
+            if self._own_level_columns(other, schema):
+                return False
+        return True
+
+    def _require_immediate_child(self, from_level: str, to_level: str, operation: str) -> None:
+        """
+        Check that ``from_level`` is a direct child of ``to_level``.
+
+        Operations that read a single ``List[Struct]`` column need the child to
+        sit one hop below the parent. When ``to_level`` branches, the message
+        lists every branch so the caller can see which one they meant.
+
+        Args:
+            from_level: The candidate child level.
+            to_level: The candidate parent level.
+            operation: Short description used in the error message.
+
+        Raises:
+            KeyError: If either level is not found in the hierarchy.
+            ValueError: If ``from_level`` is not an immediate child of ``to_level``.
+        """
+        parent = self.spec.parent_of(from_level)
+        self.spec._require_level(to_level)
+        if parent != to_level:
+            children = self.spec.children_of(to_level)
+            raise ValueError(
+                f"from_level '{from_level}' must be the immediate child of "
+                f"to_level '{to_level}' for {operation}, but its parent is "
+                f"{parent!r}. Immediate children of '{to_level}': {children}."
+            )
+
     def _qualify_field(self, level_idx: int, field: str) -> str:
         """
         Qualify a field name with the level path prefix.
@@ -3146,7 +3703,7 @@ class HierarchicalPacker:
         if len(parts) > 1:
             return field
 
-        level_names = [lvl.name for lvl in self.spec.levels[: level_idx + 1]]
+        level_names = self.spec.axis_of(self.spec.levels[level_idx].name)
         path = self._join_path(level_names)
         prefix = f"{path}{self.separator}" if path else ""
         escaped_field = self._escape_field(field)
@@ -3174,13 +3731,26 @@ class HierarchicalPacker:
         return columns, exprs
 
     def _build_metadata(self) -> list[LevelMetadata]:
+        """
+        Build per-level metadata by walking the tree parents-first.
+
+        A level's path and ancestor keys extend its *parent's*, which is the
+        same thing as extending the previous level only in an unbranched chain.
+        Levels are declared parents-first, so one forward pass suffices.
+        """
         metas: list[LevelMetadata] = []
-        path_components: list[str] = []
-        ancestor_keys: list[str] = []
+        by_name: dict[str, LevelMetadata] = {}
 
         for index, level in enumerate(self.spec.levels):
-            path_components.append(level.name)
-            path = self.separator.join(path_components)
+            parent_name = self.spec.parent_of(level.name)
+            parent_meta = by_name[parent_name] if parent_name is not None else None
+
+            if parent_meta is None:
+                path = level.name
+                ancestor_keys: tuple[str, ...] = ()
+            else:
+                path = f"{parent_meta.path}{self.separator}{level.name}"
+                ancestor_keys = (*parent_meta.ancestor_keys, *parent_meta.id_columns)
             prefix = f"{path}{self.separator}" if path else ""
 
             id_columns, id_exprs = self._resolve_fields(index, level.id_fields)
@@ -3188,22 +3758,22 @@ class HierarchicalPacker:
                 index, level.required_fields or ()
             )
 
-            metas.append(
-                LevelMetadata(
-                    index=index,
-                    name=level.name,
-                    path=path,
-                    prefix=prefix,
-                    ancestor_keys=tuple(ancestor_keys),
-                    id_columns=tuple(id_columns),
-                    id_exprs=tuple(id_exprs),
-                    required_columns=tuple(required_columns),
-                    required_exprs=tuple(required_exprs),
-                    order_by=tuple(level.order_by or ()),
-                )
+            meta = LevelMetadata(
+                index=index,
+                name=level.name,
+                path=path,
+                prefix=prefix,
+                ancestor_keys=ancestor_keys,
+                id_columns=tuple(id_columns),
+                id_exprs=tuple(id_exprs),
+                required_columns=tuple(required_columns),
+                required_exprs=tuple(required_exprs),
+                order_by=tuple(level.order_by or ()),
+                parent=parent_name,
+                children=tuple(self.spec.children_of(level.name)),
             )
-
-            ancestor_keys.extend(id_columns)
+            metas.append(meta)
+            by_name[level.name] = meta
 
         return metas
 
@@ -3240,6 +3810,20 @@ class HierarchicalPacker:
 
         if not level_cols:
             return lf, schema
+
+        # Put the child branches last, in declaration order, so the struct's
+        # field order does not depend on which axis the caller unpacked. Without
+        # this, packing a service-axis frame and a building-axis frame back to
+        # the root would yield city structs with the same fields in different
+        # orders. A chain already satisfies this — its single child column is
+        # appended by the previous iteration — so the ordering is unchanged there.
+        branch_paths = [
+            self._levels_meta[self.spec.index_of(child)].path for child in meta.children
+        ]
+        branch_set = set(branch_paths)
+        level_cols = [col for col in level_cols if col not in branch_set] + [
+            path for path in branch_paths if path in level_cols
+        ]
 
         group_keys = list(meta.ancestor_keys)
 

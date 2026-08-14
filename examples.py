@@ -29,6 +29,7 @@ import polars as pl
 from nexpresso import (
     HierarchicalPacker,
     HierarchySpec,
+    HierarchyView,
     LevelAttribute,
     LevelSpec,
     apply_nested_operations,
@@ -782,6 +783,102 @@ def demonstrate_streaming_pack():
     print(f"\nsplit_join pack produced {split_joined.height} region rows (same contents)")
 
 
+def demonstrate_multiple_branches():
+    """Part 11: A level with two independent child branches."""
+    print_section(
+        "Part 11: Hierarchies That Branch",
+        "A city has streets (which have buildings) and, orthogonally, services.\n"
+        "Services are a property of the city, not a stage of the street chain, so\n"
+        "they hang off `city` as a second branch.",
+    )
+
+    spec = HierarchySpec.from_levels(
+        LevelSpec(name="country", id_fields=["code"]),
+        LevelSpec(name="city", id_fields=["id"], parent="country", parent_keys=["code"]),
+        LevelSpec(name="street", id_fields=["id"], parent="city", parent_keys=["city_id"]),
+        LevelSpec(name="building", id_fields=["id"], parent="street", parent_keys=["street_id"]),
+        LevelSpec(name="service", id_fields=["kind"], parent="city", parent_keys=["city_id"]),
+    )
+    packer = HierarchicalPacker(spec)
+
+    print_subsection("The shape")
+    print("country")
+    print("  └── city")
+    print("        ├── street ── building")
+    print("        └── service")
+    print(f"\nleaf levels: {packer.leaf_levels}")
+    for axis in packer.axes:
+        print(f"axis: {' > '.join(axis)}")
+
+    tables = {
+        "country": pl.DataFrame({"country.code": ["US"], "country.name": ["USA"]}),
+        "city": pl.DataFrame(
+            {
+                "country.code": ["US", "US"],
+                "country.city.id": ["NYC", "LA"],
+                "country.city.population": [8, 4],
+            }
+        ),
+        "street": pl.DataFrame(
+            {
+                "country.code": ["US", "US", "US"],
+                "country.city.id": ["NYC", "NYC", "LA"],
+                "country.city.street.id": ["s1", "s2", "s3"],
+                "country.city.street.length": [100, 200, 300],
+            }
+        ),
+        "building": pl.DataFrame(
+            {
+                "country.code": ["US", "US", "US"],
+                "country.city.id": ["NYC", "NYC", "LA"],
+                "country.city.street.id": ["s1", "s2", "s3"],
+                "country.city.street.building.id": ["b1", "b2", "b3"],
+                "country.city.street.building.floors": [10, 20, 30],
+            }
+        ),
+        "service": pl.DataFrame(
+            {
+                "country.code": ["US", "US", "US"],
+                "country.city.id": ["NYC", "NYC", "LA"],
+                "country.city.service.kind": ["police", "fire", "water"],
+                "country.city.service.budget": [100, 200, 300],
+            }
+        ),
+    }
+
+    nested = packer.denormalize(tables, target_level="country")
+    print_subsection("Packed: the city struct carries both branches")
+    city_fields = nested.schema["country"].to_schema()["city"].inner.to_schema()
+    for name, dtype in city_fields.items():
+        print(f"  city.{name}: {dtype}")
+
+    print_subsection("Unpacking one axis leaves the other packed")
+    buildings = packer.unpack(nested, "building")
+    print(f"unpack -> building  ({buildings.height} rows)")
+    print(f"  service column stays nested: {buildings.schema['country.city.service']}")
+
+    services = packer.unpack(nested, "service")
+    print(f"\nunpack -> service   ({services.height} rows)")
+    print(f"  street column stays nested: {services.schema['country.city.street']}")
+
+    print("\nNothing is dropped, so re-packing either frame reproduces the original:")
+    repacked = packer.pack(buildings, "country")
+    print(f"  pack(unpack(nested, 'building'), 'country') == nested: {repacked.equals(nested)}")
+
+    print_subsection("A view routes queries to the right branch")
+    view = HierarchyView.from_tables(tables, packer)
+    rich = view.promote(
+        "budget", from_level="service", to_level="city", agg="sum", alias="total_budget"
+    )
+    print(rich.tables()["city"].collect())
+
+    # Filtering one branch cascades through the shared ancestor into the other.
+    funded = view.filter(pl.col("country.city.service.budget") >= 300)
+    counts = {name: lf.collect().height for name, lf in funded.tables().items()}
+    print(f"\nfilter service.budget >= 300 -> rows per level: {counts}")
+    print("  (LA is the only city left, so only its street and building survive)")
+
+
 def main():
     """Run all examples."""
     print("\n" + "=" * 80)
@@ -814,6 +911,9 @@ def main():
 
     # Part 10: Memory-bounded streaming pack/unpack
     demonstrate_streaming_pack()
+
+    # Part 11: Hierarchies that branch
+    demonstrate_multiple_branches()
 
     print("\n" + "=" * 80)
     print("  ALL EXAMPLES COMPLETED SUCCESSFULLY!")

@@ -49,6 +49,10 @@ EmptyParentMode = Literal["prune", "keep"]
 parent whose children were all filtered away disappears. ``"keep"`` retains it
 with an empty child list, which is cheaper (no semi-join cascade) and is what
 you want when the parent row is meaningful on its own.
+
+Where the hierarchy branches, ``"prune"`` applies per branch: a city left with
+no streets is dropped even if its services survived, because packing along the
+street axis has nothing to pack for it.
 """
 
 
@@ -350,6 +354,39 @@ class HierarchyView:
         meta = self._meta[level]
         return [*meta.ancestor_keys, *meta.id_columns]
 
+    def _parent_in_view(self, level: str) -> str | None:
+        """
+        The nearest ancestor of ``level`` present in this view.
+
+        A view may hold a subset of the hierarchy's levels, so the structural
+        parent is not always available; the nearest present ancestor is what the
+        foreign keys still connect to.
+        """
+        for name in reversed(self._packer.spec.ancestors_of(level)):
+            if name in self._tables:
+                return name
+        return None
+
+    def _edges(self) -> list[tuple[str, str]]:
+        """
+        ``(parent, child)`` pairs over the levels present, parents first.
+
+        In a chain this is each level paired with the one before it. Where the
+        hierarchy branches, a parent appears once per branch — which is what
+        makes the consistency cascades and the ancestor tests below fan out
+        correctly instead of following declaration order.
+        """
+        edges: list[tuple[str, str]] = []
+        for name in self._tables:
+            parent = self._parent_in_view(name)
+            if parent is not None:
+                edges.append((parent, name))
+        return edges
+
+    def _ancestors_in_view(self, level: str) -> list[str]:
+        """Ancestors of ``level`` present in this view, root first."""
+        return [name for name in self._packer.spec.ancestors_of(level) if name in self._tables]
+
     def _columns_of(self, level: str, tables: Mapping[str, pl.LazyFrame] | None = None) -> set[str]:
         """
         Column names at ``level``, cached per view.
@@ -417,31 +454,52 @@ class HierarchyView:
         if not self._restricted:
             return tables
 
-        ordered = list(tables)
-
-        # Downward: children follow their surviving parents.
+        edges = self._edges()
         dirty = set(self._restricted)
-        for parent, child in zip(ordered[:-1], ordered[1:]):
-            if parent not in dirty:
-                continue
+        applied: set[tuple[str, str, str]] = set()
+
+        def cascade(parent: str, child: str, direction: str) -> bool:
+            """Semi-join one edge once; report whether it added a restriction."""
+            if (parent, child, direction) in applied:
+                return False
             keys = [c for c in self._key_columns(parent) if c in self._columns_of(child)]
             if not keys:
-                continue
-            tables[child] = self._semi_join(tables[child], tables[parent], keys)
-            dirty.add(child)
+                return False
+            applied.add((parent, child, direction))
+            if direction == "down":
+                tables[child] = self._semi_join(tables[child], tables[parent], keys)
+                dirty.add(child)
+            else:
+                tables[parent] = self._semi_join(tables[parent], tables[child], keys)
+                dirty.add(parent)
+            return True
 
-        if self._empty_parents == "keep":
-            return tables
+        # The two cascades feed each other once the hierarchy branches: filtering
+        # ``service`` prunes cities upward, and those pruned cities must then
+        # prune ``street`` downward — a branch the first downward pass never
+        # touched. Alternate until nothing new is restricted. Each edge is
+        # semi-joined at most once per direction, so this adds no repeated work;
+        # an unbranched chain settles after the first round.
+        changed = True
+        while changed:
+            changed = False
+            # Downward: children follow their surviving parents. Parents-first
+            # order carries a restriction the full depth of a branch in one pass.
+            for parent, child in edges:
+                if parent in dirty:
+                    changed |= cascade(parent, child, "down")
 
-        # Upward: parents that lost every child disappear.
-        for child, parent in zip(reversed(ordered[1:]), reversed(ordered[:-1])):
-            if child not in dirty:
+            if self._empty_parents == "keep":
                 continue
-            keys = [c for c in self._key_columns(parent) if c in self._columns_of(child)]
-            if not keys:
-                continue
-            tables[parent] = self._semi_join(tables[parent], tables[child], keys)
-            dirty.add(parent)
+
+            # Upward: parents that lost every child disappear. Each branch prunes
+            # independently, so a city with no surviving streets is dropped even
+            # if its services survived — matching ``pack`` along the street axis,
+            # where a childless parent has nothing to pack.
+            for parent, child in reversed(edges):
+                if child in dirty:
+                    changed |= cascade(parent, child, "up")
+
         return tables
 
     def _augmented(
@@ -477,7 +535,7 @@ class HierarchyView:
         """
         lf = tables[level]
         present = self._columns_of(level, tables)
-        order = list(tables)
+        ancestors = set(self._packer.spec.ancestors_of(level))
         added: list[str] = []
         for name in columns:
             if name in present:
@@ -490,8 +548,10 @@ class HierarchyView:
                 )
             # Borrowing only ever goes *up* the hierarchy. Pulling a descendant
             # column into an ancestor would fan the ancestor out to child
-            # granularity — silently turning 4 region rows into 120.
-            if order.index(owner) >= order.index(level):
+            # granularity — silently turning 4 region rows into 120. A level on
+            # a *sibling* branch is no better: it shares only an ancestor, so
+            # joining it in would cross every street with every service.
+            if owner not in ancestors:
                 raise ValueError(
                     f"Cannot compute a {level!r}-level column from {owner!r}-level input "
                     f"{name!r}: {owner!r} is not an ancestor of {level!r}. "
@@ -529,8 +589,14 @@ class HierarchyView:
         tables[level] = getattr(widened, method)(expr).drop(borrowed)
 
     def _deepest_owner(self, tables: Mapping[str, pl.LazyFrame], roots: Iterable[str]) -> str:
-        """The finest level owning any of ``roots``; that is where they can meet."""
-        order = list(tables)
+        """
+        The finest level owning any of ``roots``; that is where they can meet.
+
+        Such a level exists only when every other owner is one of its ancestors.
+        Owners on different branches share nothing below their common ancestor,
+        so there is no granularity at which the columns line up row-for-row —
+        joining them would pair every street with every service.
+        """
         owners = [(c, self._owner_of(c)) for c in roots]
         unknown = [c for c, owner in owners if owner is None or owner not in tables]
         if unknown:
@@ -541,7 +607,21 @@ class HierarchyView:
                 else ""
             )
             raise KeyError(f"Unknown column(s): {unknown}{hint}. Known columns: {known}.")
-        return max((owner for _, owner in owners if owner), key=order.index)
+
+        spec = self._packer.spec
+        names = {owner for _, owner in owners if owner}
+        for candidate in names:
+            others = names - {candidate}
+            if all(spec.is_ancestor_of(other, candidate) for other in others):
+                return candidate
+
+        branches = sorted(names)
+        raise ValueError(
+            f"Columns span levels {branches}, which lie on different branches of the "
+            "hierarchy: no level is a descendant of all of them, so there is no "
+            "granularity at which they align. Aggregate one branch onto the shared "
+            "ancestor with promote(), or apply the expressions separately."
+        )
 
     # =========================================================================
     # Operations
@@ -818,12 +898,12 @@ class HierarchyView:
         for name in (from_level, to_level):
             if name not in self._tables:
                 raise KeyError(f"Level {name!r} is not present in this view: {self.levels}.")
-        from_idx = self._packer.spec.index_of(from_level)
-        to_idx = self._packer.spec.index_of(to_level)
-        if from_idx != to_idx + 1:
+        parent = self._packer.spec.parent_of(from_level)
+        if parent != to_level:
             raise ValueError(
                 f"from_level {from_level!r} must be the immediate child of "
-                f"to_level {to_level!r}. Got indices {from_idx} and {to_idx}."
+                f"to_level {to_level!r}, but its parent is {parent!r}. Immediate "
+                f"children of {to_level!r}: {self._packer.spec.children_of(to_level)}."
             )
 
         source = self._qualified(from_level, attribute)
@@ -886,9 +966,11 @@ class HierarchyView:
         for name in (at_level, child_level):
             if name not in self._tables:
                 raise KeyError(f"Level {name!r} is not present in this view: {self.levels}.")
-        if self._packer.spec.index_of(child_level) <= self._packer.spec.index_of(at_level):
+        if not self._packer.spec.is_ancestor_of(at_level, child_level):
             raise ValueError(
-                f"child_level {child_level!r} must be finer than at_level {at_level!r}."
+                f"child_level {child_level!r} must be finer than at_level {at_level!r} "
+                f"and on the same branch. Descendants of {at_level!r}: "
+                f"{self._packer.spec.descendants_of(at_level)}."
             )
 
         keys = [c for c in self._key_columns(at_level) if c in self._columns_of(child_level)]
@@ -930,8 +1012,15 @@ class HierarchyView:
         :meth:`~nexpresso.HierarchicalPacker.normalize` guarantees are present
         as foreign keys.
 
+        Only the levels on ``level``'s **axis** — its root → ``level`` chain —
+        are joined. Sibling branches are left out rather than crossed in: a flat
+        frame has one granularity, and joining two branches would pair every
+        street with every service. Call ``to_flat`` once per branch, or use
+        :meth:`promote` to bring a branch's values onto the shared ancestor.
+
         Args:
-            level: Target granularity. Defaults to the finest level in the view.
+            level: Target granularity. Defaults to the finest level in the view
+                when the hierarchy has only one leaf.
 
         Returns:
             An unexecuted ``LazyFrame`` at ``level`` granularity, with the same
@@ -939,16 +1028,18 @@ class HierarchyView:
 
         Raises:
             KeyError: If ``level`` is absent from the view.
+            ValueError: If ``level`` is omitted and the view has several leaf
+                levels, where there is no single finest granularity.
         """
         ordered = list(self._tables)
-        target = level if level is not None else ordered[-1]
+        target = level if level is not None else self._default_target(ordered)
         if target not in self._tables:
             raise KeyError(f"Level {target!r} is not present in this view: {ordered}.")
 
         tables = self._resolved_tables()
-        lf = tables[ordered[0]]
-        for name in ordered[1 : ordered.index(target) + 1]:
-            parent = ordered[ordered.index(name) - 1]
+        axis = [*self._ancestors_in_view(target), target]
+        lf = tables[axis[0]]
+        for parent, name in zip(axis[:-1], axis[1:]):
             keys = [c for c in self._key_columns(parent) if c in self._columns_of(name)]
             lf = (
                 lf.join(tables[name], on=keys, how="inner")
@@ -956,6 +1047,25 @@ class HierarchyView:
                 else lf.join(tables[name], how="cross")
             )
         return lf
+
+    def _default_target(self, ordered: list[str]) -> str:
+        """
+        The level :meth:`to_flat` flattens to when the caller names none.
+
+        Well defined only for a single-branch view: with several leaves the
+        "finest level" is a different granularity per branch.
+        """
+        leaves = [name for name in ordered if not self._children_in_view(name)]
+        if len(leaves) > 1:
+            raise ValueError(
+                f"This view has {len(leaves)} leaf levels {leaves}, one per branch, so "
+                "there is no single finest granularity. Name the level to flatten to."
+            )
+        return leaves[0] if leaves else ordered[-1]
+
+    def _children_in_view(self, level: str) -> list[str]:
+        """Levels in this view whose nearest present ancestor is ``level``."""
+        return [name for name in self._tables if self._parent_in_view(name) == level]
 
     def collect(self, level: str | None = None) -> pl.DataFrame:
         """

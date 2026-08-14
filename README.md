@@ -98,6 +98,7 @@ packed = packer.pack(flat, "region")        # Aggregate back to region level
 |---------|-------------|
 | **Build from Tables** | Join normalized tables into nested hierarchy |
 | **Pack/Unpack** | Navigate between granularity levels |
+| **Multiple Branches** | A level can carry several independent child branches; pack/unpack along either axis |
 | **Streaming Pack/Unpack** | Memory-bounded `pack_streaming` / `unpack_streaming` for large data |
 | **Normalize/Denormalize** | Split into per-level tables and reconstruct |
 | **Validation** | Check for null keys and data integrity |
@@ -142,8 +143,40 @@ LevelSpec(
     name="store",           # Level identifier
     id_fields=["id"],       # Unique key columns
     parent_keys=["region_id"],  # Foreign key to parent (for build_from_tables)
+    parent=None,            # Parent level name; None = the level declared before
 )
 ```
+
+### Multiple Branches
+
+Levels form a chain by default. Naming a `parent` explicitly makes the hierarchy
+a tree, so one level can carry several *independent* child branches — a city has
+streets (which have buildings) and, orthogonally, services:
+
+```python
+spec = HierarchySpec.from_levels(
+    LevelSpec(name="country",  id_fields=["code"]),
+    LevelSpec(name="city",     id_fields=["id"],   parent="country", parent_keys=["code"]),
+    LevelSpec(name="street",   id_fields=["id"],   parent="city",    parent_keys=["city_id"]),
+    LevelSpec(name="building", id_fields=["id"],   parent="street",  parent_keys=["street_id"]),
+    LevelSpec(name="service",  id_fields=["kind"], parent="city",    parent_keys=["city_id"]),
+)
+```
+
+Each root → level chain is an **axis**. A flat frame holds one granularity, so
+`pack` and `unpack` work along the axis their target names and leave sibling
+branches packed:
+
+```python
+packer.unpack(nested, "building")   # street axis; `country.city.service` stays nested
+packer.unpack(nested, "service")    # service axis; `country.city.street` stays nested
+```
+
+Nothing is dropped and nothing is cross-joined, so re-packing either frame
+reproduces the original. `HierarchyView` follows the same rule: `to_flat(level)`
+joins one axis, and a filter on one branch cascades to the other through their
+shared ancestor. See
+[Hierarchical Data](https://heshamdar.github.io/polars-nexpresso/concepts/hierarchical-data/#multiple-branches-per-level).
 
 ## Examples
 
@@ -324,9 +357,10 @@ Create a hierarchy specification from level definitions.
 keys are stripped from the per-level tables, so a hierarchy relying on them cannot
 round-trip through `normalize` / `denormalize`.
 
-#### `LevelSpec(name, id_fields, required_fields=None, order_by=None, parent_keys=None)`
+#### `LevelSpec(name, id_fields, required_fields=None, order_by=None, parent_keys=None, parent=None)`
 
-Define a single level in the hierarchy.
+Define a single level in the hierarchy. `parent` names this level's parent; leave
+it `None` for a linear chain, or set it on every non-root level to branch.
 
 ## Running Examples
 

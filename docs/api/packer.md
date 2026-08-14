@@ -100,15 +100,27 @@ Unpack nested structures to the specified level.
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `frame` | `DataFrame \| LazyFrame` | The frame to unpack |
-| `to_level` | `str` | Target level name |
+| `to_level` | `str` | Target level name; its **axis** is what gets exploded |
 
 **Returns:** Same type as input with flattened columns
+
+!!! note "Branching hierarchies"
+    Only the root → `to_level` chain is exploded. Sibling branches hanging off
+    that chain stay packed as `List[Struct]` columns, replicated onto each
+    emitted row — a flat frame carries one granularity, so exploding a second
+    branch alongside the first would cross every child of one with every child
+    of the other. Unpack to a level on the other branch to explode that one.
+    See [Multiple branches](../concepts/hierarchical-data.md#multiple-branches-per-level).
 
 **Example:**
 
 ```python
 # Unpack to street level
 flat = packer.unpack(packed_df, "street")
+
+# Branching hierarchy: each call explodes one axis
+buildings = packer.unpack(nested, "building")   # `country.city.service` stays packed
+services  = packer.unpack(nested, "service")    # `country.city.street` stays packed
 ```
 
 ---
@@ -292,6 +304,13 @@ descendants).
 packer.denormalize(packer.normalize(df, root_level=L), target_level=L)
     == packer.pack(df, L)
 ```
+
+(Top-level row order is not part of `pack`'s contract, so compare with
+`check_row_order=False`.) In a branching hierarchy this holds per axis: `df`
+must be flat along the axis that contains `L`, since a flat frame carries only
+one. A parent with several branches receives one `List[Struct]` column per
+branch, and a target below a branch point keeps its ancestors' other branches as
+packed columns — exactly what `pack` produces.
 
 **Parameters:**
 
