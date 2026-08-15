@@ -88,9 +88,13 @@ def _split_path_static(
     Standalone version of :meth:`HierarchicalPacker._split_path` for use
     without an instance (e.g. in :meth:`HierarchicalPacker.discover_levels`).
 
+    The separator is matched as a **substring**, not a character, so a
+    multi-character separator such as ``"__"`` splits correctly and an escaped
+    one (``"a\\__b"``) is a literal part of the field name.
+
     Args:
         path: The path string to split.
-        separator: Separator character between path components.
+        separator: Separator between path components; may be several characters.
         escape_char: Character used to escape literal separators in field names.
 
     Returns:
@@ -99,17 +103,24 @@ def _split_path_static(
     if not path:
         return []
 
+    escaped_separator = escape_char + separator
     components: list[str] = []
     current: list[str] = []
     i = 0
     while i < len(path):
-        if path[i] == escape_char and i + 1 < len(path):
-            current.append(path[i + 1])
-            i += 2
-        elif path[i] == separator:
+        # Longest match first: an escaped separator is a literal separator,
+        # however many characters the separator happens to be.
+        if path.startswith(escaped_separator, i):
+            current.append(separator)
+            i += len(escaped_separator)
+        elif path.startswith(escape_char, i) and i + len(escape_char) < len(path):
+            # Any other escape keeps the following character as-is (``\\`` -> ``\``).
+            current.append(path[i + len(escape_char)])
+            i += len(escape_char) + 1
+        elif path.startswith(separator, i):
             components.append("".join(current))
             current = []
-            i += 1
+            i += len(separator)
         else:
             current.append(path[i])
             i += 1
@@ -3480,7 +3491,7 @@ class HierarchicalPacker:
 
     def _split_path(self, path: str) -> list[str]:
         """
-        Split a path by separator, respecting escaped separators.
+        Split a path by this packer's separator, respecting escaped separators.
 
         Args:
             path: The path to split.
@@ -3488,30 +3499,7 @@ class HierarchicalPacker:
         Returns:
             List of path components.
         """
-        if not path:
-            return []
-
-        # Use a simple state machine to handle escapes
-        components: list[str] = []
-        current: list[str] = []
-        i = 0
-        while i < len(path):
-            if path[i] == self.escape_char and i + 1 < len(path):
-                # Escaped character - include the next character literally
-                current.append(path[i + 1])
-                i += 2
-            elif path[i] == self.separator:
-                # Unescaped separator - end current component
-                components.append("".join(current))
-                current = []
-                i += 1
-            else:
-                current.append(path[i])
-                i += 1
-
-        # Add final component
-        components.append("".join(current))
-        return components
+        return _split_path_static(path, self.separator, self.escape_char)
 
     def _join_path(self, components: Sequence[str]) -> str:
         """

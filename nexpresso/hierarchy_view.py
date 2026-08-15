@@ -77,9 +77,12 @@ class HierarchyView:
     returns a new view — the underlying frames are never mutated — and nothing
     executes until you collect or sink.
 
-    Columns are addressed by their full dotted path — ``"region.store.sale.amount"``
+    Columns are addressed by their full path from the root, joined by the
+    packer's separator — ``"region.store.sale.amount"`` with the default ``"."``
     — exactly as they appear in a flat/unpacked frame, regardless of which
-    physical table they live in.
+    physical table they live in. Build paths with
+    :meth:`~nexpresso.HierarchicalPacker.join_path` rather than an f-string when
+    the separator may not be the default.
 
     Args:
         tables: Mapping of level name to that level's table, in the level-local
@@ -278,7 +281,7 @@ class HierarchyView:
 
     @property
     def columns(self) -> list[str]:
-        """Every column addressable through this view, as dotted paths."""
+        """Every column addressable through this view, as full separator-joined paths."""
         seen: dict[str, None] = {}
         for lf in self._tables.values():
             for name in lf.collect_schema().names():
@@ -308,13 +311,13 @@ class HierarchyView:
         """
         The level that *owns* ``column``.
 
-        Ownership follows the dotted path: ``"region.store.sale.amount"`` is
+        Ownership follows the column's path: ``"region.store.sale.amount"`` is
         owned by the level whose path is ``"region.store.sale"``. Ancestor key
         columns are replicated into descendant tables as foreign keys, but they
         are owned by the ancestor that declares them.
 
         Args:
-            column: A dotted column path.
+            column: A full column path.
 
         Returns:
             The owning level's name.
@@ -671,7 +674,7 @@ class HierarchyView:
                 that does not belong to ``level`` — see the note.
 
         Note:
-            Columns must be named with ``level``'s full dotted path, because that
+            Columns must be named with ``level``'s full path, because that
             is how :meth:`nested` knows where to put them. An unqualified name
             survives :meth:`level` and is silently **dropped** by :meth:`nested`,
             which is a quiet way to lose a column, so it is rejected here
@@ -700,7 +703,7 @@ class HierarchyView:
             example = self._qualified(level, "my_column")
             raise ValueError(
                 f"Transform of level {level!r} produced column(s) {stray} that do not "
-                f"belong to it. nested() places columns by their dotted path, so an "
+                f"belong to it. nested() places columns by their path, so an "
                 f"unqualified or foreign name would be dropped on the way out. Name "
                 f"them for this level, e.g. {example!r}."
             )
@@ -736,7 +739,7 @@ class HierarchyView:
         granularity.
 
         Args:
-            *predicates: Boolean expressions over dotted column paths.
+            *predicates: Boolean expressions over full column paths.
 
         Returns:
             A new view with the predicates applied.

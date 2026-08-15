@@ -30,11 +30,22 @@ hierarchy survives and can still be filtered, nested or sunk.
 | [`.filter(*predicates)`](#filter) | `HierarchyView` | Restrict the hierarchy consistently |
 | `.sink_parquet(dest, *, pattern="{level}", **kwargs)` | `None` | Stream one file per level |
 
-Columns are addressed by their full dotted path (`"region.store.sale.amount"`),
-exactly as in a flat/unpacked frame, regardless of which physical table holds
-them. Paths are split with the packer's own escaping rules, so a field whose
-name contains the separator (stored as `region.store.net\.sales`) resolves
-correctly.
+Columns are addressed by their full path from the root, exactly as in a
+flat/unpacked frame, regardless of which physical table holds them.
+
+The separator is the packer's, not a hard-coded `.`:
+
+```python
+packer = HierarchicalPacker(spec, granularity_separator="__")
+view.level_of("region__store__sale__amount")   # -> "sale"
+```
+
+Any string works, including multi-character ones. Build paths with
+`packer.join_path([...])` rather than an f-string, and let
+`packer.escape_field(...)` handle a field name that itself contains the
+separator (stored as `region.store.net\.sales` with the default). Everything the
+view does — ownership, `key_columns`, routing, the `with_level` naming check —
+goes through those helpers.
 
 ## Constructors
 
@@ -159,7 +170,7 @@ Two things are checked, because both fail quietly otherwise:
 
 - the level's **key columns** must survive, or it can no longer be related to the
   rest of the hierarchy;
-- every column must be named with the level's **full dotted path**. `nested()`
+- every column must be named with the level's **full path**. `nested()`
   places columns by path, so an unqualified name survives `level()` and is
   silently *dropped* by `nested()`. `with_level` raises instead.
 

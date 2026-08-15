@@ -295,9 +295,32 @@ it is an error.
     print("    packer.split_path('region.store.net\\\\.sales')")
     print(f"      -> {packer.split_path(chr(92).join(['region.store.net', '.sales']))}")
 
-    sub("A different separator changes every path")
-    other = HierarchicalPacker(SPEC, granularity_separator="__")
-    print(f"  level paths with '__': {[m.path for m in other._levels_meta]}")  # noqa: SLF001
+    sub("The separator is configurable — nothing assumes '.'")
+    for sep in (".", "__", " -> "):
+        other = HierarchicalPacker(SPEC, granularity_separator=sep)
+        amount = other.join_path(["region", "store", "sale", "amount"])
+        # A full round trip on that separator: build a frame, view it, resolve
+        # ownership, roll up. Ownership is resolved by SPLITTING the path, so it
+        # is the strictest check that the separator is honoured throughout.
+        frame = pl.DataFrame(
+            {
+                other.join_path(["region", "id"]): [1, 1],
+                other.join_path(["region", "store", "region_id"]): [1, 1],
+                other.join_path(["region", "store", "id"]): [10, 11],
+                other.join_path(["region", "store", "sale", "store_id"]): [10, 11],
+                other.join_path(["region", "store", "sale", "id"]): [100, 110],
+                amount: [5.0, 6.0],
+            }
+        )
+        v = HierarchyView.from_frame(frame, other)
+        total = (
+            v.tables()["sale"]
+            .group_by(v.key_columns("region"))
+            .agg(pl.col(amount).sum().alias("t"))
+            .collect()["t"]
+            .item()
+        )
+        print(f"  sep={sep!r:8} level_of({amount!r}) = {v.level_of(amount)!r}, rollup = {total}")
 
     sub("THE RULE THAT BITES: naming decides whether a column survives nesting")
     print(

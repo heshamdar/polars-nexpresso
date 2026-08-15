@@ -101,6 +101,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A multi-character `granularity_separator` never worked.** Both path splitters
+  compared one **character** at a time (`path[i] == separator`), so a separator
+  such as `"__"` or `"::"` never matched and a path came back as a single
+  unsplit component. `join_path` and `escape_field` were correct, so paths were
+  *written* correctly and could not be read back: `split_path` was not the
+  inverse of `join_path`, and since column ownership is resolved by splitting,
+  `HierarchyView` could not route anything at all — `level_of` raised, and
+  `with_level` rejected every column. Only a single-character separator (the
+  `"."` default) worked.
+
+  Both splitters now match the separator as a substring, and
+  `HierarchicalPacker._split_path` delegates to the module-level
+  `_split_path_static` so the two cannot drift again. The escape convention
+  extends to it: `escape_char` before a *whole* separator occurrence is a
+  literal separator in a field name.
+
+  `tests/test_custom_separator.py` runs the packer and view suites across
+  `".", "__", "::", "/", "|", " -> "` — 15 of its cases fail without this fix.
+
 - **An aggregating predicate over an ancestor key is no longer refused.**
   `view.filter(pl.col("region.id").count() > 10)` raised `ValueError`; it now
   evaluates at the level that *owns* the column, so the count is the number of
