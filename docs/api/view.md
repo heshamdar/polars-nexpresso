@@ -17,14 +17,16 @@ a frame has exactly one.
 
 ## The surface
 
-The view is deliberately small. Three methods get data out, one restricts the
-hierarchy, the rest is introspection.
+The view is deliberately small, and the return type tells you which context you
+are in. Three methods get data **out** as frames; two return a **view**, so the
+hierarchy survives and can still be filtered, nested or sunk.
 
 | Method | Returns | What it is for |
 |---|---|---|
 | [`.level(at_level=None)`](#level) | `pl.LazyFrame` | Work at one granularity — the main entry point |
 | [`.nested(at_level=None)`](#nested) | `pl.LazyFrame` | The packed `List[Struct]` shape, at the boundary |
 | [`.tables()`](#tables) | `dict[str, pl.LazyFrame]` | The per-level plans, no join at all |
+| [`.with_level(level, transform)`](#with_level) | `HierarchyView` | Modify one level and keep a view |
 | [`.filter(*predicates)`](#filter) | `HierarchyView` | Restrict the hierarchy consistently |
 | `.sink_parquet(dest, *, pattern="{level}", **kwargs)` | `None` | Stream one file per level |
 
@@ -131,6 +133,39 @@ tables = dict(view.tables())
 tables["sale"] = tables["sale"].with_columns(expr)
 view = HierarchyView.from_tables(tables, packer)
 ```
+
+## with_level
+
+```python
+def with_level(
+    self,
+    level: str,
+    transform: Callable[[pl.LazyFrame], pl.LazyFrame],
+) -> HierarchyView: ...
+```
+
+`level()` hands you a frame and lets go, which is what you want for a query.
+`with_level` keeps the hierarchy, so the result can still be filtered, nested or
+sunk. `transform` receives that level's own `LazyFrame` — ancestor **keys** are
+on it, ancestor *attributes* are not:
+
+```python
+view.with_level("sale", lambda lf: lf.with_columns(
+    (pl.col("region.store.sale.amount") * 2).alias("region.store.sale.doubled")
+))
+```
+
+Two things are checked, because both fail quietly otherwise:
+
+- the level's **key columns** must survive, or it can no longer be related to the
+  rest of the hierarchy;
+- every column must be named with the level's **full dotted path**. `nested()`
+  places columns by path, so an unqualified name survives `level()` and is
+  silently *dropped* by `nested()`. `with_level` raises instead.
+
+Doing this by hand through `tables()` and `from_tables` also works, and is what
+you want when several levels change at once — but it skips the checks above and
+silently resets `empty_parents` to `"prune"`.
 
 ## filter
 
@@ -274,13 +309,11 @@ restricts the sales themselves and prunes regions left with none.
 
 ### Getting a derived column into the nested shape
 
-Two routes. If the column is local to one level, edit that table and rebuild —
-nothing is ever widened to another granularity:
+Two routes. If the column is local to one level, use
+[`with_level`](#with_level) — nothing is ever widened to another granularity:
 
 ```python
-tables = dict(view.tables())
-tables["sale"] = tables["sale"].with_columns(expr)
-HierarchyView.from_tables(tables, packer).nested().collect()
+view.with_level("sale", lambda lf: lf.with_columns(expr)).nested().collect()
 ```
 
 If it is cross-level, compute it on `level()` and pack the result. Name derived
