@@ -36,7 +36,7 @@ See ``docs/concepts/storage-layouts.md`` for the measurements behind this.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -636,6 +636,78 @@ class HierarchyView:
     # =========================================================================
     # Operations
     # =========================================================================
+
+    def with_level(
+        self,
+        level: str,
+        transform: Callable[[pl.LazyFrame], pl.LazyFrame],
+    ) -> HierarchyView:
+        """
+        Replace one level's table, keeping a view.
+
+        :meth:`level` gives you a frame and lets go; this keeps the hierarchy, so
+        the result can still be filtered, nested or sunk. ``transform`` receives
+        that level's own ``LazyFrame`` — ancestor **keys** are on it, ancestor
+        *attributes* are not — and returns the new one:
+
+            view.with_level("sale", lambda lf: lf.with_columns(
+                (pl.col("region.store.sale.amount") * 2).alias("region.store.sale.dbl")
+            ))
+
+        Doing this by hand through :meth:`tables` and
+        :meth:`from_tables` works too, but silently drops ``empty_parents`` and
+        skips the naming check below.
+
+        Args:
+            level: The level whose table to replace.
+            transform: Called with the level's ``LazyFrame``, returns the new one.
+
+        Returns:
+            A new view with that level rebuilt.
+
+        Raises:
+            KeyError: If ``level`` is absent from the view.
+            ValueError: If the result drops a key column, or carries a column
+                that does not belong to ``level`` — see the note.
+
+        Note:
+            Columns must be named with ``level``'s full dotted path, because that
+            is how :meth:`nested` knows where to put them. An unqualified name
+            survives :meth:`level` and is silently **dropped** by :meth:`nested`,
+            which is a quiet way to lose a column, so it is rejected here
+            instead. Use :meth:`~nexpresso.HierarchicalPacker.join_path` or
+            :meth:`~nexpresso.HierarchicalPacker.escape_field` when a field name
+            itself contains the separator.
+        """
+        if level not in self._tables:
+            raise KeyError(f"Level {level!r} is not present in this view: {self.levels}.")
+
+        result = transform(self._tables[level])
+        produced = result.collect_schema().names()
+
+        keys = self.key_columns(level)
+        missing = [key for key in keys if key not in produced]
+        if missing:
+            raise ValueError(
+                f"Transform of level {level!r} dropped key column(s) {missing}, which "
+                "relate it to the rest of the hierarchy. Keep "
+                f"{keys} on the frame."
+            )
+
+        allowed = set(keys)
+        stray = [name for name in produced if name not in allowed and self._owner_of(name) != level]
+        if stray:
+            example = self._qualified(level, "my_column")
+            raise ValueError(
+                f"Transform of level {level!r} produced column(s) {stray} that do not "
+                f"belong to it. nested() places columns by their dotted path, so an "
+                f"unqualified or foreign name would be dropped on the way out. Name "
+                f"them for this level, e.g. {example!r}."
+            )
+
+        tables = dict(self._tables)
+        tables[level] = result
+        return self._rebuild(tables)
 
     def filter(self, *predicates: pl.Expr) -> HierarchyView:
         """

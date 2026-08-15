@@ -75,6 +75,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   joined; sibling branches are left out rather than crossed in.
 - **`HierarchyView.nested(at_level=None)`** — the packed `List[Struct]` shape,
   lazily. Replaces `to_nested`, and `collect_nested` is now `.nested().collect()`.
+- **`HierarchyView.with_level(level, transform)`** — the counterpart to `level()`:
+  it applies a transform to one level's table and returns a **view**, so the
+  result can still be filtered, nested or sunk. Doing this through `tables()` +
+  `from_tables` works too, but silently resets `empty_parents` and skips two
+  checks `with_level` performs — that the level's key columns survive, and that
+  every column is named with the level's full dotted path. The latter matters
+  because `nested()` places columns by path, so an unqualified name survives
+  `level()` and is silently *dropped* by `nested()`.
 - **`HierarchyView.key_columns(level)`** — ancestor foreign keys then own ids.
   Public because user code needs it now: a roll-up is
   `level(child).group_by(view.key_columns(parent)).agg(...)`.

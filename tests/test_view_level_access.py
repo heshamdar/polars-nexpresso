@@ -250,3 +250,66 @@ class TestBranchesDoNotCross:
         view, _ = branching
         with pytest.raises(ValueError, match="leaf levels"):
             view.level()
+
+
+class TestWithLevel:
+    """
+    ``with_level`` is the counterpart to ``level``: it keeps the hierarchy.
+
+    ``level(g)`` hands you a frame and lets go, which is what you want for a
+    query. When the result should still be filterable, nestable or sinkable, the
+    modification has to land back on a level's table instead.
+    """
+
+    DOUBLED = "region.store.sale.doubled"
+
+    def _double(self, lf: pl.LazyFrame) -> pl.LazyFrame:
+        return lf.with_columns((pl.col(AMOUNT) * 2).alias(self.DOUBLED))
+
+    def test_returns_a_view_that_still_composes(self, view: HierarchyView):
+        widened = view.with_level("sale", self._double)
+        assert isinstance(widened, HierarchyView)
+        assert self.DOUBLED in widened.level("sale").collect_schema().names()
+        # ...and the hierarchy is intact, so the rest of the API still applies.
+        assert widened.filter(pl.col(self.DOUBLED) > 100).level("sale").collect().height > 0
+
+    def test_the_column_reaches_the_nested_shape(self, view: HierarchyView):
+        nested = view.with_level("sale", self._double).nested().collect()
+        store = nested.schema["region.store"].inner.to_schema()  # type: ignore[union-attr]
+        assert "doubled" in store["sale"].inner.to_schema()
+
+    def test_preserves_empty_parents(self, flat: pl.DataFrame, packer: HierarchicalPacker):
+        """The tables()/from_tables round trip silently resets this; with_level must not."""
+        keep = HierarchyView.from_frame(flat, packer, empty_parents="keep")
+        assert "keep" in repr(keep.with_level("sale", self._double))
+
+    def test_rejects_an_unqualified_name(self, view: HierarchyView):
+        """
+        The footgun this guard exists for.
+
+        An unqualified column survives level() and is silently dropped by
+        nested(), so the loss shows up far from its cause.
+        """
+        with pytest.raises(ValueError, match="do not belong to it"):
+            view.with_level("sale", lambda lf: lf.with_columns(pl.col(AMOUNT).alias("doubled")))
+
+    def test_rejects_a_foreign_level_name(self, view: HierarchyView):
+        with pytest.raises(ValueError, match="do not belong to it"):
+            view.with_level("sale", lambda lf: lf.with_columns(pl.lit(1).alias("region.oops")))
+
+    def test_rejects_dropping_a_key(self, view: HierarchyView):
+        with pytest.raises(ValueError, match="key column"):
+            view.with_level("sale", lambda lf: lf.drop(REGION_ID))
+
+    def test_rejects_unknown_level(self, view: HierarchyView):
+        with pytest.raises(KeyError, match="not present in this view"):
+            view.with_level("planet", self._double)
+
+    def test_matches_the_manual_round_trip(self, view: HierarchyView, packer: HierarchicalPacker):
+        tables = dict(view.tables())
+        tables["sale"] = self._double(tables["sale"])
+        manual = HierarchyView.from_tables(tables, packer).nested().collect()
+        assert_frame_equal(
+            view.with_level("sale", self._double).nested().collect().sort(REGION_ID),
+            manual.sort(REGION_ID),
+        )
