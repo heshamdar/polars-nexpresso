@@ -313,3 +313,104 @@ class TestWithLevel:
             view.with_level("sale", self._double).nested().collect().sort(REGION_ID),
             manual.sort(REGION_ID),
         )
+
+
+class TestWithLevelSeesAncestorAttributes:
+    """
+    A transform may reference any ancestor attribute, not just this level's own
+    columns and the ancestor *keys* that ``normalize`` replicates. The columns
+    are joined in for the computation and dropped again, so the level keeps its
+    own schema and ``nested()`` still places everything by path.
+    """
+
+    NET = "region.store.sale.net"
+
+    def _price(self, lf: pl.LazyFrame) -> pl.LazyFrame:
+        """Needs DISCOUNT, which lives on ``store``, not ``sale``."""
+        return lf.with_columns((pl.col(AMOUNT) * (1 - pl.col(DISCOUNT))).alias(self.NET))
+
+    def test_cross_level_derivation_needs_no_manual_join(self, view: HierarchyView):
+        priced = view.with_level("sale", self._price)
+        assert self.NET in priced.tables()["sale"].collect_schema().names()
+
+    def test_the_values_match_the_flat_computation(self, view: HierarchyView, flat: pl.DataFrame):
+        got = (
+            view.with_level("sale", self._price)
+            .level("sale")
+            .collect()
+            .sort(SALE_ID)
+            .get_column(self.NET)
+            .to_list()
+        )
+        want = (
+            flat.sort(SALE_ID)
+            .with_columns((pl.col(AMOUNT) * (1 - pl.col(DISCOUNT))).alias(self.NET))
+            .get_column(self.NET)
+            .to_list()
+        )
+        assert got == want
+
+    def test_borrowed_columns_are_lent_not_adopted(self, view: HierarchyView):
+        """The ancestor attribute must not linger on the level's own table."""
+        schema = view.with_level("sale", self._price).tables()["sale"].collect_schema().names()
+        assert DISCOUNT not in schema
+        assert REGION_NAME not in schema
+
+    def test_borrowing_does_not_change_the_row_count(self, view: HierarchyView):
+        """The join is LEFT on purpose: borrowing must never drop a row."""
+        before = view.tables()["sale"].collect().height
+        assert view.with_level("sale", self._price).tables()["sale"].collect().height == before
+
+    def test_an_ancestor_value_can_be_kept_by_naming_it_for_this_level(self, view: HierarchyView):
+        """Aliasing to this level's path makes a copy that survives the drop."""
+        snapshot = "region.store.sale.discount_at_sale"
+        kept = view.with_level("sale", lambda lf: lf.with_columns(pl.col(DISCOUNT).alias(snapshot)))
+        assert snapshot in kept.tables()["sale"].collect_schema().names()
+        assert DISCOUNT not in kept.tables()["sale"].collect_schema().names()
+
+    def test_the_derived_column_reaches_the_nested_shape(self, view: HierarchyView):
+        nested = view.with_level("sale", self._price).nested().collect()
+        store = nested.schema["region.store"].inner.to_schema()  # type: ignore[union-attr]
+        assert "net" in store["sale"].inner.to_schema()
+
+    def test_a_descendant_column_is_still_refused(self, view: HierarchyView):
+        """Borrowing goes up the hierarchy only; pulling a child down would fan out."""
+        with pytest.raises(ValueError, match="not an ancestor"):
+            view.with_level("region", lambda lf: lf.with_columns(pl.col(AMOUNT).alias("region.x")))
+
+    def test_an_unknown_column_is_named_rather_than_dumping_the_plan(self, view: HierarchyView):
+        with pytest.raises(KeyError, match="Unknown column"):
+            view.with_level(
+                "sale", lambda lf: lf.with_columns(pl.col("region.nope").alias(self.NET))
+            )
+
+    def test_a_same_level_transform_joins_nothing(self, view: HierarchyView):
+        """
+        The widening is only paid when the transform reaches for an ancestor.
+
+        A transform that names none is run against the level's own table, so the
+        common case costs no join at all.
+        """
+        plan = (
+            view.with_level("sale", lambda lf: lf.with_columns(pl.col(AMOUNT).alias(self.NET)))
+            .tables()["sale"]
+            .explain()
+        )
+        assert "JOIN" not in plan.upper()
+
+    def test_one_join_per_ancestor_level_not_per_column(self, view: HierarchyView):
+        """Two attributes from the same ancestor share a single join."""
+        plan = (
+            view.with_level(
+                "sale",
+                lambda lf: lf.with_columns(
+                    (pl.col(AMOUNT) * (1 - pl.col(DISCOUNT))).alias(self.NET),
+                    pl.col(REGION_NAME).alias("region.store.sale.region_name"),
+                ),
+            )
+            .tables()["sale"]
+            .explain()
+        )
+        # region and store contribute one attribute each here; explain() prints
+        # an opening and a closing marker per join.
+        assert plan.count("LEFT JOIN:") == 2

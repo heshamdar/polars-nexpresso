@@ -101,17 +101,22 @@ def recipe_contexts(view: HierarchyView, packer: HierarchicalPacker) -> None:
 Every entry point answers a different question, and the return type tells you
 which one you are in:
 
-  view.tables()[g]  -> LazyFrame   one level's own table. Ancestor KEYS are on
-                                   it; ancestor ATTRIBUTES are not. No join.
+  view.tables()[g]  -> LazyFrame   one level's own table, exactly as stored.
+                                   Ancestor KEYS are on it; attributes are
+                                   not. No join.
   view.level(g)     -> LazyFrame   the root->g axis joined. Every ancestor
                                    column in scope. This is the query context.
   view.with_level() -> View        a modification that lands back on a level,
   view.filter()     -> View        so the hierarchy survives and can still be
                                    filtered, nested or sunk.
 
-Rule of thumb: if the expression mentions an ancestor *attribute*, you need
-level(). If it only mentions keys, tables()[g] gives the same answer without
-the join. If you need a *view* back, use with_level / filter.
+Ancestor attributes are in scope in BOTH level() and with_level(); only the
+raw tables()[g] frame lacks them. So the question is not what you can write,
+it is what you want back:
+
+  a frame to query          -> level(g)
+  a hierarchy to keep going -> with_level(g, ...) / filter(...)
+  the stored table itself   -> tables()[g]
 """
     )
 
@@ -380,6 +385,8 @@ def recipe_cheatsheet() -> None:
   which level owns a column             view.level_of("region.store.discount")
 
   a derived column, keep the view       view.with_level("sale", lambda lf: ...)
+  ...using an ancestor attribute        same — they are in scope, and are
+                                        joined in only if you name one
   a derived column, just querying       view.level("sale").with_columns(...)
   restrict the whole hierarchy          view.filter(pl.col(AMOUNT) > 990)
   restrict just this query              view.level("sale").filter(...)
