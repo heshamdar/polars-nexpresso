@@ -290,11 +290,12 @@ class TestWithLevel:
         An unqualified column survives level() and is silently dropped by
         nested(), so the loss shows up far from its cause.
         """
-        with pytest.raises(ValueError, match="do not belong to it"):
+        with pytest.raises(ValueError, match="name no level in this view"):
             view.with_level("sale", lambda lf: lf.with_columns(pl.col(AMOUNT).alias("doubled")))
 
     def test_rejects_a_foreign_level_name(self, view: HierarchyView):
-        with pytest.raises(ValueError, match="do not belong to it"):
+        """Landing a column on another level is possible, but never by accident."""
+        with pytest.raises(ValueError, match="named for another level"):
             view.with_level("sale", lambda lf: lf.with_columns(pl.lit(1).alias("region.oops")))
 
     def test_rejects_dropping_a_key(self, view: HierarchyView):
@@ -414,3 +415,121 @@ class TestWithLevelSeesAncestorAttributes:
         # region and store contribute one attribute each here; explain() prints
         # an opening and a closing marker per join.
         assert plan.count("LEFT JOIN:") == 2
+
+
+class TestPromoteToAnAncestor:
+    """
+    A transform names its output for a level, and that is where the column goes.
+
+    Working at ``sale`` granularity there are many sale rows per region, so a
+    column named ``region.x`` has many values per region row and something must
+    reduce them. ``promote`` says how — and by defaulting to ``None``, that a
+    column landing on another level is never implicit.
+    """
+
+    REVENUE = "region.revenue"
+    BEST = "region.store.best"
+
+    def _revenue(self, lf: pl.LazyFrame) -> pl.LazyFrame:
+        """A window sum: constant within each region by construction."""
+        return lf.with_columns(pl.col(AMOUNT).sum().over(REGION_ID).alias(self.REVENUE))
+
+    def test_refused_without_promote(self, view: HierarchyView):
+        with pytest.raises(ValueError, match="named for another level"):
+            view.with_level("sale", self._revenue)
+
+    def test_the_refusal_names_both_modes(self, view: HierarchyView):
+        """The error has to teach the fix, since the column name alone looks fine."""
+        with pytest.raises(ValueError, match="promote='first'.*promote='list'"):
+            view.with_level("sale", self._revenue)
+
+    def test_first_lands_the_rollup_on_the_ancestor(self, view: HierarchyView, flat: pl.DataFrame):
+        promoted = view.with_level("sale", self._revenue, promote="first")
+        got = promoted.tables()["region"].collect().sort(REGION_ID)
+        want = flat.group_by(REGION_ID).agg(pl.col(AMOUNT).sum()).sort(REGION_ID)
+        assert got[self.REVENUE].to_list() == want[AMOUNT].to_list()
+
+    def test_the_column_leaves_the_originating_level(self, view: HierarchyView):
+        promoted = view.with_level("sale", self._revenue, promote="first")
+        assert self.REVENUE not in promoted.tables()["sale"].collect_schema().names()
+        assert self.REVENUE in promoted.tables()["region"].collect_schema().names()
+
+    def test_promoting_adds_no_rows_to_the_ancestor(self, view: HierarchyView):
+        """It is a left join on the ancestor's own keys, so the row set is untouched."""
+        before = view.tables()["region"].collect().height
+        promoted = view.with_level("sale", self._revenue, promote="first")
+        assert promoted.tables()["region"].collect().height == before
+
+    def test_list_gathers_every_child_value(self, view: HierarchyView, flat: pl.DataFrame):
+        gathered = view.with_level(
+            "sale",
+            lambda lf: lf.with_columns(pl.col(AMOUNT).alias("region.amounts")),
+            promote="list",
+        )
+        got = gathered.tables()["region"].collect().sort(REGION_ID)
+        assert got.schema["region.amounts"] == pl.List(pl.Float64)
+        want = flat.group_by(REGION_ID).agg(pl.col(AMOUNT)).sort(REGION_ID)
+        assert [sorted(v) for v in got["region.amounts"]] == [sorted(v) for v in want[AMOUNT]]
+
+    def test_several_levels_in_one_pass(self, view: HierarchyView):
+        both = view.with_level(
+            "sale",
+            lambda lf: lf.with_columns(
+                pl.col(AMOUNT).sum().over(REGION_ID).alias(self.REVENUE),
+                pl.col(AMOUNT).max().over(STORE_ID).alias(self.BEST),
+                (pl.col(AMOUNT) * 2).alias("region.store.sale.dbl"),
+            ),
+            promote="first",
+        )
+        assert self.REVENUE in both.tables()["region"].collect_schema().names()
+        assert self.BEST in both.tables()["store"].collect_schema().names()
+        assert "region.store.sale.dbl" in both.tables()["sale"].collect_schema().names()
+
+    def test_the_promoted_column_is_first_class(self, view: HierarchyView):
+        """It is stored on the ancestor, so filter routes and cascades from there."""
+        promoted = view.with_level("sale", self._revenue, promote="first")
+        kept = promoted.filter(pl.col(self.REVENUE) > 0)
+        assert kept.tables()["region"].collect().height > 0
+        assert self.REVENUE in promoted.nested().collect().columns
+
+    def test_a_descendant_is_still_refused(self, view: HierarchyView):
+        """Reducing onto a coarser row is defined; fanning out to a finer one is not."""
+        with pytest.raises(ValueError, match="a descendant of"):
+            view.with_level(
+                "region", lambda lf: lf.with_columns(pl.lit(1).alias(self.BEST)), promote="first"
+            )
+
+    def test_an_unqualified_name_is_still_refused(self, view: HierarchyView):
+        with pytest.raises(ValueError, match="name no level in this view"):
+            view.with_level(
+                "sale", lambda lf: lf.with_columns(pl.col(AMOUNT).alias("oops")), promote="first"
+            )
+
+    def test_colliding_with_a_stored_ancestor_column_is_refused(self, view: HierarchyView):
+        """Otherwise a borrowed column silently overwrites the one it was lent from."""
+        with pytest.raises(ValueError, match="already has"):
+            view.with_level(
+                "sale",
+                lambda lf: lf.with_columns(pl.lit("x").alias(REGION_NAME)),
+                promote="first",
+            )
+
+    def test_an_unknown_mode_is_rejected(self, view: HierarchyView):
+        with pytest.raises(ValueError, match="Invalid promote"):
+            view.with_level("sale", self._revenue, promote="mean")  # type: ignore[arg-type]
+
+    def test_first_takes_the_caller_at_their_word(self, view: HierarchyView):
+        """
+        Nothing verifies uniformity — that is the documented bargain.
+
+        A varying column keeps one arbitrary value rather than raising, which is
+        why the mode has to be asked for by name.
+        """
+        loose = view.with_level(
+            "sale",
+            lambda lf: lf.with_columns((pl.col(AMOUNT) * 2).alias("region.arbitrary")),
+            promote="first",
+        )
+        values = loose.tables()["region"].collect()["region.arbitrary"].to_list()
+        assert len(values) == loose.tables()["region"].collect().height
+        assert all(v is not None for v in values)

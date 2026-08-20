@@ -49,7 +49,7 @@ from nexpresso.hierarchical_packer import (
     _reject_legacy_level_kwarg,
 )
 
-__all__ = ["HierarchyView", "EmptyParentMode"]
+__all__ = ["HierarchyView", "EmptyParentMode", "PromoteMode"]
 
 EmptyParentMode = Literal["prune", "keep"]
 """How to treat parents left with no surviving children.
@@ -62,6 +62,23 @@ you want when the parent row is meaningful on its own.
 Where the hierarchy branches, ``"prune"`` applies per branch: a city left with
 no streets is dropped even if its services survived, because packing along the
 street axis has nothing to pack for it.
+"""
+
+
+PromoteMode = Literal["first", "list"]
+"""How :meth:`HierarchyView.with_level` collapses a column named for an ancestor.
+
+A transform runs at one level's granularity, so a column it names for an
+*ancestor* has many values per ancestor row and something must reduce them.
+
+``"first"`` takes one value per ancestor group and trusts you that they are all
+the same — the mode for a window roll-up such as
+``pl.col(amount).sum().over(region_keys)``, which is constant within the group by
+construction. Nothing verifies that; a genuinely varying column silently keeps an
+arbitrary value, so reach for ``"list"`` or an explicit aggregate when unsure.
+
+``"list"`` gathers every value into a ``List`` column on the ancestor instead,
+which is well defined whether or not they agree.
 """
 
 
@@ -706,6 +723,8 @@ class HierarchyView:
         self,
         level: str,
         transform: Callable[[pl.LazyFrame], pl.LazyFrame],
+        *,
+        promote: PromoteMode | None = None,
     ) -> HierarchyView:
         """
         Replace one level's table, keeping a view.
@@ -738,10 +757,25 @@ class HierarchyView:
         it is only paid when the transform actually names an ancestor column.
         A transform confined to this level runs against its bare table.
 
-        Descendants are a different matter: borrowing only ever goes *up*.
-        Pulling a child column into an ancestor would fan the ancestor out to
-        child granularity, so it raises. Aggregate on ``level(child)`` and join
-        the result in instead.
+        A column's **name decides where it lands**. Name one for an ancestor and,
+        with ``promote`` set, that is the table it goes to — so a roll-up is an
+        ordinary window expression rather than a separate operation:
+
+            view.with_level("sale", lambda lf: lf.with_columns(
+                pl.col(amount).sum().over("region.id").alias("region.revenue")
+            ), promote="first")
+
+        ``promote`` defaults to ``None``, which refuses such a column: a value
+        arriving on a level you are not working at is worth being explicit
+        about. See :data:`~nexpresso.PromoteMode` for what the modes mean.
+        Nothing verifies that a ``"first"`` column is really constant within its
+        group — that is the caller's bargain, and ``"list"`` is there for when it
+        is not.
+
+        Only *ancestors* can take a column this way. Their rows are coarser, so
+        the values computed here reduce onto one; a descendant's are finer, and
+        there is no answer to which of them each value belongs to. A sibling
+        branch shares nothing below the common ancestor, so it is refused too.
 
         Doing this by hand through :meth:`tables` and
         :meth:`from_tables` works too, but silently drops ``empty_parents`` and
@@ -750,6 +784,9 @@ class HierarchyView:
         Args:
             level: The level whose table to replace.
             transform: Called with the level's ``LazyFrame``, returns the new one.
+            promote: How to reduce a column named for an ancestor onto that
+                level — ``"first"`` or ``"list"``. ``None`` (the default)
+                refuses such a column instead.
 
         Returns:
             A new view with that level rebuilt.
@@ -757,9 +794,12 @@ class HierarchyView:
         Raises:
             KeyError: If ``level`` is absent from the view, or the transform
                 references a column no level owns.
-            ValueError: If the result drops a key column, or carries a column
-                that does not belong to ``level`` — see the note — or the
-                transform references a descendant or sibling-branch column.
+            ValueError: If the result drops a key column; carries a column that
+                names no level at all — see the note; names one for another
+                level without ``promote``; names one for a level that is not an
+                ancestor, or that already has that column; if ``promote`` is not
+                a recognised mode; or if the transform references a descendant
+                or sibling-branch column.
 
         Note:
             Columns must be named with ``level``'s full path, because that
@@ -814,19 +854,106 @@ class HierarchyView:
             )
 
         allowed = set(keys)
-        stray = [name for name in produced if name not in allowed and self._owner_of(name) != level]
-        if stray:
-            example = self._qualified(level, "my_column")
-            raise ValueError(
-                f"Transform of level {level!r} produced column(s) {stray} that do not "
-                f"belong to it. nested() places columns by their path, so an "
-                f"unqualified or foreign name would be dropped on the way out. Name "
-                f"them for this level, e.g. {example!r}."
-            )
+        foreign = [
+            name for name in produced if name not in allowed and self._owner_of(name) != level
+        ]
 
         tables = dict(self._tables)
+        if foreign:
+            promoted = self._promote_foreign(tables, level, result, foreign, promote)
+            result = result.drop(promoted)
+            produced = [name for name in produced if name not in promoted]
+
         tables[level] = result
         return self._rebuild(tables)
+
+    def _promote_foreign(
+        self,
+        tables: dict[str, pl.LazyFrame],
+        level: str,
+        result: pl.LazyFrame,
+        foreign: list[str],
+        promote: PromoteMode | None,
+    ) -> list[str]:
+        """
+        Move ``foreign`` columns onto the ancestor levels their paths name.
+
+        ``result`` is at ``level`` granularity, so a column named for an ancestor
+        has many values per ancestor row. ``promote`` says how to reduce them and,
+        by being ``None`` by default, that reduction never happens unless it was
+        asked for -- a column landing on another level is a big enough thing to
+        be explicit about.
+
+        Mutates ``tables`` and returns the names to drop from ``level``.
+
+        Raises:
+            ValueError: If ``promote`` is ``None``, if a name belongs to no level
+                or to one that is not an ancestor, or if ``promote`` is not a
+                recognised mode.
+        """
+        if promote is not None and promote not in ("first", "list"):
+            raise ValueError(f"Invalid promote: {promote!r}. Must be 'first', 'list' or None.")
+
+        unowned = [name for name in foreign if self._owner_of(name) not in self._tables]
+        if unowned:
+            example = self._qualified(level, "my_column")
+            raise ValueError(
+                f"Transform of level {level!r} produced column(s) {unowned} that name no "
+                f"level in this view. nested() places columns by their path, so an "
+                f"unqualified name would be dropped on the way out. Name them for a "
+                f"level, e.g. {example!r}."
+            )
+
+        ancestors = set(self._packer.spec.ancestors_of(level))
+        by_owner: dict[str, list[str]] = {}
+        for name in foreign:
+            owner = self._owner_of(name)
+            assert owner is not None  # unowned names were rejected above
+            if owner not in ancestors:
+                relation = (
+                    "a descendant of"
+                    if self._packer.spec.is_ancestor_of(level, owner)
+                    else "on a different branch from"
+                )
+                raise ValueError(
+                    f"Transform of level {level!r} produced {name!r}, which belongs to "
+                    f"level {owner!r} — {relation} {level!r}. A column can only be "
+                    f"promoted to an *ancestor*, whose rows are coarser, so the values "
+                    f"computed here reduce onto one. {owner!r} rows are not, so there is "
+                    f"no answer to which of them each value belongs to. Compute it in "
+                    f"with_level({owner!r}, ...) instead."
+                )
+            by_owner.setdefault(owner, []).append(name)
+
+        if promote is None:
+            raise ValueError(
+                f"Transform of level {level!r} produced column(s) {sorted(foreign)} named "
+                f"for another level. Pass promote='first' to reduce each to one value per "
+                f"owning row -- correct when the column is constant within the group, as a "
+                f"window aggregate is -- or promote='list' to gather the values into a "
+                "List column. Nothing checks uniformity; 'first' takes you at your word."
+            )
+
+        promoted: list[str] = []
+        for owner, names in by_owner.items():
+            owner_keys = self.key_columns(owner)
+            existing = [name for name in names if name in self._columns_of(owner)]
+            if existing:
+                raise ValueError(
+                    f"Transform of level {level!r} produced column(s) {existing}, which "
+                    f"level {owner!r} already has. Promoting would collide with the stored "
+                    f"column, and a borrowed column is lent, not adopted -- to change "
+                    f"{owner!r}'s own data, call with_level({owner!r}, ...)."
+                )
+            rolled = result.group_by(owner_keys).agg(
+                [
+                    (pl.col(name).first() if promote == "first" else pl.col(name)).alias(name)
+                    for name in names
+                ]
+            )
+            tables[owner] = tables[owner].join(rolled, on=owner_keys, how="left")
+            promoted.extend(names)
+        return promoted
 
     def filter(self, *predicates: pl.Expr) -> HierarchyView:
         """

@@ -543,3 +543,41 @@ class TestBranchingView:
             restored.level("building").collect().sort("country.city.street.building.id"),
             view.level("building").collect().sort("country.city.street.building.id"),
         )
+
+
+class TestPromoteAcrossBranches:
+    """
+    ``promote`` reduces onto an ancestor, and a sibling branch is not one.
+
+    ``street`` and ``service`` both hang off ``city``. They share city, but a
+    street row and a service row have no relation to each other, so a value
+    computed per street has no home on the service table.
+    """
+
+    def test_promotes_up_its_own_branch(
+        self, branching_packer: HierarchicalPacker, branching_tables: dict[str, pl.DataFrame]
+    ):
+        view = HierarchyView.from_tables(branching_tables, branching_packer)
+        promoted = view.with_level(
+            "street",
+            lambda lf: lf.with_columns(
+                pl.col("country.city.street.length")
+                .sum()
+                .over("country.code", "country.city.id")
+                .alias("country.city.street_length")
+            ),
+            promote="first",
+        )
+        city = promoted.tables()["city"].collect().sort("country.city.id")
+        assert city["country.city.street_length"].to_list() == [300, 300, 400]
+
+    def test_refuses_a_sibling_branch(
+        self, branching_packer: HierarchicalPacker, branching_tables: dict[str, pl.DataFrame]
+    ):
+        view = HierarchyView.from_tables(branching_tables, branching_packer)
+        with pytest.raises(ValueError, match="different branch"):
+            view.with_level(
+                "street",
+                lambda lf: lf.with_columns(pl.lit(1).alias("country.city.service.oops")),
+                promote="first",
+            )

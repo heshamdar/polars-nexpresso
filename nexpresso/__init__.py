@@ -22,7 +22,7 @@ from nexpresso.hierarchical_packer import (
     PromoteAggregation,
     SchemaValidationResult,
 )
-from nexpresso.hierarchy_view import EmptyParentMode, HierarchyView
+from nexpresso.hierarchy_view import EmptyParentMode, HierarchyView, PromoteMode
 from nexpresso.structuring_utils import convert_polars_schema, unnest_all, unnest_rename
 
 __version__ = "0.9.0"
@@ -47,6 +47,7 @@ __all__ = [
     # Normalized storage views
     "EmptyParentMode",
     "HierarchyView",
+    "PromoteMode",
     # Structuring utilities
     "convert_polars_schema",
     "unnest_all",

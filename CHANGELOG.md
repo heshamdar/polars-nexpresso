@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`with_level` can land a column on an ancestor: `promote=`.** A column's name
+  already says which level it belongs to, and `pack()` has always honoured that —
+  a column named for a coarser level is accepted when it is constant within that
+  level's groups. The view refused categorically, which made it the one path
+  where the name did not decide. Now it does:
+
+  ```python
+  view.with_level("sale", lambda lf: lf.with_columns(
+      pl.col(AMOUNT).sum().over("region.id").alias("region.revenue")
+  ), promote="first")
+  ```
+
+  So a roll-up is an ordinary window expression rather than a separate
+  operation, and several levels can be written in one pass — each column goes
+  where its path says. The result is still a view, so the promoted column is
+  first-class: `filter(pl.col("region.revenue") > 400)` routes to the region
+  table and cascades to its stores and sales.
+
+  `promote` defaults to `None`, which refuses such a column — a value arriving
+  on a level you are not working at is worth being explicit about. `"first"`
+  takes one value per ancestor row and **does not verify** that they agree,
+  which is correct for a window aggregate and the caller's problem otherwise;
+  `"list"` gathers them into a `List` column, which is well defined either way.
+
+  Only ancestors can take a column this way: their rows are coarser, so the
+  values reduce onto one, while a descendant's are finer and there is no answer
+  to which of them each value belongs to. Sibling branches and collisions with a
+  column the ancestor already has are refused too.
+
 - **`with_level` transforms can reference any ancestor attribute.** The
   transform used to receive the level's table exactly as stored — its own
   columns plus the ancestor *keys* `normalize` replicates — so the most common
