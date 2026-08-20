@@ -28,10 +28,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   table and cascades to its stores and sales.
 
   `promote` defaults to `None`, which refuses such a column — a value arriving
-  on a level you are not working at is worth being explicit about. `"first"`
-  takes one value per ancestor row and **does not verify** that they agree,
-  which is correct for a window aggregate and the caller's problem otherwise;
-  `"list"` gathers them into a `List` column, which is well defined either way.
+  on a level you are not working at is worth being explicit about. The modes:
+
+  | mode | reduction | executes |
+  |---|---|---|
+  | `"first"` | one value per ancestor row, uniformity **not** checked | no |
+  | `"unique"` | same, but values must agree within the group or it raises | **yes** |
+  | `"list"` | every value gathered into a `List` column | no |
+
+  `"unique"` applies the rule `pack()` already applies to a column named for a
+  coarser level, and raises the same `HierarchyValidationError`, so the two
+  paths agree on what the data has to look like. It is the one mode that
+  executes — a `group_by` reduced to a single row inside the engine — which
+  buys catching the mistake at the line that caused it rather than at the sink.
+  `"first"` stays the default choice for a window aggregate, where uniformity
+  holds by construction.
 
   Only ancestors can take a column this way: their rows are coarser, so the
   values reduce onto one, while a descendant's are finer and there is no answer

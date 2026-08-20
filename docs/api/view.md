@@ -204,11 +204,31 @@ view.with_level("sale", lambda lf: lf.with_columns(
 #     1     |  region-1   |     570.0
 ```
 
-| `promote` | Effect |
-|---|---|
-| `None` *(default)* | A column named for another level is **refused**. |
-| `"first"` | One value per ancestor row. **Nothing checks uniformity** — correct for a window aggregate, which is constant within its group by construction; a genuinely varying column silently keeps an arbitrary value. |
-| `"list"` | Every value gathered into a `List` column on the ancestor. Well defined either way. |
+| `promote` | Effect | Executes? |
+|---|---|---|
+| `None` *(default)* | A column named for another level is **refused**. | no |
+| `"first"` | One value per ancestor row. **Nothing checks uniformity** — correct for a window aggregate, which is constant within its group by construction; a genuinely varying column silently keeps an arbitrary value. | no |
+| `"unique"` | `"first"` with that assumption enforced: values must agree within each group, ignoring nulls, or it raises `HierarchyValidationError`. | **yes** |
+| `"list"` | Every value gathered into a `List` column on the ancestor. Well defined either way. | no |
+
+`"unique"` applies the same rule `pack()` applies to a column named for a coarser
+level, and raises the same error, so the two paths agree on what the data has to
+look like:
+
+```python
+view.with_level("sale", lambda lf: lf.with_columns(
+    (pl.col(AMOUNT) * 2).alias("region.arbitrary")   # differs per sale
+), promote="unique")
+# HierarchyValidationError: [Level: region] Column 'region.arbitrary' has
+# non-uniform values within groups. Found 2 groups with differing values.
+```
+
+It is the one mode that **executes**: the check is a `group_by` over the level,
+reduced to a single row inside the engine and collected. A lazy pipeline pays for
+it where it is written rather than at the sink, which is the trade for catching
+the mistake at the line that caused it. Use `"first"` when the expression makes
+uniformity obvious — a window aggregate — and `"unique"` when it comes from data
+you have not verified.
 
 Several levels can be written in one pass — each column goes where its path says:
 

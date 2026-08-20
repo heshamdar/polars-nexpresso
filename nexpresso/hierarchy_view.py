@@ -65,7 +65,7 @@ street axis has nothing to pack for it.
 """
 
 
-PromoteMode = Literal["first", "list"]
+PromoteMode = Literal["first", "unique", "list"]
 """How :meth:`HierarchyView.with_level` collapses a column named for an ancestor.
 
 A transform runs at one level's granularity, so a column it names for an
@@ -74,8 +74,17 @@ A transform runs at one level's granularity, so a column it names for an
 ``"first"`` takes one value per ancestor group and trusts you that they are all
 the same — the mode for a window roll-up such as
 ``pl.col(amount).sum().over(region_keys)``, which is constant within the group by
-construction. Nothing verifies that; a genuinely varying column silently keeps an
-arbitrary value, so reach for ``"list"`` or an explicit aggregate when unsure.
+construction. Nothing verifies that, so a genuinely varying column silently keeps
+an arbitrary value.
+
+``"unique"`` is ``"first"`` with that assumption enforced: values must agree
+within each group (ignoring nulls), or it raises
+:class:`~nexpresso.HierarchyValidationError`. This is the rule
+:meth:`~nexpresso.HierarchicalPacker.pack` applies to a column named for a
+coarser level, so the two paths agree on what the data has to look like. It is
+the one mode that **executes** — the check is a ``group_by`` over the level,
+reduced to a single row inside the engine and collected — so a lazy pipeline
+pays for it where it is written rather than at the sink.
 
 ``"list"`` gathers every value into a ``List`` column on the ancestor instead,
 which is well defined whether or not they agree.
@@ -812,6 +821,12 @@ class HierarchyView:
         """
         if level not in self._tables:
             raise KeyError(f"Level {level!r} is not present in this view: {self.levels}.")
+        # Up front, so a typo is caught whether or not the transform happens to
+        # produce anything to promote.
+        if promote is not None and promote not in ("first", "unique", "list"):
+            raise ValueError(
+                f"Invalid promote: {promote!r}. Must be 'first', 'unique', 'list' or None."
+            )
 
         # Ancestor attributes are in scope, but joining them in costs a join per
         # ancestor that Polars cannot optimize away. So try the level's own
@@ -867,6 +882,17 @@ class HierarchyView:
         tables[level] = result
         return self._rebuild(tables)
 
+    @staticmethod
+    def _promote_expr(name: str, promote: PromoteMode) -> pl.Expr:
+        """The aggregate that reduces ``name`` onto one ancestor row."""
+        if promote == "list":
+            return pl.col(name).alias(name)
+        if promote == "unique":
+            # Uniformity was checked ignoring nulls, so read the value the same
+            # way: a group of [null, 5] agreed on 5 and should store 5.
+            return pl.col(name).drop_nulls().first().alias(name)
+        return pl.col(name).first().alias(name)
+
     def _promote_foreign(
         self,
         tables: dict[str, pl.LazyFrame],
@@ -887,13 +913,11 @@ class HierarchyView:
         Mutates ``tables`` and returns the names to drop from ``level``.
 
         Raises:
-            ValueError: If ``promote`` is ``None``, if a name belongs to no level
-                or to one that is not an ancestor, or if ``promote`` is not a
-                recognised mode.
+            ValueError: If ``promote`` is ``None``, or a name belongs to no level,
+                to one that is not an ancestor, or to one that already has it.
+            HierarchyValidationError: If ``promote`` is ``"unique"`` and a column
+                is not constant within an owning group.
         """
-        if promote is not None and promote not in ("first", "list"):
-            raise ValueError(f"Invalid promote: {promote!r}. Must be 'first', 'list' or None.")
-
         unowned = [name for name in foreign if self._owner_of(name) not in self._tables]
         if unowned:
             example = self._qualified(level, "my_column")
@@ -928,10 +952,10 @@ class HierarchyView:
         if promote is None:
             raise ValueError(
                 f"Transform of level {level!r} produced column(s) {sorted(foreign)} named "
-                f"for another level. Pass promote='first' to reduce each to one value per "
-                f"owning row -- correct when the column is constant within the group, as a "
-                f"window aggregate is -- or promote='list' to gather the values into a "
-                "List column. Nothing checks uniformity; 'first' takes you at your word."
+                f"for another level. Say how their many values per owning row should "
+                f"reduce to one: promote='first' takes one and takes you at your word, "
+                f"promote='unique' takes one but checks they agree first (a group_by, so "
+                f"it executes), promote='list' gathers them into a List column."
             )
 
         promoted: list[str] = []
@@ -945,11 +969,15 @@ class HierarchyView:
                     f"column, and a borrowed column is lent, not adopted -- to change "
                     f"{owner!r}'s own data, call with_level({owner!r}, ...)."
                 )
+            if promote == "unique":
+                # Same rule, same error, same message as pack() applies to a
+                # column named for a coarser level -- the two paths should not
+                # disagree about what the data has to look like.
+                self._packer._validate_aggregation_uniformity(  # noqa: SLF001
+                    result, owner_keys, names, owner
+                )
             rolled = result.group_by(owner_keys).agg(
-                [
-                    (pl.col(name).first() if promote == "first" else pl.col(name)).alias(name)
-                    for name in names
-                ]
+                [self._promote_expr(name, promote) for name in names]
             )
             tables[owner] = tables[owner].join(rolled, on=owner_keys, how="left")
             promoted.extend(names)
