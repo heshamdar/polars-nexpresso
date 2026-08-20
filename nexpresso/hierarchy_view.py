@@ -732,11 +732,21 @@ class HierarchyView:
         the deepest level involved, with the ancestor columns joined in and
         dropped again afterwards.
 
-        An **aggregating** predicate is evaluated at the level that *owns* its
-        columns, so ``pl.col("region.id").count()`` is the number of regions.
-        The broadcast above is a pushdown shortcut and is skipped for such a
-        predicate, since each level holds a replicated key at a different
-        granularity.
+        A predicate that reads the whole column rather than each row on its own
+        is evaluated at the level that *owns* its columns, so
+        ``pl.col("region.id").count()`` is the number of regions. The broadcast
+        above is a pushdown shortcut and is skipped for such a predicate, since
+        each level holds a replicated key at a different granularity. That
+        covers window-shaped predicates too — ``col > col.mean()`` keeps the row
+        count but still depends on every other row, so broadcasting it would
+        recompute the mean once per level.
+
+        Note:
+            An aggregate carries no implicit ``over``: ``pl.col(AMOUNT).sum() >
+            100`` is one scalar over the entire level, so every row survives or
+            none does. For a per-parent question, roll up with
+            ``level(child).group_by(key_columns(parent)).agg(...)`` and
+            semi-join the result back.
 
         Args:
             *predicates: Boolean expressions over full column paths.
@@ -753,6 +763,7 @@ class HierarchyView:
             >>> view.filter(pl.col("region.store.sale.amount") > 990)
             >>> view.filter(pl.col("region.id") == 3)  # pushed to every level
             >>> view.filter(pl.col("region.id").count() > 10)  # at the region level
+            >>> view.filter(pl.col("region.id") > pl.col("region.id").mean())  # ditto
         """
         tables = dict(self._tables)
         touched: set[str] = set()
@@ -792,26 +803,57 @@ class HierarchyView:
 
     def _is_row_wise(self, predicate: pl.Expr, roots: Iterable[str], schema: pl.Schema) -> bool:
         """
-        Whether ``predicate`` yields one value per row rather than collapsing.
+        Whether ``predicate`` evaluates each row independently of the others.
 
         Polars exposes no public "is this elementwise" API, so ask the
         expression: evaluate it against a small correctly-typed probe frame and
-        see whether the output keeps the row count. A row-wise predicate maps
-        N rows to N; any aggregate collapses to 1. Probing needs more than one
-        row, since an aggregate over a single row also returns a single row.
+        compare that against evaluating it one row at a time. An elementwise
+        predicate cannot tell the difference; anything that reads the rest of
+        the column gives itself away.
+
+        Preserving the row count is *not* enough on its own. It rules out a
+        plain aggregate, which collapses N rows to 1, but a window-shaped
+        predicate such as ``col > col.mean()`` or ``col.rank() <= 2`` maps N
+        rows to N while still depending on the whole column. Broadcasting one of
+        those to every carrier would recompute the aggregate at each level's own
+        granularity — over regions on the region table, over sales on the sale
+        table — and quietly return a different row set than the level that owns
+        the columns would.
+
+        The probe therefore needs distinct, non-null values: an all-null column
+        makes ``col > col.mean()`` return nulls either way, and a constant one
+        makes it agree by accident.
 
         This gates an optimization only. Correctness comes from routing the
         predicate to the level that owns its columns and cascading from there,
-        so a detection failure is answered ``False``: the broadcast is skipped
-        and the predicate takes the slower but always-sound path.
+        so any doubt is answered ``False``: the broadcast is skipped and the
+        predicate takes the slower but always-sound path.
         """
         try:
-            probe = pl.DataFrame(
-                {c: pl.Series([None] * self._PROBE_HEIGHT, dtype=schema[c]) for c in roots}
+            probe = pl.DataFrame({c: self._probe_column(schema[c]) for c in roots})
+            # A column the cast collapsed to a single value cannot tell the two
+            # evaluations apart, so it cannot clear the predicate either.
+            if any(probe[c].n_unique() < 2 for c in probe.columns):
+                return False
+            whole = probe.lazy().select(predicate).collect()
+            if whole.height != self._PROBE_HEIGHT:
+                return False
+            per_row = pl.concat(
+                [probe[i : i + 1].lazy().select(predicate).collect() for i in range(probe.height)]
             )
-            return probe.lazy().select(predicate).collect().height == self._PROBE_HEIGHT
+            return whole.equals(per_row)
         except Exception:  # pragma: no cover - unusual expressions
             return False
+
+    def _probe_column(self, dtype: pl.DataType) -> pl.Series:
+        """Distinct, non-null probe values of ``dtype``, for :meth:`_is_row_wise`."""
+        counter = pl.int_range(self._PROBE_HEIGHT, eager=True)
+        try:
+            return counter.cast(dtype, strict=True)
+        except Exception:
+            # A few dtypes take no integer directly — Categorical among them —
+            # but accept the same values spelled as strings.
+            return counter.cast(pl.String).cast(dtype, strict=True)
 
     # =========================================================================
     # Materialization
