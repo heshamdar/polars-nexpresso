@@ -62,6 +62,10 @@ def header(title: str) -> None:
     print("=" * 80)
 
 
+def sub(title: str) -> None:
+    print(f"\n--- {title} " + "-" * max(0, 74 - len(title)))
+
+
 def span(frame: pl.DataFrame, n: int = 6) -> pl.DataFrame:
     """
     Evenly spaced rows in sale order.
@@ -250,9 +254,7 @@ def demonstrate_filtering(view: HierarchyView) -> None:
     print("\n(a) Asking a question about sales: filter the frame.")
     print("    'sales above their own store average':")
     above = (
-        view.level("sale")
-        .filter(pl.col(AMOUNT) > pl.col(AMOUNT).mean().over(STORE_ID))
-        .collect()
+        view.level("sale").filter(pl.col(AMOUNT) > pl.col(AMOUNT).mean().over(STORE_ID)).collect()
     )
     print(f"    {above.height} of {total} sales")
 
@@ -307,12 +309,100 @@ def demonstrate_conditional_rollup(view: HierarchyView) -> None:
 
 
 # =============================================================================
-# Part 7: Ending in the nested shape
+# Part 7: Staying in the view — mutations that keep the hierarchy
+# =============================================================================
+
+
+def demonstrate_staying_in_the_view(view: HierarchyView) -> None:
+    header("PART 7: Staying in the view — with_level")
+
+    print("\nEverything so far ended at level(), which hands back a LazyFrame and")
+    print("lets go: a flat frame has forgotten which columns belonged to which")
+    print("level, so there is no way back to a hierarchy from it. with_level is")
+    print("the other direction — it applies a transform to ONE level's table and")
+    print("returns a view, so the result can still be filtered, nested or sunk.")
+
+    final = "region.store.sale.final"
+    rank = "region.store.sale.rank"
+    status = "region.store.status"
+
+    sub("(a) A same-level derivation")
+    print("The transform receives that level's own LazyFrame and returns the new")
+    print("one. Ancestor KEYS are on it; ancestor ATTRIBUTES are not:")
+    print(f"  sale table columns: {view.tables()['sale'].collect_schema().names()}")
+    print("  -> region.id and region.store.id are there; tax_rate and discount are not.")
+
+    sub("(b) A cross-level derivation needs the ancestors joined in")
+    print("A sale's final price needs store.discount and region.tax_rate, so the")
+    print("transform pulls them in and drops them again — the level keeps its own")
+    print("schema, and nothing is materialized until you collect or sink.")
+    tables = view.tables()
+
+    def price_the_sales(lf: pl.LazyFrame) -> pl.LazyFrame:
+        return (
+            lf.join(tables["store"].select(STORE_ID, DISCOUNT), on=STORE_ID)
+            .join(tables["region"].select(REGION_ID, TAX), on=REGION_ID)
+            .with_columns(
+                (pl.col(AMOUNT) * (1 - pl.col(DISCOUNT)) * (1 + pl.col(TAX))).alias(final)
+            )
+            .drop(DISCOUNT, TAX)
+        )
+
+    priced = view.with_level("sale", price_the_sales)
+    print(f"  {priced!r}")
+    print(f"  sale table now: {priced.tables()['sale'].collect_schema().names()}")
+
+    sub("(c) Keep going — each step returns a view, so they compose")
+    enriched = (
+        priced.with_level(
+            "sale",
+            lambda lf: lf.with_columns(
+                pl.col(final).rank(descending=True).over(STORE_ID).alias(rank)
+            ),
+        )
+        .filter(pl.col(rank) <= 2)
+        .with_level("store", lambda lf: lf.with_columns(pl.lit("audited").alias(status)))
+    )
+    print("  with_level(sale) -> with_level(sale) -> filter -> with_level(store)")
+    print(f"  {enriched!r}")
+    print("\n  The filter in the middle is a hierarchy filter, so it cascaded:")
+    for name, lf in enriched.tables().items():
+        before = view.tables()[name].collect().height
+        print(f"    {name:7} {lf.collect().height:3} of {before:3} rows")
+
+    sub("(d) The derived columns land in the right structs")
+    print("nested() places columns by path, which is why with_level insists each")
+    print("one is named for its level. Both new columns come out where they belong:")
+    nested = enriched.nested().collect()
+    store_dt = nested.schema["region.store"].inner
+    sale_dt = next(f for f in store_dt.fields if f.name == "sale").dtype.inner
+    print(f"  region.store fields: {[f.name for f in store_dt.fields]}")
+    print(f"  ...sale fields:      {[f.name for f in sale_dt.fields]}")
+
+    sub("(e) Or skip nesting entirely and stream it back to disk")
+    print("A view can be sunk without ever being collected, so an enrich-and-")
+    print("republish job never materializes the whole hierarchy in memory:")
+    out = Path(tempfile.mkdtemp(prefix="nexpresso-enriched-"))
+    try:
+        enriched.sink_parquet(out)
+        print(f"  {sorted(p.name for p in out.iterdir())}")
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+
+    print("\nRule of thumb: level() to ask a question, with_level to change the")
+    print("answer and keep the hierarchy. tables() + from_tables does the same by")
+    print("hand, but resets empty_parents and skips with_level's two checks —")
+    print("that the level's key columns survive, and that every column is named")
+    print("for its level (an unqualified name would be dropped by nested()).")
+
+
+# =============================================================================
+# Part 8: Ending in the nested shape
 # =============================================================================
 
 
 def demonstrate_full_pipeline(view: HierarchyView, packer: HierarchicalPacker) -> None:
-    header("PART 7: A full pipeline — and back to List[Struct] at the boundary")
+    header("PART 8: A full pipeline — and back to List[Struct] at the boundary")
 
     print("\nRestrict the hierarchy first — that part stays on the view, so the")
     print("levels stay normalized and no parent column is ever repeated per sale:")
@@ -364,6 +454,7 @@ def main() -> None:
         demonstrate_rollup_and_share(view)
         demonstrate_filtering(view)
         demonstrate_conditional_rollup(view)
+        demonstrate_staying_in_the_view(view)
         demonstrate_full_pipeline(view, packer)
 
         print("\n" + "=" * 80)
