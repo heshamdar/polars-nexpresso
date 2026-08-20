@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-20
+
 ### Added
 
+- **`HierarchyView.with_level(level, transform)`** — the counterpart to `level()`:
+  it applies a transform to one level's table and returns a **view**, so the
+  result can still be filtered, nested or sunk. Doing this through `tables()` +
+  `from_tables` works too, but silently resets `empty_parents` and skips two
+  checks `with_level` performs — that the level's key columns survive, and that
+  every column is named with the level's full path. The latter matters because
+  `nested()` places columns by path, so an unqualified name survives `level()`
+  and is silently *dropped* by `nested()`.
 - **`with_level` can land a column on an ancestor: `promote=`.** A column's name
   already says which level it belongs to, and `pack()` has always honoured that —
   a column named for a coarser level is accepted when it is constant within that
@@ -82,6 +92,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `filter` gets the same reduction on a multi-column cross-level predicate.
 
 ### Fixed
+
+- **A multi-character `granularity_separator` never worked.** Both path splitters
+  compared one **character** at a time (`path[i] == separator`), so a separator
+  such as `"__"` or `"::"` never matched and a path came back as a single
+  unsplit component. `join_path` and `escape_field` were correct, so paths were
+  *written* correctly and could not be read back: `split_path` was not the
+  inverse of `join_path`, and since column ownership is resolved by splitting,
+  `HierarchyView` could not route anything at all — `level_of` raised, and
+  `with_level` rejected every column. Only a single-character separator (the
+  `"."` default) worked.
+
+  Both splitters now match the separator as a substring, and
+  `HierarchicalPacker._split_path` delegates to the module-level
+  `_split_path_static` so the two cannot drift again. The escape convention
+  extends to it: `escape_char` before a *whole* separator occurrence is a
+  literal separator in a field name.
+
+  `tests/test_custom_separator.py` runs the packer and view suites across
+  `".", "__", "::", "/", "|", " -> "` — 15 of its cases fail without this fix.
 
 - **`filter` could silently drop rows for a window-shaped predicate.** Routing
   broadcasts a predicate over a replicated ancestor key to every table carrying
@@ -175,14 +204,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   joined; sibling branches are left out rather than crossed in.
 - **`HierarchyView.nested(at_level=None)`** — the packed `List[Struct]` shape,
   lazily. Replaces `to_nested`, and `collect_nested` is now `.nested().collect()`.
-- **`HierarchyView.with_level(level, transform)`** — the counterpart to `level()`:
-  it applies a transform to one level's table and returns a **view**, so the
-  result can still be filtered, nested or sunk. Doing this through `tables()` +
-  `from_tables` works too, but silently resets `empty_parents` and skips two
-  checks `with_level` performs — that the level's key columns survive, and that
-  every column is named with the level's full dotted path. The latter matters
-  because `nested()` places columns by path, so an unqualified name survives
-  `level()` and is silently *dropped* by `nested()`.
 - **`HierarchyView.key_columns(level)`** — ancestor foreign keys then own ids.
   Public because user code needs it now: a roll-up is
   `level(child).group_by(view.key_columns(parent)).agg(...)`.
@@ -200,25 +221,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ~2.3× (31.0 ms → 76.0 ms).
 
 ### Fixed
-
-- **A multi-character `granularity_separator` never worked.** Both path splitters
-  compared one **character** at a time (`path[i] == separator`), so a separator
-  such as `"__"` or `"::"` never matched and a path came back as a single
-  unsplit component. `join_path` and `escape_field` were correct, so paths were
-  *written* correctly and could not be read back: `split_path` was not the
-  inverse of `join_path`, and since column ownership is resolved by splitting,
-  `HierarchyView` could not route anything at all — `level_of` raised, and
-  `with_level` rejected every column. Only a single-character separator (the
-  `"."` default) worked.
-
-  Both splitters now match the separator as a substring, and
-  `HierarchicalPacker._split_path` delegates to the module-level
-  `_split_path_static` so the two cannot drift again. The escape convention
-  extends to it: `escape_char` before a *whole* separator occurrence is a
-  literal separator in a field name.
-
-  `tests/test_custom_separator.py` runs the packer and view suites across
-  `".", "__", "::", "/", "|", " -> "` — 15 of its cases fail without this fix.
 
 - **An aggregating predicate over an ancestor key is no longer refused.**
   `view.filter(pl.col("region.id").count() > 10)` raised `ValueError`; it now
@@ -699,6 +701,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The pack uniformity check reduces violation counts inside the engine rather
   than pulling one row per group into Python.
 
+[0.10.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.10.0
 [0.9.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.9.0
 [0.8.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.8.0
 [0.7.0]: https://github.com/heshamdar/polars-nexpresso/releases/tag/v0.7.0

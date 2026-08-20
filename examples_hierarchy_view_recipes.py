@@ -3,8 +3,8 @@
 Polars Nexpresso - HierarchyView recipes
 ========================================
 
-A cookbook for the 0.9.0 `HierarchyView`, organised around the three things you
-need to know to use it.
+A cookbook for `HierarchyView`, organised around the three things you need to
+know to use it.
 
     1. THE THREE CONTEXTS   which entry point returns what, and when to use it
     2. EXPRESSIONS          what you may write (answer: anything Polars accepts)

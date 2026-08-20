@@ -2,8 +2,8 @@
 
 This document provides comprehensive guidance for AI assistants working with the polars-nexpresso codebase. It covers architecture, conventions, workflows, and best practices.
 
-**Last Updated:** 2026-08-14
-**Version:** 0.9.0
+**Last Updated:** 2026-08-20
+**Version:** 0.10.0
 
 ---
 
@@ -60,12 +60,18 @@ polars-nexpresso/
 │   ├── __init__.py
 │   ├── conftest.py                   # Pytest fixtures & version checks
 │   ├── test_complex_hierarchies.py   # Complex hierarchy tests
+│   ├── test_custom_separator.py      # Packer + view across several separators
 │   ├── test_hierarchical_packer.py   # Packer tests
+│   ├── test_hierarchy_view.py        # HierarchyView construction & routing
 │   ├── test_integration.py           # Integration tests
+│   ├── test_level_symmetry.py        # pack/unpack round trips at every level
 │   ├── test_matrix.py                # Multi-version test runner
+│   ├── test_multi_branch.py          # Branching hierarchies
 │   ├── test_nested_helper.py         # Nested expression tests
 │   ├── test_streaming.py             # Lazy-purity & streaming/pack_streaming tests
-│   └── test_structuring_utils.py     # Utility tests
+│   ├── test_structuring_utils.py     # Utility tests
+│   ├── test_view_level_access.py     # level()/with_level()/promote=
+│   └── test_view_packed_equivalence.py  # View answers match the packed path
 ├── benchmarks/                       # Performance benchmarks
 │   ├── README.md                     # Measured trade-offs (e.g. parent_strategy)
 │   ├── bench_packer.py               # HierarchicalPacker benchmarks
@@ -82,12 +88,15 @@ polars-nexpresso/
 │   ├── test.yml                      # CI: lint/type job + Polars test matrix
 │   └── publish.yml                   # PyPI publish workflow
 ├── examples.py                       # Comprehensive examples
+├── examples_hierarchy_view.py        # Narrative tour of HierarchyView
+├── examples_hierarchy_view_recipes.py  # HierarchyView cookbook + cheatsheet
 ├── pyproject.toml                    # Project metadata & config
 ├── pytest.ini                        # Pytest configuration
 ├── mkdocs.yml                        # MkDocs configuration
 ├── uv.lock                           # Locked dependencies
 ├── MANIFEST.in                       # sdist packaging rules
 ├── .python-version                   # Default Python for uv
+├── CHANGELOG.md                      # Keep a Changelog release history
 ├── README.md                         # User-facing documentation
 ├── SETUP.md                          # Development setup guide
 └── LICENSE                           # MIT License
@@ -199,13 +208,19 @@ from nexpresso import (
     HierarchySpec,                 # Hierarchy specification
     LevelSpec,                     # Level specification
     HierarchyValidationError,      # Custom exception
+    DiscoveredLevel,               # Result of level discovery from a schema
+    LevelAttribute,                # Attribute descriptor used by enrich()
+    ParentStrategy,                # Type alias for parent-row handling
+    PartitionStrategy,             # Type alias for pack_streaming bucketing
     PromoteAggregation,            # Type alias for promote_attribute agg modes
+    SchemaValidationResult,        # Result of schema validation
 )
 
 # From hierarchy_view.py
 from nexpresso import (
-    HierarchyView,                 # level(g) -> LazyFrame; nested(); tables(); filter()
+    HierarchyView,                 # level(g); nested(); tables(); filter(); with_level()
     EmptyParentMode,               # "prune" | "keep"
+    PromoteMode,                   # "first" | "unique" | "list" -- with_level(promote=)
 )
 
 # From structuring_utils.py

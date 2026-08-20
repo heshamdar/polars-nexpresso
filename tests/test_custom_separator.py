@@ -6,7 +6,7 @@ project whose field names contain dots can use ``"__"`` or ``"::"`` instead.
 Every path is then built and parsed with that separator, and the escape
 convention (``escape_char`` before a literal separator) has to hold for it too.
 
-This was not true before 0.9.0: both path splitters compared **one character**
+This was not true before 0.10.0: both path splitters compared **one character**
 at a time (``path[i] == separator``), so any separator longer than one character
 never matched and a path came back as a single unsplit component. Column
 ownership is resolved by splitting, so `HierarchyView` could not route anything

@@ -23,8 +23,17 @@ moves no data.
 | `promote_attribute`, `enrich`, `attribute_expr` | ✅ | No |
 | `any_child_satisfies`, `all_children_satisfy` | ✅ | No |
 | `HierarchyView.level` / `.nested` / `.tables` / `.filter` | ✅ (returns `LazyFrame`) | No |
+| `HierarchyView.with_level` | ✅ (returns a view) | Only with `promote="unique"` |
 | `validate` | — | **Yes** — one `collect()`, by definition |
 | `pack_streaming` | ✅ (returns `LazyFrame`) | Sinks to Parquet when `defer=False` |
+
+`with_level` is the one place a view operation can execute, and only when you ask
+it to: `promote="unique"` verifies that the values reducing onto each ancestor row
+agree, which the data has to be read to know. The check is a `group_by` reduced to
+a single row inside the engine, so what comes back is still a `LazyFrame` — the
+cost buys the mistake being reported at the line that caused it rather than at the
+sink. `promote="first"` and `promote="list"` are defined without looking, and stay
+fully lazy.
 
 !!! tip "Collect a dict of frames in one call"
     `split_levels` / `normalize` return one `LazyFrame` per level, and every one
