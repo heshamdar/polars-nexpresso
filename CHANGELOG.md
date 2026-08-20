@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`filter` could silently drop rows for a window-shaped predicate.** Routing
+  broadcasts a predicate over a replicated ancestor key to every table carrying
+  it, which is sound only when the predicate reads each row on its own. The
+  check for that asked whether the expression preserved the row count, and a
+  window-shaped predicate does: `col > col.mean()` and `col.rank() <= 2` map N
+  rows to N while still depending on the whole column. Such a predicate was
+  broadcast and its aggregate recomputed at each level's own granularity, so
+  `view.filter(pl.col("region.id") > pl.col("region.id").mean())` used the mean
+  over *sales* on the sale table instead of the mean over regions, dropping
+  regions the documented semantics keep. The probe now compares evaluating the
+  predicate over the whole frame against evaluating it a row at a time, over
+  distinct non-null values, which only an elementwise predicate survives. Plain
+  elementwise predicates still broadcast, so the pushdown the shortcut exists
+  for is unaffected.
+
+### Documentation
+
+- `filter` spells out that an aggregate carries no implicit `over` — a predicate
+  such as `pl.col(AMOUNT).sum() > 100` is one scalar over the whole level, so
+  every row survives or none does — and shows the roll-up plus semi-join to use
+  for the per-parent question instead.
+- `nested()` notes that its root default is the opposite end from `level()`'s
+  finest-level default, and why.
+
 ## [0.9.0] - 2026-08-14
 
 ### Changed (breaking)

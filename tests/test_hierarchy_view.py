@@ -489,3 +489,79 @@ class TestAggregatingPredicateRouting:
         filtered = HierarchyView.scan_parquet(tmp_path, packer).filter(pl.col("region.id") == 2)
         plan = filtered.tables()["sale"].explain().upper()
         assert plan.count("SELECTION") >= len(filtered.levels)
+
+    @pytest.fixture
+    def lopsided(self, packer: HierarchicalPacker) -> HierarchyView:
+        """
+        4 regions with 1, 1, 1 and 20 sales.
+
+        Deliberately unbalanced, so an aggregate over ``region.id`` differs by
+        the level it is computed on: the mean is 1.5 over the region table and
+        ~2.74 over the sale table. A balanced fixture hides the bug this class
+        is about, because both means land on the same value.
+        """
+        counts = {0: 1, 1: 1, 2: 1, 3: 20}
+        rows = [(r, i) for r, n in counts.items() for i in range(n)]
+        flat = pl.DataFrame(
+            {
+                "region.id": [r for r, _ in rows],
+                "region.name": [f"r{r}" for r, _ in rows],
+                "region.store.id": list(range(len(rows))),
+                "region.store.name": [f"s{i}" for i in range(len(rows))],
+                SALE_ID: list(range(len(rows))),
+                AMOUNT: [1.0] * len(rows),
+            }
+        )
+        return HierarchyView.from_frame(flat, packer)
+
+    def test_window_shaped_predicate_evaluates_at_the_owning_level(self, lopsided: HierarchyView):
+        """
+        ``col > col.mean()`` keeps the row count, but is not row-wise.
+
+        It reads the whole column, so broadcasting it to every carrier would
+        recompute the mean at each level's granularity. Over the region table
+        the mean is 1.5 and regions 2 and 3 survive; over the sale table it is
+        ~2.74 and region 2 is silently lost.
+        """
+        predicate = pl.col("region.id") > pl.col("region.id").mean()
+
+        kept = lopsided.filter(predicate)
+        surviving = sorted(set(kept.tables()["region"].collect()["region.id"]))
+        assert surviving == [2, 3]
+
+        # The same answer the owning level gives on its own.
+        expected = sorted(set(lopsided.level("region").filter(predicate).collect()["region.id"]))
+        assert surviving == expected
+
+    @pytest.mark.parametrize(
+        "predicate",
+        [
+            pl.col("region.id") > pl.col("region.id").mean(),
+            pl.col("region.id").rank() <= 2,
+            pl.col("region.id") - pl.col("region.id").min() > 1,
+        ],
+        ids=["mean", "rank", "min"],
+    )
+    def test_column_reading_predicates_are_not_treated_as_row_wise(
+        self, lopsided: HierarchyView, predicate: pl.Expr
+    ):
+        """Every N-to-N predicate that reads the column must decline the broadcast."""
+        schema = lopsided.tables()["region"].collect_schema()
+        assert not lopsided._is_row_wise(predicate, predicate.meta.root_names(), schema)
+
+    @pytest.mark.parametrize(
+        "predicate",
+        [
+            pl.col("region.id") == 2,
+            pl.col("region.id").is_in([1, 2]),
+            pl.col("region.id").is_not_null(),
+            (pl.col("region.id") > 0) & (pl.col("region.id") < 3),
+        ],
+        ids=["eq", "is_in", "is_not_null", "and"],
+    )
+    def test_genuinely_elementwise_predicates_still_broadcast(
+        self, lopsided: HierarchyView, predicate: pl.Expr
+    ):
+        """The stricter probe must not cost the pushdown it exists to enable."""
+        schema = lopsided.tables()["region"].collect_schema()
+        assert lopsided._is_row_wise(predicate, predicate.meta.root_names(), schema)

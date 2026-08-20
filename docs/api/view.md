@@ -119,7 +119,9 @@ def nested(self, at_level: str | None = None) -> pl.LazyFrame: ...
 
 Reconstructs the packed `List[Struct]` shape. `at_level` names the granularity
 of the rows — it defaults to the root, giving one row per root entity with its
-descendants nested.
+descendants nested. Note that this is the opposite end from `level()`, which
+defaults to the finest granularity: each default is the one that leaves nothing
+out, and for a nested frame that is the root.
 
 ```python
 view.nested().collect()          # one row per region
@@ -194,8 +196,8 @@ materializing parent columns per child row.
 | Predicate references | Routing |
 |---|---|
 | One level's columns | Applied to that level's table |
-| An ancestor **key**, row-wise | Applied to *every* table carrying it (sound transitive pushdown; the deepest scan skips row groups with no join) |
-| An ancestor **key**, aggregating | Applied once, at the level that owns the column |
+| An ancestor **key**, elementwise | Applied to *every* table carrying it (sound transitive pushdown; the deepest scan skips row groups with no join) |
+| An ancestor **key**, reading the whole column | Applied once, at the level that owns the column |
 | An ancestor **attribute** | Applied to the ancestor, propagated by semi-join |
 | Columns across levels | Evaluated at the deepest level, ancestor columns joined in and dropped again |
 
@@ -205,11 +207,37 @@ sales they flatten to. Broadcasting to every carrier is a pushdown shortcut and
 is skipped for such a predicate, since each level holds a replicated key at a
 different granularity.
 
+The line the shortcut is drawn on is **elementwise**, not "returns as many rows
+as it was given". A window-shaped predicate such as `col > col.mean()` or
+`col.rank() <= 2` preserves the row count while still reading the whole column,
+so broadcasting it would recompute the aggregate once per level and quietly
+return a different row set than the owning level would. Those take the
+owning-level path too.
+
 ```python
 view.filter(pl.col("region.store.sale.amount") > 990)
 view.filter(pl.col("region.id") == 3)              # pushed to every level
 view.filter(pl.col("region.id").count() > 10)      # at the region level
+view.filter(pl.col("region.id") > pl.col("region.id").mean())  # at the region level
 ```
+
+!!! warning "An aggregate has no implicit `over`"
+
+    `view.filter(pl.col("region.store.sale.amount").sum() > 100)` is one scalar
+    over the **entire** sale table, so every row survives or none does — it is
+    not "regions whose sales sum to more than 100". For a per-parent question,
+    roll up and semi-join back:
+
+    ```python
+    keys = view.key_columns("region")
+    big = (
+        view.level("sale")
+        .group_by(keys)
+        .agg(pl.col(AMOUNT).sum().alias("revenue"))
+        .filter(pl.col("revenue") > 100)
+    )
+    view.level("region").join(big.select(keys), on=keys, how="semi")
+    ```
 
 Use `level(g).filter(...)` instead when you are asking a question *about* `g`
 rows and want a frame back; use `view.filter(...)` when you want a smaller
