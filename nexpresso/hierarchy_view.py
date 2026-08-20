@@ -36,6 +36,7 @@ See ``docs/concepts/storage-layouts.md`` for the measurements behind this.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -416,6 +417,22 @@ class HierarchyView:
             self._schema_cache[level] = cached
         return cached
 
+    def _ancestor_attributes(self, level: str) -> list[str]:
+        """
+        Ancestor-owned columns that ``level``'s own table does not already carry.
+
+        ``normalize`` replicates ancestor *keys* into every descendant table, so
+        those are already present; this is the rest — the attributes — which a
+        cross-level expression has to borrow.
+        """
+        present = self._columns_of(level)
+        return [
+            name
+            for ancestor in self._ancestors_in_view(level)
+            for name in sorted(self._columns_of(ancestor))
+            if name not in present and self._owner_of(name) == ancestor
+        ]
+
     def _carriers_of(
         self, columns: Iterable[str], tables: Mapping[str, pl.LazyFrame] | None = None
     ) -> list[str]:
@@ -549,6 +566,11 @@ class HierarchyView:
         present = self._columns_of(level, tables)
         ancestors = set(self._packer.spec.ancestors_of(level))
         added: list[str] = []
+        # Group by owner first: one join per ancestor level, not per column. A
+        # borrowed column is projected away again afterwards, but Polars cannot
+        # drop the join itself -- it has no way to know the ancestor's keys are
+        # unique, so the join might change the row count.
+        wanted: dict[str, tuple[list[str], list[str]]] = {}
         for name in columns:
             if name in present:
                 continue
@@ -577,8 +599,11 @@ class HierarchyView:
                     f"no shared key columns. Expected {self._key_columns(owner)} "
                     f"to be present as foreign keys."
                 )
-            lf = lf.join(tables[owner].select([*keys, name]), on=keys, how="left")
+            wanted.setdefault(owner, ([], keys))[0].append(name)
             added.append(name)
+
+        for owner, (names, join_keys) in wanted.items():
+            lf = lf.join(tables[owner].select([*join_keys, *names]), on=join_keys, how="left")
         return lf, added
 
     def _apply_at(
@@ -640,6 +665,43 @@ class HierarchyView:
     # Operations
     # =========================================================================
 
+    @staticmethod
+    def _missing_column(exc: BaseException) -> str | None:
+        """The column name a Polars "not found" error names, if it names one."""
+        match = re.search(r'unable to find column "((?:[^"\\]|\\.)*)"', str(exc))
+        return match.group(1) if match else None
+
+    def _reject_unreachable_column(self, exc: BaseException, level: str) -> None:
+        """
+        Re-raise a missing-column failure as the reason that column is unreachable.
+
+        A transform runs against ``level`` widened with every ancestor
+        attribute, so a name that still does not resolve is either owned by a
+        level that cannot be borrowed from -- a descendant or a sibling branch,
+        which do not line up row for row -- or not in the view at all. Both
+        deserve better than a raw error printing the query plan. Anything this
+        cannot explain is left for the caller to re-raise unchanged.
+        """
+        name = self._missing_column(exc)
+        if name is None:
+            return
+
+        owner = self._owner_of(name)
+        # _owner_of resolves by path, so a name that merely *looks* like a
+        # level's column ("region.nope") comes back owned. Check it exists.
+        if owner is None or owner not in self._tables or name not in self._columns_of(owner):
+            raise KeyError(
+                f"Unknown column {name!r}: not available in this view. "
+                f"Known columns: {sorted(self.columns)}."
+            ) from exc
+        if owner not in set(self._packer.spec.ancestors_of(level)):
+            raise ValueError(
+                f"Cannot evaluate at level {level!r} using {owner!r}-level input "
+                f"{name!r}: {owner!r} is not an ancestor of {level!r}, so the two do "
+                "not line up row for row. Work on the frame level() returns for the "
+                "granularity you want."
+            ) from exc
+
     def with_level(
         self,
         level: str,
@@ -650,12 +712,36 @@ class HierarchyView:
 
         :meth:`level` gives you a frame and lets go; this keeps the hierarchy, so
         the result can still be filtered, nested or sunk. ``transform`` receives
-        that level's own ``LazyFrame`` — ancestor **keys** are on it, ancestor
-        *attributes* are not — and returns the new one:
+        that level's ``LazyFrame`` and returns the new one:
 
             view.with_level("sale", lambda lf: lf.with_columns(
                 (pl.col("region.store.sale.amount") * 2).alias("region.store.sale.dbl")
             ))
+
+        Any **ancestor attribute** may be referenced, not just this level's own
+        columns and the ancestor keys ``normalize`` replicates. They are joined
+        in for the computation and dropped again, so the level keeps its own
+        schema — a cross-level derivation needs no manual join:
+
+            view.with_level("sale", lambda lf: lf.with_columns(
+                (pl.col("region.store.sale.amount")
+                 * (1 - pl.col("region.store.discount"))
+                 * (1 + pl.col("region.tax_rate"))).alias("region.store.sale.net")
+            ))
+
+        To keep an ancestor value on this level rather than merely borrow it,
+        alias it to a path this level owns; that copy is not one of the borrowed
+        columns, so it survives.
+
+        The widening costs one join per ancestor level, which Polars cannot
+        optimize away — it has no way to know an ancestor's keys are unique — so
+        it is only paid when the transform actually names an ancestor column.
+        A transform confined to this level runs against its bare table.
+
+        Descendants are a different matter: borrowing only ever goes *up*.
+        Pulling a child column into an ancestor would fan the ancestor out to
+        child granularity, so it raises. Aggregate on ``level(child)`` and join
+        the result in instead.
 
         Doing this by hand through :meth:`tables` and
         :meth:`from_tables` works too, but silently drops ``empty_parents`` and
@@ -669,9 +755,11 @@ class HierarchyView:
             A new view with that level rebuilt.
 
         Raises:
-            KeyError: If ``level`` is absent from the view.
+            KeyError: If ``level`` is absent from the view, or the transform
+                references a column no level owns.
             ValueError: If the result drops a key column, or carries a column
-                that does not belong to ``level`` — see the note.
+                that does not belong to ``level`` — see the note — or the
+                transform references a descendant or sibling-branch column.
 
         Note:
             Columns must be named with ``level``'s full path, because that
@@ -685,8 +773,36 @@ class HierarchyView:
         if level not in self._tables:
             raise KeyError(f"Level {level!r} is not present in this view: {self.levels}.")
 
-        result = transform(self._tables[level])
-        produced = result.collect_schema().names()
+        # Ancestor attributes are in scope, but joining them in costs a join per
+        # ancestor that Polars cannot optimize away. So try the level's own
+        # table first: a transform that never names an ancestor column pays
+        # nothing, and one that does fails here on the missing name and is
+        # retried against the widened frame.
+        borrowed: list[str] = []
+        try:
+            result = transform(self._tables[level])
+            produced = result.collect_schema().names()
+        except Exception:
+            working = dict(self._tables)
+            widened, borrowed = self._augmented(working, level, self._ancestor_attributes(level))
+            try:
+                result = transform(widened)
+                produced = result.collect_schema().names()
+            except Exception as exc:
+                # Every ancestor attribute was in scope and the transform still
+                # could not resolve a name. Say which one and why, rather than
+                # letting a raw Polars error print the whole plan.
+                self._reject_unreachable_column(exc, level)
+                raise
+
+        # Ancestor attributes were lent for the computation, not adopted: drop
+        # whatever survived so the level keeps its own schema. A transform that
+        # wants to keep one aliases it to a path this level owns, and that copy
+        # is not in ``borrowed`` so it stays.
+        leftover = [name for name in borrowed if name in produced]
+        if leftover:
+            result = result.drop(leftover)
+            produced = [name for name in produced if name not in leftover]
 
         keys = self.key_columns(level)
         missing = [key for key in keys if key not in produced]

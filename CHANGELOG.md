@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`with_level` transforms can reference any ancestor attribute.** The
+  transform used to receive the level's table exactly as stored — its own
+  columns plus the ancestor *keys* `normalize` replicates — so the most common
+  thing you would want to do, a cross-level derivation, was the one thing it
+  could not express. Reaching an ancestor *attribute* meant dropping to
+  `tables()`, writing the joins by hand, and remembering to drop the borrowed
+  columns again, which is what `level()` exists to spare you:
+
+  ```python
+  view.with_level("sale", lambda lf: lf.with_columns(
+      (pl.col(AMOUNT) * (1 - pl.col(DISCOUNT)) * (1 + pl.col(TAX)))
+      .alias("region.store.sale.net")
+  ))
+  ```
+
+  Ancestor attributes are joined in for the computation and dropped again, so
+  the level keeps its own schema and `nested()` still places everything by path.
+  Aliasing one to a path this level owns keeps that copy. Borrowing goes up the
+  hierarchy only — a descendant column would fan the level out to child
+  granularity, and now says so instead of surfacing a raw Polars error with the
+  query plan attached.
+
+  The widening costs one join per ancestor **level**, not per column, and is
+  paid only when the transform actually names an ancestor column; a transform
+  confined to its own level runs against the bare table and joins nothing.
+
+### Changed
+
+- `_augmented` groups its borrowed columns by owner, so pulling several
+  attributes from one ancestor is a single join rather than one per column.
+  `filter` gets the same reduction on a multi-column cross-level predicate.
+
 ### Fixed
 
 - **`filter` could silently drop rows for a window-shaped predicate.** Routing

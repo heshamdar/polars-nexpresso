@@ -159,14 +159,41 @@ def with_level(
 
 `level()` hands you a frame and lets go, which is what you want for a query.
 `with_level` keeps the hierarchy, so the result can still be filtered, nested or
-sunk. `transform` receives that level's own `LazyFrame` — ancestor **keys** are
-on it, ancestor *attributes* are not:
+sunk. `transform` receives that level's `LazyFrame` and returns the new one:
 
 ```python
 view.with_level("sale", lambda lf: lf.with_columns(
     (pl.col("region.store.sale.amount") * 2).alias("region.store.sale.doubled")
 ))
 ```
+
+Any **ancestor attribute** is in scope, not just this level's own columns and the
+ancestor keys `normalize` replicates. They are joined in for the computation and
+dropped again, so the level keeps its own schema and a cross-level derivation
+needs no manual join:
+
+```python
+view.with_level("sale", lambda lf: lf.with_columns(
+    (pl.col("region.store.sale.amount")
+     * (1 - pl.col("region.store.discount"))       # from store
+     * (1 + pl.col("region.tax_rate"))             # from region
+    ).alias("region.store.sale.net")
+))
+```
+
+To *keep* an ancestor value on this level rather than borrow it, alias it to a
+path this level owns — that copy is not one of the borrowed columns, so it stays.
+
+Borrowing goes up the hierarchy only. A descendant column would fan the level out
+to child granularity, so it raises; aggregate on `level(child)` and join the
+result in instead.
+
+!!! note "What the widening costs"
+
+    One join per ancestor *level* — not per column — and Polars cannot optimize
+    it away, since it has no way to know an ancestor's keys are unique. So it is
+    paid only when the transform actually names an ancestor column; a transform
+    confined to this level runs against its bare table and joins nothing.
 
 Two things are checked, because both fail quietly otherwise:
 

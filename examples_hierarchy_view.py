@@ -326,31 +326,31 @@ def demonstrate_staying_in_the_view(view: HierarchyView) -> None:
     rank = "region.store.sale.rank"
     status = "region.store.status"
 
-    sub("(a) A same-level derivation")
-    print("The transform receives that level's own LazyFrame and returns the new")
-    print("one. Ancestor KEYS are on it; ancestor ATTRIBUTES are not:")
+    sub("(a) The level's own table is what physically exists")
+    print("normalize() replicates ancestor KEYS into every descendant table, but")
+    print("not ancestor attributes:")
     print(f"  sale table columns: {view.tables()['sale'].collect_schema().names()}")
     print("  -> region.id and region.store.id are there; tax_rate and discount are not.")
 
-    sub("(b) A cross-level derivation needs the ancestors joined in")
-    print("A sale's final price needs store.discount and region.tax_rate, so the")
-    print("transform pulls them in and drops them again — the level keeps its own")
-    print("schema, and nothing is materialized until you collect or sink.")
-    tables = view.tables()
-
-    def price_the_sales(lf: pl.LazyFrame) -> pl.LazyFrame:
-        return (
-            lf.join(tables["store"].select(STORE_ID, DISCOUNT), on=STORE_ID)
-            .join(tables["region"].select(REGION_ID, TAX), on=REGION_ID)
-            .with_columns(
-                (pl.col(AMOUNT) * (1 - pl.col(DISCOUNT)) * (1 + pl.col(TAX))).alias(final)
-            )
-            .drop(DISCOUNT, TAX)
-        )
-
-    priced = view.with_level("sale", price_the_sales)
+    sub("(b) ...but the transform sees ancestor attributes anyway")
+    print("A sale's final price needs store.discount and region.tax_rate. Write")
+    print("the expression; with_level joins those in and drops them again, so the")
+    print("level keeps its own schema and no join is written by hand:")
+    priced = view.with_level(
+        "sale",
+        lambda lf: lf.with_columns(
+            (pl.col(AMOUNT) * (1 - pl.col(DISCOUNT)) * (1 + pl.col(TAX))).alias(final)
+        ),
+    )
     print(f"  {priced!r}")
     print(f"  sale table now: {priced.tables()['sale'].collect_schema().names()}")
+    print("  -> 'final' landed; discount and tax_rate were lent, not adopted.")
+    print("\nThe widening is one join per ancestor LEVEL, and only when the")
+    print("transform actually names an ancestor column — a same-level transform")
+    print("runs against the bare table:")
+    same = view.with_level("sale", lambda lf: lf.with_columns((pl.col(AMOUNT) * 2).alias(final)))
+    for label, v in [("cross-level", priced), ("same-level ", same)]:
+        print(f"    {label}: {v.tables()['sale'].explain().count('LEFT JOIN:')} join(s)")
 
     sub("(c) Keep going — each step returns a view, so they compose")
     enriched = (
