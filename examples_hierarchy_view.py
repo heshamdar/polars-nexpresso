@@ -379,7 +379,29 @@ def demonstrate_staying_in_the_view(view: HierarchyView) -> None:
     print(f"  region.store fields: {[f.name for f in store_dt.fields]}")
     print(f"  ...sale fields:      {[f.name for f in sale_dt.fields]}")
 
-    sub("(e) Or skip nesting entirely and stream it back to disk")
+    sub("(e) A column goes where its NAME says — including onto an ancestor")
+    print("A roll-up is not a separate operation: write a window aggregate at")
+    print("sale granularity, name it for region, and promote= says how to reduce")
+    print("the many values per region to the one the region table can hold.")
+    revenue = "region.revenue"
+    rolled = view.with_level(
+        "sale",
+        lambda lf: lf.with_columns(pl.col(AMOUNT).sum().over(REGION_ID).alias(revenue)),
+        promote="first",
+    )
+    print(rolled.tables()["region"].collect())
+    print("  'first' takes one value per region and trusts you they agree — true")
+    print("  of a window aggregate by construction. Nothing verifies it, which is")
+    print("  why promote must be asked for; promote='list' gathers them instead.")
+    print("\n  It is a region column now, so filter routes there and cascades")
+    print("  — one region survives, and it brings its stores and sales with it:")
+    hot = rolled.filter(pl.col(revenue) > 500)
+    for name, lf in hot.tables().items():
+        print(
+            f"    {name:7} {lf.collect().height:3} of {rolled.tables()[name].collect().height:3} rows"
+        )
+
+    sub("(f) Or skip nesting entirely and stream it back to disk")
     print("A view can be sunk without ever being collected, so an enrich-and-")
     print("republish job never materializes the whole hierarchy in memory:")
     out = Path(tempfile.mkdtemp(prefix="nexpresso-enriched-"))

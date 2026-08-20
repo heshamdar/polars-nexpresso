@@ -179,7 +179,7 @@ class TestViewOperations:
     ):
         """The naming guard must key off the configured separator, not a dot."""
         amount = packer.join_path(["region", "store", "sale", "amount"])
-        with pytest.raises(ValueError, match="do not belong to it"):
+        with pytest.raises(ValueError, match="name no level in this view"):
             view.with_level("sale", lambda lf: lf.with_columns(pl.col(amount).alias("doubled")))
 
     def test_nested_round_trip(self, view: HierarchyView, flat: pl.DataFrame, packer):

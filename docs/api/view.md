@@ -188,6 +188,51 @@ Borrowing goes up the hierarchy only. A descendant column would fan the level ou
 to child granularity, so it raises; aggregate on `level(child)` and join the
 result in instead.
 
+### promote — landing a column on an ancestor
+
+A column's **name decides which table it goes to**. Name one for an ancestor and,
+with `promote` set, that is where it lands — so a roll-up is an ordinary window
+expression rather than a separate operation:
+
+```python
+view.with_level("sale", lambda lf: lf.with_columns(
+    pl.col(AMOUNT).sum().over("region.id").alias("region.revenue")
+), promote="first")
+
+# region.id | region.name | region.revenue
+#     0     |  region-0   |     210.0
+#     1     |  region-1   |     570.0
+```
+
+| `promote` | Effect |
+|---|---|
+| `None` *(default)* | A column named for another level is **refused**. |
+| `"first"` | One value per ancestor row. **Nothing checks uniformity** — correct for a window aggregate, which is constant within its group by construction; a genuinely varying column silently keeps an arbitrary value. |
+| `"list"` | Every value gathered into a `List` column on the ancestor. Well defined either way. |
+
+Several levels can be written in one pass — each column goes where its path says:
+
+```python
+view.with_level("sale", lambda lf: lf.with_columns(
+    pl.col(AMOUNT).sum().over("region.id").alias("region.revenue"),        # -> region
+    pl.col(AMOUNT).max().over("region.store.id").alias("region.store.best"),  # -> store
+    (pl.col(AMOUNT) * 2).alias("region.store.sale.dbl"),                   # stays on sale
+), promote="first")
+```
+
+Only **ancestors** can take a column this way. Their rows are coarser, so the
+values computed here reduce onto one; a descendant's are finer, and there is no
+answer to which of them each value belongs to. A sibling branch shares nothing
+below the common ancestor, so it is refused too. Promoting onto a column the
+ancestor already has is refused rather than silently overwriting it.
+
+The promoted column is first-class once it lands, which is the point of doing
+this in view space — `filter` routes to the ancestor's table and cascades:
+
+```python
+enriched.filter(pl.col("region.revenue") > 400)   # regions, with their stores and sales
+```
+
 !!! note "What the widening costs"
 
     One join per ancestor *level* — not per column — and Polars cannot optimize
