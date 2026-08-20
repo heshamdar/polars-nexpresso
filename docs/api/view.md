@@ -473,6 +473,17 @@ How to treat parents left with no surviving children after a filter.
 | `"prune"` (default) | Childless parents disappear — matches `packer.pack()` |
 | `"keep"` | Childless parents retained with empty child lists; skips the upward semi-join cascade |
 
+### PromoteMode
+
+```python
+PromoteMode = Literal["first", "unique", "list"]
+```
+
+How `with_level(..., promote=)` reduces the many values a level produces per
+ancestor row onto the one that row can hold. See
+[promote](#promote-landing-a-column-on-an-ancestor) for the full table; `None`
+(the default, and not a member of this type) refuses such a column outright.
+
 ## Consistency model
 
 Filtering one level implies restrictions on the others. The view defers both

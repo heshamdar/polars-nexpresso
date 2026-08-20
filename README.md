@@ -117,6 +117,7 @@ Query normalized per-level storage through a nested interface.
 | **No hand-written joins** | `level()` joins the axis, and the planner prunes what you do not read |
 | **Transitive key pushdown** | Ancestor-key predicates reach the deepest scan with no join |
 | **Deferred consistency** | `filter` restricts the whole hierarchy, applied once at materialization |
+| **Transform a level, keep the view** | `with_level()` returns a view, so `filter`, `nested` and `sink_parquet` still apply — and `promote=` lands a roll-up on an ancestor |
 | **Nest only at the boundary** | `nested()` when a consumer genuinely needs `List[Struct]` |
 
 ## Core Concepts
@@ -418,7 +419,8 @@ view.level("sale").with_columns(
 ```
 
 See [Storage Layouts](docs/concepts/storage-layouts.md) for the measurements,
-`python examples_hierarchy_view.py` for a runnable tour, and
+`python examples_hierarchy_view.py` for a runnable tour,
+`python examples_hierarchy_view_recipes.py` for the cookbook, and
 `benchmarks/bench_storage.py` to reproduce the numbers.
 
 ## Performance
