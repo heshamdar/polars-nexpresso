@@ -21,7 +21,13 @@ import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 
-from nexpresso import HierarchicalPacker, HierarchySpec, HierarchyView, LevelSpec
+from nexpresso import (
+    HierarchicalPacker,
+    HierarchySpec,
+    HierarchyValidationError,
+    HierarchyView,
+    LevelSpec,
+)
 
 ROOT = "region"
 REGION_ID = "region.id"
@@ -438,9 +444,9 @@ class TestPromoteToAnAncestor:
         with pytest.raises(ValueError, match="named for another level"):
             view.with_level("sale", self._revenue)
 
-    def test_the_refusal_names_both_modes(self, view: HierarchyView):
+    def test_the_refusal_names_every_mode(self, view: HierarchyView):
         """The error has to teach the fix, since the column name alone looks fine."""
-        with pytest.raises(ValueError, match="promote='first'.*promote='list'"):
+        with pytest.raises(ValueError, match="promote='first'.*promote='unique'.*promote='list'"):
             view.with_level("sale", self._revenue)
 
     def test_first_lands_the_rollup_on_the_ancestor(self, view: HierarchyView, flat: pl.DataFrame):
@@ -517,6 +523,79 @@ class TestPromoteToAnAncestor:
     def test_an_unknown_mode_is_rejected(self, view: HierarchyView):
         with pytest.raises(ValueError, match="Invalid promote"):
             view.with_level("sale", self._revenue, promote="mean")  # type: ignore[arg-type]
+
+    def test_an_unknown_mode_is_rejected_even_when_nothing_is_promoted(self, view: HierarchyView):
+        """A typo should not depend on whether the transform happened to need it."""
+        with pytest.raises(ValueError, match="Invalid promote"):
+            view.with_level("sale", lambda lf: lf, promote="mean")  # type: ignore[arg-type]
+
+    def test_unique_accepts_a_column_constant_within_its_group(
+        self, view: HierarchyView, flat: pl.DataFrame
+    ):
+        checked = view.with_level("sale", self._revenue, promote="unique")
+        got = checked.tables()["region"].collect().sort(REGION_ID)
+        want = flat.group_by(REGION_ID).agg(pl.col(AMOUNT).sum()).sort(REGION_ID)
+        assert got[self.REVENUE].to_list() == want[AMOUNT].to_list()
+
+    def test_unique_rejects_a_column_that_varies(self, view: HierarchyView):
+        with pytest.raises(HierarchyValidationError, match="non-uniform values within groups"):
+            view.with_level(
+                "sale",
+                lambda lf: lf.with_columns((pl.col(AMOUNT) * 2).alias("region.arbitrary")),
+                promote="unique",
+            )
+
+    def test_unique_names_the_group_that_failed(self, view: HierarchyView):
+        """The owning level is the one whose groups disagreed, so it is the context."""
+        with pytest.raises(HierarchyValidationError, match=r"\[Level: region\]"):
+            view.with_level(
+                "sale",
+                lambda lf: lf.with_columns((pl.col(AMOUNT) * 2).alias("region.arbitrary")),
+                promote="unique",
+            )
+
+    def test_unique_ignores_nulls_like_pack_does(self, view: HierarchyView):
+        """A group of [null, x, x] agreed on x, and stores x rather than null."""
+        checked = view.with_level(
+            "sale",
+            lambda lf: lf.with_columns(
+                pl.when(pl.col(SALE_ID) == pl.col(SALE_ID).min())
+                .then(None)
+                .otherwise(pl.col(AMOUNT).sum().over(REGION_ID))
+                .alias(self.REVENUE)
+            ),
+            promote="unique",
+        )
+        values = checked.tables()["region"].collect()[self.REVENUE].to_list()
+        assert all(v is not None for v in values)
+
+    def test_first_still_accepts_what_unique_rejects(self, view: HierarchyView):
+        """The two modes differ only in whether the assumption is enforced."""
+        varying = lambda lf: lf.with_columns(  # noqa: E731
+            (pl.col(AMOUNT) * 2).alias("region.arbitrary")
+        )
+        assert view.with_level("sale", varying, promote="first") is not None
+        with pytest.raises(HierarchyValidationError):
+            view.with_level("sale", varying, promote="unique")
+
+    def test_unique_agrees_with_pack_on_the_same_data(
+        self, view: HierarchyView, flat: pl.DataFrame, packer: HierarchicalPacker
+    ):
+        """
+        Both paths apply the same rule, which is the point of reusing it.
+
+        A column named for a coarser level is either constant within that
+        level's groups or it is not, and neither path should be the lenient one.
+        """
+        varying = flat.with_columns((pl.col(AMOUNT) * 2).alias("region.arbitrary"))
+        with pytest.raises(HierarchyValidationError):
+            packer.pack(varying, "region")
+        with pytest.raises(HierarchyValidationError):
+            view.with_level(
+                "sale",
+                lambda lf: lf.with_columns((pl.col(AMOUNT) * 2).alias("region.arbitrary")),
+                promote="unique",
+            )
 
     def test_first_takes_the_caller_at_their_word(self, view: HierarchyView):
         """

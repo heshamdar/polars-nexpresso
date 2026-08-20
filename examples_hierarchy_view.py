@@ -34,7 +34,13 @@ from pathlib import Path
 
 import polars as pl
 
-from nexpresso import HierarchicalPacker, HierarchySpec, HierarchyView, LevelSpec
+from nexpresso import (
+    HierarchicalPacker,
+    HierarchySpec,
+    HierarchyValidationError,
+    HierarchyView,
+    LevelSpec,
+)
 
 pl.Config.set_tbl_rows(12)
 pl.Config.set_tbl_cols(12)
@@ -391,8 +397,17 @@ def demonstrate_staying_in_the_view(view: HierarchyView) -> None:
     )
     print(rolled.tables()["region"].collect())
     print("  'first' takes one value per region and trusts you they agree — true")
-    print("  of a window aggregate by construction. Nothing verifies it, which is")
-    print("  why promote must be asked for; promote='list' gathers them instead.")
+    print("  of a window aggregate by construction. promote='unique' checks it")
+    print("  instead (the rule pack() applies, and the one mode that executes):")
+    try:
+        view.with_level(
+            "sale",
+            lambda lf: lf.with_columns((pl.col(AMOUNT) * 2).alias("region.varies")),
+            promote="unique",
+        )
+    except HierarchyValidationError as exc:
+        print(f"    {str(exc)[:96]}...")
+    print("  and promote='list' gathers every value into a List column instead.")
     print("\n  It is a region column now, so filter routes there and cascades")
     print("  — one region survives, and it brings its stores and sales with it:")
     hot = rolled.filter(pl.col(revenue) > 500)
